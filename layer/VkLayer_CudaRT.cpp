@@ -193,21 +193,40 @@ static PendingTLAS g_pendingTLAS = {0, 0, false};
 // Layout: 8 vec4s = 128 bytes per instance
 //   [0..2] = transform rows 0,1,2 (3×vec4 = 12 floats)
 //   [3..5] = invTransform rows 0,1,2 (3×vec4 = 12 floats)
-//   [6]    = (blasMin.xyz, uintBitsToFloat(blasIdx))
-//   [7]    = (blasMax.xyz, pad)
+//   [6]    = (blasMin.xyz, uintBitsToFloat(blasNodeOff))
+//   [7]    = (blasMax.xyz, uintBitsToFloat(blasTriOff))
 struct InstanceGPU {
     float transform[12];     // 3×4 row-major affine transform
     float invTransform[12];  // inverse 3×4 for transforming rays
     float blasMinX, blasMinY, blasMinZ;
     float blasMaxX, blasMaxY, blasMaxZ;
-    uint32_t blasIdx;        // which BLAS (always 0 for now — single BLAS)
-    uint32_t pad;
+    uint32_t blasNodeOff;    // node offset into concatenated BVH2 nodes array
+    uint32_t blasTriOff;     // tri offset into concatenated packed tris array
 };
 static std::vector<InstanceGPU> g_instances;
 static CudaBVH_t g_tlasBVH = nullptr;  // TLAS BVH over instance AABBs (first build only)
 // Fast TLAS path: raw BVH2 stackless data (per-frame rebuilds)
 static uint32_t* g_fastTLASNodes = nullptr;
 static int g_fastTLASNodeCount = 0;
+
+// ═══════════════════════════════════════════
+// Multi-BLAS tracking: all built BLASes concatenated into single buffers
+// ═══════════════════════════════════════════
+struct BLASEntry {
+    CudaBVH_t bvh;
+    uint64_t  asKey;         // VkAccelerationStructureKHR handle
+    int       nodeOffset;    // offset into concatenated nodes array (in nodes, not bytes)
+    int       triOffset;     // offset into concatenated packed tris array (in triangles, not bytes)
+    int       numNodes;
+    int       numTriVec4s;   // number of vec4s in packed tris (= numTris * 3)
+    int       numTris;
+    float     minX, minY, minZ, maxX, maxY, maxZ; // BLAS bounds from BVH root
+};
+static std::vector<BLASEntry> g_blasEntries;
+// Map AS handle → index in g_blasEntries
+static std::unordered_map<uint64_t, int> g_asKeyToBLASIdx;
+// Map device address → index in g_blasEntries
+static std::unordered_map<VkDeviceAddress, int> g_blasDevAddrToIdx;
 
 // ═══════════════════════════════════════════
 // Storage image tracking (for CUDA→VkImage output)
@@ -1405,9 +1424,9 @@ static void processPendingBLAS() {
 
     LOG("[Deferred] Processing %zu pending BLAS builds after QueueSubmit...", pending.size());
 
-    // Find the BLAS with the most triangles (primary mesh) to use as g_lastBLAS
     CudaBVH_t bestBVH = nullptr;
     int bestTris = 0;
+    int totalBLAS = 0;
 
     for (auto& pb : pending) {
         std::vector<CudaTri> capturedTris;
@@ -1449,16 +1468,6 @@ static void processPendingBLAS() {
         }
 
         if (!capturedTris.empty()) {
-            // Debug: print first tri of each BLAS
-            auto& t = capturedTris[0];
-            static int dumpN = 0;
-            if (dumpN < 3) {
-                LOG("  [BLAS] %zu tris, first: v0=(%.4f,%.4f,%.4f) v1=(%.4f,%.4f,%.4f)",
-                    capturedTris.size(),
-                    t.v0[0],t.v0[1],t.v0[2], t.v1[0],t.v1[1],t.v1[2]);
-                dumpN++;
-            }
-
             CudaBVH_t bvh = cudaBVH_build(capturedTris.data(), (int)capturedTris.size());
             if (bvh) {
                 std::lock_guard<std::mutex> lock(g_lock);
@@ -1469,13 +1478,63 @@ static void processPendingBLAS() {
                     bit->second.numTris = (int)capturedTris.size();
                     bit->second.isReady = true;
                 }
-                // Track the largest BLAS as g_lastBLAS
+                // Track ALL BLASes in g_blasEntries
+                BLASEntry entry = {};
+                entry.bvh = bvh;
+                entry.asKey = pb.asKey;
+                entry.numTris = (int)capturedTris.size();
+                g_asKeyToBLASIdx[pb.asKey] = (int)g_blasEntries.size();
+                g_blasEntries.push_back(entry);
+                totalBLAS++;
+
                 if ((int)capturedTris.size() > bestTris) {
                     bestTris = (int)capturedTris.size();
                     bestBVH = bvh;
                 }
             }
         }
+    }
+
+    // Compute concatenated node/tri offsets for all BLASes
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        int nodeOff = 0, triOff = 0;
+        for (auto& be : g_blasEntries) {
+            uint32_t* bvh2Data = nullptr;
+            int numNodes = cudaBVH_getStacklessBVH2(be.bvh, &bvh2Data);
+            int numTris = cudaBVH_getNumTris(be.bvh);
+            int numTriVec4s = numTris * 3; // 3 vec4s per triangle
+
+            be.nodeOffset = nodeOff;
+            be.triOffset = triOff;
+            be.numNodes = numNodes;
+            be.numTriVec4s = numTriVec4s;
+
+            // Extract BLAS bounds from BVH2 root node
+            if (bvh2Data && numNodes > 0) {
+                memcpy(&be.minX, bvh2Data + 0, 4);
+                memcpy(&be.minY, bvh2Data + 1, 4);
+                memcpy(&be.minZ, bvh2Data + 2, 4);
+                memcpy(&be.maxX, bvh2Data + 3, 4);
+                memcpy(&be.maxY, bvh2Data + 4, 4);
+                memcpy(&be.maxZ, bvh2Data + 5, 4);
+            }
+
+            nodeOff += numNodes;
+            triOff += numTris;
+            LOG("  [BLAS#%d] asKey=0x%lx, %d tris, %d nodes, nodeOff=%d, triOff=%d",
+                (int)(&be - g_blasEntries.data()), (uint64_t)be.asKey,
+                numTris, numNodes, be.nodeOffset, be.triOffset);
+        }
+        // Map device addresses to BLAS entries
+        for (auto& [devAddr, asHandle] : g_asDevAddrToHandle) {
+            auto it = g_asKeyToBLASIdx.find(asHandle);
+            if (it != g_asKeyToBLASIdx.end()) {
+                g_blasDevAddrToIdx[devAddr] = it->second;
+            }
+        }
+        LOG("[Multi-BLAS] %d BLASes, total %d nodes + %d tris",
+            totalBLAS, nodeOff, triOff);
     }
 
     if (bestBVH) {
@@ -1592,11 +1651,9 @@ static void processPendingTLAS() {
             numInst, identical, std::min(numInst, 1000u));
     }
 
-    // ── BLAS RESOLUTION ──
-    // Find the BLAS that instances actually reference (via device address).
-    // g_lastBLAS was set to the LARGEST BLAS by processPendingBLAS, but that may be
-    // the planet mesh, while all TLAS instances are asteroids. Fix: count blasRef
-    // occurrences, find the most-referenced one, and switch g_lastBLAS to it.
+    // ── MULTI-BLAS RESOLUTION ──
+    // Count unique BLAS references for logging, and find a fallback BLAS
+    int fallbackBlasIdx = -1;
     {
         const uint8_t* p = (const uint8_t*)rawData;
         std::unordered_map<uint64_t, int> blasRefCounts;
@@ -1605,58 +1662,32 @@ static void processPendingTLAS() {
             memcpy(&ref, p + i*64 + 56, 8);
             if (ref) blasRefCounts[ref]++;
         }
-        // Find most-referenced BLAS device address
+        // Find most-referenced BLAS as fallback for unmapped instances
         uint64_t bestRef = 0;
         int bestCount = 0;
         for (auto& [ref, cnt] : blasRefCounts) {
             if (cnt > bestCount) { bestCount = cnt; bestRef = ref; }
         }
-        if (bestRef && bestCount > 0) {
-            std::lock_guard<std::mutex> lock(g_lock);
-            auto ait = g_asDevAddrToHandle.find(bestRef);
-            if (ait != g_asDevAddrToHandle.end()) {
-                uint64_t asHandle = ait->second;
-                auto bit = g_bvhMap.find(asHandle);
-                if (bit != g_bvhMap.end() && bit->second.isReady && bit->second.handle) {
-                    if (bit->second.handle != g_lastBLAS) {
-                        LOG("[TLAS] BLAS SWITCH: instances reference BLAS 0x%lx (%d tris, %d/%u instances)"
-                            " — was using %d tris",
-                            asHandle, bit->second.numTris, bestCount, numInst,
-                            g_lastBLAS ? cudaBVH_getNumTris(g_lastBLAS) : 0);
-                        g_lastBLAS = bit->second.handle;
-                    }
-                }
-            } else if (verbose) {
-                LOG("[TLAS] Most-referenced blasRef=0x%lx (%d/%u) — no AS handle mapping found",
-                    bestRef, bestCount, numInst);
+        if (bestRef) {
+            auto it = g_blasDevAddrToIdx.find(bestRef);
+            if (it != g_blasDevAddrToIdx.end()) {
+                fallbackBlasIdx = it->second;
+            }
+        }
+        if (verbose) {
+            LOG("[TLAS] %zu unique BLAS refs, fallbackIdx=%d (%d BLASes available)",
+                blasRefCounts.size(), fallbackBlasIdx, (int)g_blasEntries.size());
+            for (auto& [ref, cnt] : blasRefCounts) {
+                auto it = g_blasDevAddrToIdx.find(ref);
+                int idx = (it != g_blasDevAddrToIdx.end()) ? it->second : -1;
+                if (idx >= 0)
+                    LOG("  blasRef=0x%lx → BLAS#%d (%d tris), %d instances",
+                        ref, idx, g_blasEntries[idx].numTris, cnt);
+                else
+                    LOG("  blasRef=0x%lx → UNMAPPED, %d instances", ref, cnt);
             }
         }
     }
-
-    // Get BLAS AABB from the best BLAS
-    float blasCx, blasCy, blasCz, blasExtent;
-    cudaBVH_getBounds(g_lastBLAS, &blasCx, &blasCy, &blasCz, &blasExtent);
-    // Reconstruct BLAS min/max from the BVH2 data
-    uint32_t* bvh2Data = nullptr;
-    int numNodes = cudaBVH_getStacklessBVH2(g_lastBLAS, &bvh2Data);
-    float blasMinX, blasMinY, blasMinZ, blasMaxX, blasMaxY, blasMaxZ;
-    if (bvh2Data && numNodes > 0) {
-        // Root node bounds are the first 6 floats in bvh2Data (node 0)
-        memcpy(&blasMinX, bvh2Data + 0, 4);
-        memcpy(&blasMinY, bvh2Data + 1, 4);
-        memcpy(&blasMinZ, bvh2Data + 2, 4);
-        memcpy(&blasMaxX, bvh2Data + 3, 4);
-        memcpy(&blasMaxY, bvh2Data + 4, 4);
-        memcpy(&blasMaxZ, bvh2Data + 5, 4);
-    } else {
-        float halfE = blasExtent * 0.5f;
-        blasMinX = blasCx - halfE; blasMinY = blasCy - halfE; blasMinZ = blasCz - halfE;
-        blasMaxX = blasCx + halfE; blasMaxY = blasCy + halfE; blasMaxZ = blasCz + halfE;
-    }
-
-    if (verbose)
-        LOG("[TLAS] BLAS bounds: (%.3f,%.3f,%.3f)-(%.3f,%.3f,%.3f)",
-            blasMinX, blasMinY, blasMinZ, blasMaxX, blasMaxY, blasMaxZ);
 
     // Parse instances and build InstanceGPU array + world AABBs for TLAS BVH
     g_instances.clear();
@@ -1665,6 +1696,7 @@ static void processPendingTLAS() {
     // AABBs for TLAS BVH builder: 6 floats per instance (minX,minY,minZ,maxX,maxY,maxZ)
     std::vector<float> worldAABBs(numInst * 6);
     int maskCounts[256] = {0};
+    int mappedCount = 0, unmappedCount = 0;
 
     const uint8_t* src = (const uint8_t*)rawData;
     for (uint32_t i = 0; i < numInst; i++) {
@@ -1684,23 +1716,48 @@ static void processPendingTLAS() {
         uint8_t instanceMask = (customIdxMask >> 24) & 0xFF;
         maskCounts[instanceMask]++;
 
+        // Resolve per-instance BLAS
+        uint64_t blasRef = 0;
+        memcpy(&blasRef, inst + 56, 8);
+        int blasIdx = fallbackBlasIdx;
+        if (blasRef) {
+            auto it = g_blasDevAddrToIdx.find(blasRef);
+            if (it != g_blasDevAddrToIdx.end()) {
+                blasIdx = it->second;
+                mappedCount++;
+            } else {
+                unmappedCount++;
+            }
+        }
+
+        // Get per-instance BLAS bounds and offsets
+        float bMinX = 0, bMinY = 0, bMinZ = 0, bMaxX = 0, bMaxY = 0, bMaxZ = 0;
+        uint32_t nodeOff = 0, triOff = 0;
+        if (blasIdx >= 0 && blasIdx < (int)g_blasEntries.size()) {
+            const BLASEntry& be = g_blasEntries[blasIdx];
+            bMinX = be.minX; bMinY = be.minY; bMinZ = be.minZ;
+            bMaxX = be.maxX; bMaxY = be.maxY; bMaxZ = be.maxZ;
+            nodeOff = be.nodeOffset;
+            triOff = be.triOffset;
+        }
+
         // Compute inverse transform
         float invXform[12];
         invertAffine3x4(xform, invXform);
 
         // Compute world-space AABB by transforming BLAS bounds through instance transform
         float wMinX, wMinY, wMinZ, wMaxX, wMaxY, wMaxZ;
-        transformAABB(xform, blasMinX, blasMinY, blasMinZ, blasMaxX, blasMaxY, blasMaxZ,
+        transformAABB(xform, bMinX, bMinY, bMinZ, bMaxX, bMaxY, bMaxZ,
                       wMinX, wMinY, wMinZ, wMaxX, wMaxY, wMaxZ);
 
         // Fill InstanceGPU
         InstanceGPU& gi = g_instances[i];
         memcpy(gi.transform, xform, 48);
         memcpy(gi.invTransform, invXform, 48);
-        gi.blasMinX = blasMinX; gi.blasMinY = blasMinY; gi.blasMinZ = blasMinZ;
-        gi.blasMaxX = blasMaxX; gi.blasMaxY = blasMaxY; gi.blasMaxZ = blasMaxZ;
-        gi.blasIdx = 0;  // single BLAS for now
-        gi.pad = 0;
+        gi.blasMinX = bMinX; gi.blasMinY = bMinY; gi.blasMinZ = bMinZ;
+        gi.blasMaxX = bMaxX; gi.blasMaxY = bMaxY; gi.blasMaxZ = bMaxZ;
+        gi.blasNodeOff = nodeOff;
+        gi.blasTriOff = triOff;
 
         // Store world AABB for TLAS BVH
         worldAABBs[i*6+0] = wMinX; worldAABBs[i*6+1] = wMinY; worldAABBs[i*6+2] = wMinZ;
@@ -1708,14 +1765,16 @@ static void processPendingTLAS() {
 
         // Log sampled instances on first rebuild only
         if (verbose && (i < 3 || i == numInst/4 || i == numInst/2 || i == numInst*3/4 || i == numInst-1)) {
-            uint64_t blasRef = 0;
-            memcpy(&blasRef, inst + 56, 8);
-            LOG("[TLAS] Instance %u: T=[%.1f,%.1f,%.1f] mask=0x%02x blasRef=0x%lx wAABB=(%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f)",
-                i, xform[3], xform[7], xform[11], instanceMask, (uint64_t)blasRef,
+            LOG("[TLAS] Instance %u: T=[%.1f,%.1f,%.1f] mask=0x%02x BLAS#%d (nOff=%u,tOff=%u) wAABB=(%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f)",
+                i, xform[3], xform[7], xform[11], instanceMask, blasIdx, nodeOff, triOff,
                 wMinX, wMinY, wMinZ, wMaxX, wMaxY, wMaxZ);
         }
     }
     free(rawData);
+
+    if (verbose)
+        LOG("[TLAS] Multi-BLAS: %d mapped, %d unmapped (fallback=%d)",
+            mappedCount, unmappedCount, fallbackBlasIdx);
 
     // Log mask distribution
     if (verbose) {
@@ -2049,27 +2108,55 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
     if (!bvh) return false;
     if (!setupBVH2Descriptors(disp)) return false;
 
-    // Get BVH2 stackless node data
-    uint32_t* nodeData = nullptr;
-    int numNodes = cudaBVH_getStacklessBVH2(bvh, &nodeData);
-    if (!nodeData || numNodes == 0) {
-        LOG("[BVH2] No stackless BVH2 data");
+    // ── MULTI-BLAS: Concatenate ALL BLASes' BVH2 data into single buffers ──
+    std::vector<uint32_t> allNodes;
+    std::vector<float> allTris;
+    int totalNodes = 0, totalTriVec4s = 0;
+
+    if (!g_blasEntries.empty()) {
+        // Concatenate all BLASes
+        for (auto& be : g_blasEntries) {
+            uint32_t* nodeData = nullptr;
+            int numNodes = cudaBVH_getStacklessBVH2(be.bvh, &nodeData);
+            float* triData = nullptr;
+            int numTriVec4s = cudaBVH_getPackedTris(be.bvh, &triData);
+            if (nodeData && numNodes > 0) {
+                allNodes.insert(allNodes.end(), nodeData, nodeData + numNodes * 8);
+            }
+            if (triData && numTriVec4s > 0) {
+                allTris.insert(allTris.end(), triData, triData + numTriVec4s * 4);
+            }
+            totalNodes += numNodes;
+            totalTriVec4s += numTriVec4s;
+        }
+        LOG("[BVH2] Multi-BLAS concat: %d BLASes → %d total nodes, %d total triVec4s",
+            (int)g_blasEntries.size(), totalNodes, totalTriVec4s);
+    } else {
+        // Fallback: single BLAS (g_lastBLAS)
+        uint32_t* nodeData = nullptr;
+        int numNodes = cudaBVH_getStacklessBVH2(bvh, &nodeData);
+        float* triData = nullptr;
+        int numTriVec4s = cudaBVH_getPackedTris(bvh, &triData);
+        if (!nodeData || numNodes == 0 || !triData || numTriVec4s == 0) {
+            LOG("[BVH2] No stackless BVH2 data");
+            return false;
+        }
+        allNodes.assign(nodeData, nodeData + numNodes * 8);
+        allTris.assign(triData, triData + numTriVec4s * 4);
+        totalNodes = numNodes;
+        totalTriVec4s = numTriVec4s;
+    }
+
+    if (allNodes.empty() || allTris.empty()) {
+        LOG("[BVH2] No BVH data after concatenation");
         return false;
     }
 
-    // Get packed triangle data
-    float* triData = nullptr;
-    int numTriVec4s = cudaBVH_getPackedTris(bvh, &triData);
-    if (!triData || numTriVec4s == 0) {
-        LOG("[BVH2] No packed triangle data");
-        return false;
-    }
-
-    // Debug: dump first few BVH2 nodes
+    // Debug: dump first few nodes
     {
-        int dumpN = std::min(numNodes, 8);
+        int dumpN = std::min(totalNodes, 4);
         for (int i = 0; i < dumpN; i++) {
-            const uint32_t* n = (const uint32_t*)nodeData + i*8;
+            const uint32_t* n = allNodes.data() + i*8;
             float bmin[3], bmax[3];
             memcpy(bmin, n+0, 12);
             memcpy(&bmax[0], n+3, 4);
@@ -2086,16 +2173,9 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
                     i, bmin[0],bmin[1],bmin[2], bmax[0],bmax[1],bmax[2], skip);
             }
         }
-        // Also dump first few packed tris
-        int dumpT = std::min(numTriVec4s/3, 2) * 3; // 2 tris = 6 vec4s
-        for (int i = 0; i < dumpT; i += 3) {
-            const float* p = triData + i*4;
-            LOG("[BVH2] Tri %d: v0=(%.3f,%.3f,%.3f) v1=(%.3f,%.3f,%.3f) v2=(%.3f,%.3f,%.3f)",
-                i/3, p[0],p[1],p[2], p[3],p[4+0],p[4+1], p[4+2],p[4+3],p[8+0]);
-        }
     }
 
-    // Destroy old buffers if they exist
+    // Destroy old buffers
     if (g_bvh2.nodesBuf) { disp.DestroyBuffer(disp.device, g_bvh2.nodesBuf, nullptr); g_bvh2.nodesBuf = VK_NULL_HANDLE; }
     if (g_bvh2.nodesMem) { disp.FreeMemory(disp.device, g_bvh2.nodesMem, nullptr); g_bvh2.nodesMem = VK_NULL_HANDLE; }
     if (g_bvh2.trisBuf)  { disp.DestroyBuffer(disp.device, g_bvh2.trisBuf, nullptr); g_bvh2.trisBuf = VK_NULL_HANDLE; }
@@ -2105,19 +2185,19 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
     if (g_bvh2.instancesBuf) { disp.DestroyBuffer(disp.device, g_bvh2.instancesBuf, nullptr); g_bvh2.instancesBuf = VK_NULL_HANDLE; }
     if (g_bvh2.instancesMem) { disp.FreeMemory(disp.device, g_bvh2.instancesMem, nullptr); g_bvh2.instancesMem = VK_NULL_HANDLE; }
 
-    // Nodes: 8 uint32s per node, accessed as uvec4 pairs → size = numNodes * 8 * 4 bytes
-    VkDeviceSize nodesSize = (VkDeviceSize)numNodes * 8 * sizeof(uint32_t);
-    if (!createBufferWithData(disp, nodeData, nodesSize,
+    // Upload concatenated nodes
+    VkDeviceSize nodesSize = (VkDeviceSize)allNodes.size() * sizeof(uint32_t);
+    if (!createBufferWithData(disp, allNodes.data(), nodesSize,
                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.nodesBuf, g_bvh2.nodesMem)) {
-        LOG("[BVH2] Failed to create nodes buffer (%d nodes, %zu bytes)", numNodes, (size_t)nodesSize);
+        LOG("[BVH2] Failed to create nodes buffer (%d nodes, %zu bytes)", totalNodes, (size_t)nodesSize);
         return false;
     }
 
-    // Tris: numTriVec4s * 4 floats = numTriVec4s * 16 bytes
-    VkDeviceSize trisSize = (VkDeviceSize)numTriVec4s * 4 * sizeof(float);
-    if (!createBufferWithData(disp, triData, trisSize,
+    // Upload concatenated tris
+    VkDeviceSize trisSize = (VkDeviceSize)allTris.size() * sizeof(float);
+    if (!createBufferWithData(disp, allTris.data(), trisSize,
                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.trisBuf, g_bvh2.trisMem)) {
-        LOG("[BVH2] Failed to create tris buffer (%d vec4s, %zu bytes)", numTriVec4s, (size_t)trisSize);
+        LOG("[BVH2] Failed to create tris buffer (%d vec4s, %zu bytes)", totalTriVec4s, (size_t)trisSize);
         return false;
     }
 
@@ -2155,12 +2235,12 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
             memcpy(dst + 12, gi.invTransform + 0, 16);
             memcpy(dst + 16, gi.invTransform + 4, 16);
             memcpy(dst + 20, gi.invTransform + 8, 16);
-            // vec4[6] = (blasMin.xyz, uintBitsToFloat(blasIdx))
+            // vec4[6] = (blasMin.xyz, uintBitsToFloat(blasNodeOff))
             dst[24] = gi.blasMinX; dst[25] = gi.blasMinY; dst[26] = gi.blasMinZ;
-            memcpy(dst + 27, &gi.blasIdx, 4); // blasIdx as float bits
-            // vec4[7] = (blasMax.xyz, pad)
+            memcpy(dst + 27, &gi.blasNodeOff, 4);
+            // vec4[7] = (blasMax.xyz, uintBitsToFloat(blasTriOff))
             dst[28] = gi.blasMaxX; dst[29] = gi.blasMaxY; dst[30] = gi.blasMaxZ;
-            dst[31] = 0.0f;
+            memcpy(dst + 31, &gi.blasTriOff, 4);
         }
         if (!createBufferWithData(disp, instPacked.data(), instancesSize,
                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.instancesBuf, g_bvh2.instancesMem)) {
@@ -2227,15 +2307,15 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
 
     disp.UpdateDescriptorSets(disp.device, 4, writes, 0, nullptr);
 
-    g_bvh2.numNodes = numNodes;
-    g_bvh2.numTriVec4s = numTriVec4s;
+    g_bvh2.numNodes = totalNodes;
+    g_bvh2.numTriVec4s = totalTriVec4s;
     g_bvh2.numTlasNodes = numTlasNodes;
     g_bvh2.numInstances = numInst;
     g_bvh2.descSetIdx = 4; // matches SPIR-V rewriter's bvhDescSet
     g_bvh2.tlasGen = g_tlasGeneration;
     g_bvh2.ready = true;
     LOG("[BVH2] Uploaded: %d BLAS nodes (%.1f KB), %d tri-vec4s (%.1f KB), %d TLAS nodes, %d instances → descriptor set %u",
-        numNodes, nodesSize/1024.f, numTriVec4s, trisSize/1024.f, numTlasNodes, numInst, g_bvh2.descSetIdx);
+        totalNodes, nodesSize/1024.f, totalTriVec4s, trisSize/1024.f, numTlasNodes, numInst, g_bvh2.descSetIdx);
     return true;
 }
 
@@ -2283,9 +2363,9 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
         memcpy(dst + 16, gi.invTransform + 4, 16);
         memcpy(dst + 20, gi.invTransform + 8, 16);
         dst[24] = gi.blasMinX; dst[25] = gi.blasMinY; dst[26] = gi.blasMinZ;
-        memcpy(dst + 27, &gi.blasIdx, 4);
+        memcpy(dst + 27, &gi.blasNodeOff, 4);
         dst[28] = gi.blasMaxX; dst[29] = gi.blasMaxY; dst[30] = gi.blasMaxZ;
-        dst[31] = 0.0f;
+        memcpy(dst + 31, &gi.blasTriOff, 4);
     }
     if (!createBufferWithData(disp, instPacked.data(), instancesSize,
                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.instancesBuf, g_bvh2.instancesMem)) {
@@ -3137,6 +3217,11 @@ static VKAPI_ATTR VkDeviceAddress VKAPI_CALL layer_GetAccelerationStructureDevic
     {
         std::lock_guard<std::mutex> lock(g_lock);
         g_asDevAddrToHandle[addr] = asVal;
+        // Also update multi-BLAS device address → index mapping
+        auto it = g_asKeyToBLASIdx.find(asVal);
+        if (it != g_asKeyToBLASIdx.end()) {
+            g_blasDevAddrToIdx[addr] = it->second;
+        }
     }
     return addr;
 }
@@ -3467,7 +3552,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
         static int tlasRate = -1;
         if (tlasRate < 0) {
             const char* env = getenv("CUDA_RT_TLAS_RATE");
-            tlasRate = env ? atoi(env) : 60;  // rebuild every 60 QueueSubmits
+            tlasRate = env ? atoi(env) : 300;  // rebuild every 300 QueueSubmits (~5s)
         }
         static int qsTlasCount = 0;
         qsTlasCount++;
@@ -3561,6 +3646,11 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdCopyAccelerationStructureKHR(
     if (it != g_bvhMap.end()) {
         g_bvhMap[dstH] = it->second;
         LOG("  Copied BVH metadata 0x%lx -> 0x%lx", srcH, dstH);
+    }
+    // Propagate multi-BLAS index to the copy destination
+    auto bit = g_asKeyToBLASIdx.find(srcH);
+    if (bit != g_asKeyToBLASIdx.end()) {
+        g_asKeyToBLASIdx[dstH] = bit->second;
     }
 }
 

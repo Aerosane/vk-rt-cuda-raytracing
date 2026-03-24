@@ -311,6 +311,8 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
     uint32_t tvLocalRo = newId();    // local-space ray origin (vec3)
     uint32_t tvLocalRd = newId();    // local-space ray direction (vec3)
     uint32_t tvHitInst = newId();    // hit instance index
+    uint32_t tvBlasNodeOff = newId(); // per-instance BLAS node offset
+    uint32_t tvBlasTriOff  = newId(); // per-instance BLAS tri offset
     uint32_t cMaxTlasIter = newId(); // constant: max TLAS iterations
     uint32_t glslExtId = 0; // will find existing GLSL.std.450 import
 
@@ -621,6 +623,8 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 spvEmit(out, SpvOpVariable, {pVec3,  tvLocalRo,   (uint32_t)SCFunction});
                 spvEmit(out, SpvOpVariable, {pVec3,  tvLocalRd,   (uint32_t)SCFunction});
                 spvEmit(out, SpvOpVariable, {pInt,   tvHitInst,   (uint32_t)SCFunction});
+                spvEmit(out, SpvOpVariable, {pInt,   tvBlasNodeOff, (uint32_t)SCFunction});
+                spvEmit(out, SpvOpVariable, {pInt,   tvBlasTriOff,  (uint32_t)SCFunction});
             }
             skip = true; // already copied OpLabel
         }
@@ -826,6 +830,27 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 E(SpvOpAccessChain, {pVec4SB, pIr2, vInst, c0, ir2Idx});
                 E(SpvOpLoad, {tVec4, ir2, pIr2});
 
+                // Load per-instance BLAS offsets from instances[instBase+6].w and [instBase+7].w
+                uint32_t ib6Idx = newId(), pIb6 = newId(), ib6 = newId();
+                E(SpvOpIAdd, {tInt, ib6Idx, instBase, c6});
+                E(SpvOpAccessChain, {pVec4SB, pIb6, vInst, c0, ib6Idx});
+                E(SpvOpLoad, {tVec4, ib6, pIb6});
+                uint32_t ib7Idx = newId(), pIb7 = newId(), ib7 = newId();
+                E(SpvOpIAdd, {tInt, ib7Idx, instBase, c7});
+                E(SpvOpAccessChain, {pVec4SB, pIb7, vInst, c0, ib7Idx});
+                E(SpvOpLoad, {tVec4, ib7, pIb7});
+                // blasNodeOff = floatBitsToInt(ib6.w), blasTriOff = floatBitsToInt(ib7.w)
+                uint32_t ib6wF = newId(), ib7wF = newId(), ib6wU = newId(), ib7wU = newId();
+                uint32_t blasNOff = newId(), blasTOff = newId();
+                E(SpvOpCompositeExtract, {tFloat, ib6wF, ib6, 3});
+                E(SpvOpCompositeExtract, {tFloat, ib7wF, ib7, 3});
+                E(SpvOpBitcast, {tUint, ib6wU, ib6wF});
+                E(SpvOpBitcast, {tUint, ib7wU, ib7wF});
+                E(SpvOpBitcast, {tInt, blasNOff, ib6wU});
+                E(SpvOpBitcast, {tInt, blasTOff, ib7wU});
+                E(SpvOpStore, {tvBlasNodeOff, blasNOff});
+                E(SpvOpStore, {tvBlasTriOff, blasTOff});
+
                 // Extract inverse transform components
                 uint32_t ir0x = newId(), ir0y = newId(), ir0z = newId(), ir0w = newId();
                 E(SpvOpCompositeExtract, {tFloat, ir0x, ir0, 0});
@@ -913,9 +938,12 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
 
                 spvEmit(out, SpvOpLabel, {lInner2});
 
-                // Load BVH node: w0 = bvhNodes[ni*2], w1 = bvhNodes[ni*2+1]
+                // Load BVH node: w0 = bvhNodes[(ni+blasNodeOff)*2], w1 = bvhNodes[(ni+blasNodeOff)*2+1]
+                uint32_t bnoVal = newId(), niOff = newId();
+                E(SpvOpLoad, {tInt, bnoVal, tvBlasNodeOff});
+                E(SpvOpIAdd, {tInt, niOff, niVal, bnoVal});
                 uint32_t ni2 = newId(), ni2p1 = newId();
-                E(SpvOpIMul, {tInt, ni2, niVal, c2});
+                E(SpvOpIMul, {tInt, ni2, niOff, c2});
                 E(SpvOpIAdd, {tInt, ni2p1, ni2, c1});
                 uint32_t pw0 = newId(), pw1 = newId(), w0 = newId(), w1 = newId();
                 E(SpvOpAccessChain, {pUvec4SB, pw0, vNodes, c0, ni2});
@@ -962,8 +990,10 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                     E(SpvOpBranchConditional, {tCond, triBody, triM});
 
                     spvEmit(out, SpvOpLabel, {triBody});
-                    uint32_t tst = newId(), b = newId();
-                    E(SpvOpIAdd, {tInt, tst, ts, tVal});
+                    uint32_t tst0 = newId(), btoVal = newId(), tst = newId(), b = newId();
+                    E(SpvOpIAdd, {tInt, tst0, ts, tVal});
+                    E(SpvOpLoad, {tInt, btoVal, tvBlasTriOff});
+                    E(SpvOpIAdd, {tInt, tst, tst0, btoVal});  // absolute tri index
                     E(SpvOpIMul, {tInt, b, tst, c3});
                     uint32_t bp1 = newId(), bp2 = newId();
                     E(SpvOpIAdd, {tInt, bp1, b, c1});
@@ -1054,7 +1084,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                     E(SpvOpStore, {tvBestT, tt});
                     E(SpvOpStore, {tvHitU, uu});
                     E(SpvOpStore, {tvHitV, vv});
-                    E(SpvOpStore, {tvHitPrim, tst});
+                    E(SpvOpStore, {tvHitPrim, tst0}); // BLAS-local primitive index
                     E(SpvOpStore, {tvHitType, c1});
                     E(SpvOpStore, {tvHitInst, instIdx}); // record which instance was hit
                     E(SpvOpBranch, {lHitEnd});
