@@ -1,0 +1,93 @@
+#version 460
+#extension GL_EXT_shader_16bit_storage : require
+layout(local_size_x = 4, local_size_y = 4) in;
+
+layout(push_constant) uniform PushConstants {
+    float camOx, camOy, camOz;
+    float fwdX, fwdY, fwdZ;
+    float rightX, rightY, rightZ;
+    float upX, upY, upZ;
+    float fov;
+    float nearZ, farZ;
+    int width, height;
+    int numNodes;
+    int outFmt;
+};
+
+layout(set=0,binding=0,std430) readonly restrict buffer BVH4Nodes { uvec4 bvhNodes[]; };
+layout(set=0,binding=1,std430) readonly restrict buffer TriData { vec4 triPacked[]; };
+layout(set=0,binding=10,rgba16f) writeonly uniform image2D outImage;
+layout(set=0,binding=11,std140) uniform TopNodes { uvec4 topNodes[4096]; };
+
+#define STK 13
+
+void main() {
+    int px = int(gl_GlobalInvocationID.x);
+    int py = int(gl_GlobalInvocationID.y);
+    if (px >= width || py >= height) return;
+
+    float u = (float(px)+0.5)/float(width)*2.0-1.0;
+    float v = (float(py)+0.5)/float(height)*2.0-1.0;
+    u *= float(width)/float(height)*fov; v *= fov;
+
+    vec3 rd = normalize(vec3(fwdX,fwdY,fwdZ)+u*vec3(rightX,rightY,rightZ)+v*vec3(upX,upY,upZ));
+    vec3 ro = vec3(camOx,camOy,camOz);
+    vec3 invD = 1.0/mix(rd,vec3(sign(rd.x),sign(rd.y),sign(rd.z))*1e-8,lessThan(abs(rd),vec3(1e-8)));
+    vec3 ood = -ro * invD;
+    bool sX = invD.x >= 0.0, sY = invD.y >= 0.0, sZ = invD.z >= 0.0;
+
+    float tHit=1e30; int hitTri=-1;
+    int stk[STK]; int sp=0; stk[sp++]=0;
+
+    while(sp>0){
+        int ni=stk[--sp];
+        if(ni<0){
+            int enc=-(ni+2),ts=enc>>3,tc=(enc&7)+1;
+            for(int t=0;t<tc;t++){
+                int ti=ts+t;
+                int b=ti*3;
+                vec4 p0=triPacked[b], p1=triPacked[b+1], p2=triPacked[b+2];
+                vec3 v0=p0.xyz;
+                vec3 e1=vec3(p0.w,p1.xy)-v0;
+                vec3 e2=vec3(p1.zw,p2.x)-v0;
+                vec3 pp=cross(rd,e2);
+                float det=dot(e1,pp);
+                float inv=1.0/det;
+                vec3 tv=ro-v0;
+                float uu=inv*dot(tv,pp);
+                if(uu<0.0||uu>1.0)continue;
+                vec3 qq=cross(tv,e1);
+                float vv=inv*dot(rd,qq);
+                if(vv<0.0||uu+vv>1.0)continue;
+                float tt=inv*dot(e2,qq);
+                if(tt>0.0&&tt<tHit){tHit=tt;hitTri=ti;}
+            }
+            continue;
+        }
+        int base=ni*4;
+        uvec4 n0=bvhNodes[base],n1=bvhNodes[base+1],n2=bvhNodes[base+2],n3=bvhNodes[base+3];
+        vec2 bx0=unpackHalf2x16(n0.x),bx1=unpackHalf2x16(n0.y),bx2=unpackHalf2x16(n0.z),bx3=unpackHalf2x16(n0.w);
+        vec2 by0=unpackHalf2x16(n1.x),by1=unpackHalf2x16(n1.y),by2=unpackHalf2x16(n1.z),by3=unpackHalf2x16(n1.w);
+        vec2 bz0=unpackHalf2x16(n2.x),bz1=unpackHalf2x16(n2.y),bz2=unpackHalf2x16(n2.z),bz3=unpackHalf2x16(n2.w);
+        ivec4 ch=ivec4(n3);
+
+        if(ch.x!=-1){float nX=sX?bx0.x:bx2.x,fX=sX?bx2.x:bx0.x,nY=sY?by0.x:by2.x,fY=sY?by2.x:by0.x,nZ=sZ?bz0.x:bz2.x,fZ=sZ?bz2.x:bz0.x;float tN=max(max(fma(nX,invD.x,ood.x),fma(nY,invD.y,ood.y)),fma(nZ,invD.z,ood.z));float tF=min(min(fma(fX,invD.x,ood.x),fma(fY,invD.y,ood.y)),fma(fZ,invD.z,ood.z));if(tN<=tF&&tF>0.0&&tN<tHit&&sp<STK)stk[sp++]=ch.x;}
+        if(ch.y!=-1){float nX=sX?bx0.y:bx2.y,fX=sX?bx2.y:bx0.y,nY=sY?by0.y:by2.y,fY=sY?by2.y:by0.y,nZ=sZ?bz0.y:bz2.y,fZ=sZ?bz2.y:bz0.y;float tN=max(max(fma(nX,invD.x,ood.x),fma(nY,invD.y,ood.y)),fma(nZ,invD.z,ood.z));float tF=min(min(fma(fX,invD.x,ood.x),fma(fY,invD.y,ood.y)),fma(fZ,invD.z,ood.z));if(tN<=tF&&tF>0.0&&tN<tHit&&sp<STK)stk[sp++]=ch.y;}
+        if(ch.z!=-1){float nX=sX?bx1.x:bx3.x,fX=sX?bx3.x:bx1.x,nY=sY?by1.x:by3.x,fY=sY?by3.x:by1.x,nZ=sZ?bz1.x:bz3.x,fZ=sZ?bz3.x:bz1.x;float tN=max(max(fma(nX,invD.x,ood.x),fma(nY,invD.y,ood.y)),fma(nZ,invD.z,ood.z));float tF=min(min(fma(fX,invD.x,ood.x),fma(fY,invD.y,ood.y)),fma(fZ,invD.z,ood.z));if(tN<=tF&&tF>0.0&&tN<tHit&&sp<STK)stk[sp++]=ch.z;}
+        if(ch.w!=-1){float nX=sX?bx1.y:bx3.y,fX=sX?bx3.y:bx1.y,nY=sY?by1.y:by3.y,fY=sY?by3.y:by1.y,nZ=sZ?bz1.y:bz3.y,fZ=sZ?bz3.y:bz1.y;float tN=max(max(fma(nX,invD.x,ood.x),fma(nY,invD.y,ood.y)),fma(nZ,invD.z,ood.z));float tF=min(min(fma(fX,invD.x,ood.x),fma(fY,invD.y,ood.y)),fma(fZ,invD.z,ood.z));if(tN<=tF&&tF>0.0&&tN<tHit&&sp<STK)stk[sp++]=ch.w;}
+    }
+
+    vec4 color;
+    if(tHit>=1e20){float vv=float(py)/float(height);color=vec4((20.0+10.0*(1.0-vv))/255.0,(30.0+20.0*(1.0-vv))/255.0,(60.0+100.0*vv)/255.0,1.0);}
+    else{
+        int b=hitTri*3;
+        vec4 p0=triPacked[b],p1=triPacked[b+1],p2=triPacked[b+2];
+        vec3 v0=p0.xyz;
+        vec3 e1=vec3(p0.w,p1.xy)-v0;
+        vec3 e2=vec3(p1.zw,p2.x)-v0;
+        vec3 n=normalize(cross(e1,e2));if(dot(n,rd)>0.0)n=-n;
+        float shade=min(0.15+0.65*max(dot(n,normalize(vec3(0.5,0.7,0.5))),0.0)+0.2*pow(1.0-abs(dot(n,-rd)),3.0),1.0);
+        color=vec4(shade*0.92+0.08,shade*0.88+0.07,shade*0.82+0.06,1.0);
+    }
+    imageStore(outImage,ivec2(px,py),color);
+}
