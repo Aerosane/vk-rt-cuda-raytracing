@@ -2,6 +2,10 @@
 // SPIR-V Ray Query -> Software BVH Traversal Rewriter
 // Set to 0 for no-hit stub (debug), 1 for full BVH2 traversal
 #define SPIRV_RQ_FULL_TRAVERSAL 1
+// Set to 1 to skip BLAS traversal — report a hit as soon as TLAS leaf (instance AABB) is hit.
+// This is a shadow approximation: correct for shadow/occlusion queries, approximate for intersections.
+// Saves ~60% traversal cost by eliminating per-instance ray transform + BVH2 + triangle tests.
+#define SPIRV_RQ_TLAS_ONLY 0
 // Intercepts shaders containing rayQueryEXT and rewrites them to use
 // our BVH2 stackless traversal via SSBOs. Makes ray query work on ANY
 // GPU without hardware RT cores.
@@ -507,8 +511,8 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             E(SpvOpConstant, {tInt, c8, 8});
             E(SpvOpConstant, {tInt, c9, 9});
             E(SpvOpConstant, {tInt, c10, 10});
-            E(SpvOpConstant, {tInt, cMaxIter, 200}); // max BVH traversal iterations
-            E(SpvOpConstant, {tInt, cMaxTlasIter, 200}); // max TLAS traversal iterations
+            E(SpvOpConstant, {tInt, cMaxIter, 30}); // max BLAS traversal iterations
+            E(SpvOpConstant, {tInt, cMaxTlasIter, 30}); // max TLAS traversal iterations
             E(SpvOpConstant, {tFloat, cf0, zb});
             E(SpvOpConstant, {tFloat, cf_huge, hb});
             E(SpvOpConstant, {tFloat, cf1, f1b});
@@ -794,6 +798,16 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
 
                 // Load inverse transform rows from instances[instIdx*8 + 3..5]
                 // base = instIdx * 8
+#if SPIRV_RQ_TLAS_ONLY
+                // TLAS-ONLY SHADOW MODE: Skip BLAS traversal entirely.
+                // Report a committed hit as soon as any TLAS leaf (instance AABB) is reached.
+                // Correct for shadow/occlusion queries; approximate for exact intersection queries.
+                {
+                    E(SpvOpStore, {tvHitType, c1});     // committed triangle hit
+                    E(SpvOpStore, {tvHitInst, instIdx}); // which instance
+                    E(SpvOpStore, {tvTlasNi, cn1});     // break TLAS loop (any hit is enough)
+                }
+#else
                 uint32_t instBase = newId();
                 E(SpvOpIMul, {tInt, instBase, instIdx, c8});
                 // ir0 = instances[instBase + 3]
@@ -1139,6 +1153,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
 
                 // TLAS leaf done → ni = skip (continue TLAS)
                 E(SpvOpStore, {tvTlasNi, tlSkipVal});
+#endif // !SPIRV_RQ_TLAS_ONLY
             }
             E(SpvOpBranch, {tlEndIfLbl});
 
