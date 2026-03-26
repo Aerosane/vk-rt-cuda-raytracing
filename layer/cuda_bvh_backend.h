@@ -124,9 +124,11 @@ CudaBVH_t cudaBVH_buildFromAABBs(const float* aabbs, int numAABBs);
 
 /* Fast TLAS-only builder: BVH2 stackless data only (no BVH4, no CUDA, no SoA).
  * Produces packed uint32 array: 8 words per node.
- * Returns node count. Caller must free(*outNodes) when done.
+ * outOrdered: if non-null, receives malloc'd array of original indices in Morton order.
+ * Returns node count. Caller must free(*outNodes) and optionally free(*outOrdered) when done.
  * ~10× faster than cudaBVH_buildFromAABBs for per-frame TLAS rebuilds. */
-int cudaBVH_buildTLASFast(const float* aabbs, int numAABBs, uint32_t** outNodes);
+int cudaBVH_buildTLASFast(const float* aabbs, int numAABBs, uint32_t** outNodes,
+                          int** outOrdered = nullptr);
 
 /* Read GPU-only buffer data via CUDA external memory import.
  * fd: file descriptor exported from vkGetMemoryFdKHR

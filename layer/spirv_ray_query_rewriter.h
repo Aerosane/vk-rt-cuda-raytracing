@@ -3,9 +3,27 @@
 // Set to 0 for no-hit stub (debug), 1 for full BVH2 traversal
 #define SPIRV_RQ_FULL_TRAVERSAL 1
 // Set to 1 to skip BLAS traversal — report a hit as soon as TLAS leaf (instance AABB) is hit.
-// This is a shadow approximation: correct for shadow/occlusion queries, approximate for intersections.
-// Saves ~60% traversal cost by eliminating per-instance ray transform + BVH2 + triangle tests.
-#define SPIRV_RQ_TLAS_ONLY 0
+#define SPIRV_RQ_TLAS_ONLY 0  // TEMP: test TLAS traversal only
+// Set to 1 to ALWAYS report hit — bypasses traversal entirely (tests RT pipeline feedback path)
+#define SPIRV_RQ_ALWAYS_HIT 0
+// Set to 1 to force TLAS AABB test to always pass
+#define SPIRV_RQ_FORCE_TLAS_HIT 0
+// Set to 1 to dump rewritten SPIR-V to /tmp/spirv_rq_dump_*.spv
+#define SPIRV_RQ_DUMP 1
+// Set to 1 to test SSBO read: load root node word 0, if non-zero → hit
+#define SPIRV_RQ_SSBO_TEST 0
+// Set to 1 to suppress BVH SSBO injection (debug: test if SSBOs cause issues)
+#define SPIRV_RQ_NO_SSBO 0
+// Set to 1 to keep original capabilities, extensions, types, variables, decorations
+// (only replace RQ operations). Tests if stripping vs replacement causes dark frames.
+#define SPIRV_RQ_KEEP_TYPES 0
+// MINIMAL mode: when 1, skips full rewrite code and uses simpler RQ op handling.
+// Set to 0 for full BVH traversal rewrite in function bodies.
+#define SPIRV_RQ_MINIMAL 0
+// PASSTHROUGH mode: ONLY stub function calls to RQ functions with 1.0.
+// No type/cap/ext stripping, no RQ op replacement, no entry point modification.
+// Tests whether call stubbing alone vs everything else causes dark frames.
+#define SPIRV_RQ_PASSTHROUGH 0
 // Intercepts shaders containing rayQueryEXT and rewrites them to use
 // our BVH2 stackless traversal via SSBOs. Makes ray query work on ANY
 // GPU without hardware RT cores.
@@ -76,6 +94,7 @@ enum SpvRQ : uint16_t {
     SpvOpSGreaterThan           = 173,
     SpvOpSGreaterThanEqual      = 175,
     SpvOpSLessThan              = 177,
+    SpvOpFOrdNotEqual           = 182,
     SpvOpFOrdLessThan           = 184,
     SpvOpFOrdGreaterThan        = 186,
     SpvOpFOrdLessThanEqual      = 188,
@@ -195,6 +214,46 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
     int bvhDescSet, int bvhNodesBinding, int bvhTrisBinding)
 {
     if (numWords < 5 || code[0] != 0x07230203u) return {};
+
+    // --- Diagnostic: dump all RQ opcodes in original shader ---
+    {
+        size_t dp = 5;
+        while (dp < numWords) {
+            uint16_t dwc = (uint16_t)(code[dp] >> 16);
+            uint16_t dop = (uint16_t)(code[dp] & 0xFFFF);
+            if (dwc == 0 || dp + dwc > numWords) break;
+            if (dop == SpvOpRQInitialize)
+                fprintf(stderr, "[SPIRV-DIAG] OpRQInitialize wc=%d rqVar=%u\n", dwc, code[dp+1]);
+            else if (dop == SpvOpRQProceed)
+                fprintf(stderr, "[SPIRV-DIAG] OpRQProceed wc=%d resultType=%u result=%u rq=%u\n",
+                    dwc, code[dp+1], code[dp+2], code[dp+3]);
+            else if (dop == SpvOpRQGetIntersectionType)
+                fprintf(stderr, "[SPIRV-DIAG] OpRQGetIntersectionType wc=%d resultType=%u result=%u rq=%u intersection=%u\n",
+                    dwc, code[dp+1], code[dp+2], dwc>=5 ? code[dp+3] : 0, dwc>=5 ? code[dp+4] : 0);
+            else if (dop == SpvOpRQGetT)
+                fprintf(stderr, "[SPIRV-DIAG] OpRQGetT wc=%d resultType=%u result=%u rq=%u intersection=%u\n",
+                    dwc, code[dp+1], code[dp+2], dwc>=5 ? code[dp+3] : 0, dwc>=5 ? code[dp+4] : 0);
+            else if (dop == SpvOpRQGetBarycentrics)
+                fprintf(stderr, "[SPIRV-DIAG] OpRQGetBarycentrics wc=%d resultType=%u result=%u rq=%u intersection=%u\n",
+                    dwc, code[dp+1], code[dp+2], dwc>=5 ? code[dp+3] : 0, dwc>=5 ? code[dp+4] : 0);
+            else if (dop == SpvOpRQGetPrimIdx)
+                fprintf(stderr, "[SPIRV-DIAG] OpRQGetPrimIdx wc=%d rq=%u intersection=%u\n",
+                    dwc, dwc>=5 ? code[dp+3] : 0, dwc>=5 ? code[dp+4] : 0);
+            else if (dop == SpvOpRQGetInstId)
+                fprintf(stderr, "[SPIRV-DIAG] OpRQGetInstId wc=%d rq=%u intersection=%u\n",
+                    dwc, dwc>=5 ? code[dp+3] : 0, dwc>=5 ? code[dp+4] : 0);
+            else if (dop == SpvOpRQConfirmIntersection)
+                fprintf(stderr, "[SPIRV-DIAG] OpRQConfirmIntersection wc=%d rq=%u\n", dwc, dwc>=2 ? code[dp+1] : 0);
+            else if (dop == SpvOpRQTerminate)
+                fprintf(stderr, "[SPIRV-DIAG] OpRQTerminate wc=%d rq=%u\n", dwc, dwc>=2 ? code[dp+1] : 0);
+            else if (dop >= 4473 && dop <= 4479)
+                fprintf(stderr, "[SPIRV-DIAG] RQ opcode=%u wc=%d\n", dop, dwc);
+            else if (dop >= 6016 && dop <= 6032)
+                fprintf(stderr, "[SPIRV-DIAG] RQ get opcode=%u wc=%d args:", dop, dwc);
+            dp += dwc;
+        }
+        fprintf(stderr, "[SPIRV-DIAG] --- end scan ---\n");
+    }
 
     uint32_t nextId = code[3]; // current Bound
     auto newId = [&]() -> uint32_t { return nextId++; };
@@ -328,9 +387,378 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
         rqMap[rqv] = newId();
     }
 
+    // Pre-scan: identify functions that contain RQ operations
+    // Used to intercept calls to these functions and replace with constants
+    std::unordered_set<uint32_t> rqFuncIds;
+    // Also find shader's native types and constants
+    uint32_t nativeFloatType = 0, nativeFloat1 = 0, nativeFloat0 = 0;
+    uint32_t nativeBoolType = 0, nativeBoolFalse = 0;
+    uint32_t nativeUintType = 0, nativeUint0 = 0;
+    uint32_t nativeIntType = 0, nativeInt0 = 0, nativeInt1 = 0;
+    uint32_t nativeVoidType = 0;
+    uint32_t entryPointFunc = 0;
+    std::unordered_map<uint32_t, uint32_t> rqFuncRetType; // funcId -> returnTypeId
+    {
+        uint32_t curFunc = 0;
+        size_t sp = 5;
+        // Pass 1: find basic types
+        while (sp < numWords) {
+            uint16_t swc = (uint16_t)(code[sp] >> 16);
+            uint16_t sop = (uint16_t)(code[sp] & 0xFFFF);
+            if (swc == 0 || sp + swc > numWords) break;
+            if (sop == 22 /*OpTypeFloat*/ && swc >= 3 && code[sp+2] == 32)
+                nativeFloatType = code[sp+1];
+            if (sop == 20 /*OpTypeBool*/ && swc >= 2)
+                nativeBoolType = code[sp+1];
+            if (sop == 21 /*OpTypeInt*/ && swc >= 4 && code[sp+2] == 32 && code[sp+3] == 0)
+                nativeUintType = code[sp+1];
+            if (sop == 21 /*OpTypeInt*/ && swc >= 4 && code[sp+2] == 32 && code[sp+3] == 1)
+                nativeIntType = code[sp+1];
+            if (sop == 19 /*OpTypeVoid*/ && swc >= 2)
+                nativeVoidType = code[sp+1];
+            sp += swc;
+        }
+        // Pass 2: find constants and RQ functions
+        sp = 5;
+        while (sp < numWords) {
+            uint16_t swc = (uint16_t)(code[sp] >> 16);
+            uint16_t sop = (uint16_t)(code[sp] & 0xFFFF);
+            if (swc == 0 || sp + swc > numWords) break;
+            if (sop == 43 /*OpConstant*/ && swc >= 4) {
+                if (code[sp+1] == nativeFloatType) {
+                    float val; memcpy(&val, &code[sp+3], 4);
+                    if (val == 1.0f) nativeFloat1 = code[sp+2];
+                    if (val == 0.0f) nativeFloat0 = code[sp+2];
+                }
+                if (code[sp+1] == nativeUintType && code[sp+3] == 0)
+                    nativeUint0 = code[sp+2];
+                if (code[sp+1] == nativeIntType) {
+                    int32_t ival; memcpy(&ival, &code[sp+3], 4);
+                    if (ival == 0) nativeInt0 = code[sp+2];
+                    if (ival == 1) nativeInt1 = code[sp+2];
+                }
+            }
+            if (sop == 42 /*OpConstantFalse*/ && swc >= 3 && code[sp+1] == nativeBoolType)
+                nativeBoolFalse = code[sp+2];
+            if (sop == SpvOpFunction && swc >= 5) {
+                curFunc = code[sp+2];
+                rqFuncRetType[curFunc] = code[sp+1];
+            }
+            if (sop == SpvOpFunctionEnd) curFunc = 0;
+            if (curFunc && (sop == SpvOpRQInitialize || sop == SpvOpRQProceed ||
+                sop == SpvOpRQGetIntersectionType || sop == SpvOpRQGetT))
+                rqFuncIds.insert(curFunc);
+            // Capture entry point function ID
+            if (sop == SpvOpEntryPoint && swc >= 3)
+                entryPointFunc = code[sp+2];
+            sp += swc;
+        }
+        fprintf(stderr, "[SPIRV-RQ] Functions with RQ ops: %zu, entryPoint=%%%u, nativeFloat=%u f1=%u f0=%u bool=%u bF=%u uint=%u u0=%u\n",
+                rqFuncIds.size(), entryPointFunc, nativeFloatType, nativeFloat1, nativeFloat0,
+                nativeBoolType, nativeBoolFalse, nativeUintType, nativeUint0);
+        for (uint32_t fid : rqFuncIds) {
+            fprintf(stderr, "[SPIRV-RQ]   RQ func %%%u retType=%%%u\n", fid, rqFuncRetType[fid]);
+        }
+    }
+    bool entryHasRQ = rqFuncIds.count(entryPointFunc) > 0;
+    fprintf(stderr, "[SPIRV-RQ] entryHasRQ=%d\n", (int)entryHasRQ);
+
+#if SPIRV_RQ_PASSTHROUGH
+    // PASSTHROUGH: gut the RQ function body to just `return 1.0`
+    // and KEEP calls live (not stubbed) to test function body replacement
+    {
+        // Pre-scan for existing types we can reuse (avoids SPIR-V duplicate type errors)
+        uint32_t existVec3 = 0, existPtrFloat = 0, existPtrUint = 0;
+        uint32_t phB_intType = 0;
+        uint32_t phB_int0 = 0, phB_int1 = 0, phB_int2 = 0, phB_int3 = 0, phB_int4 = 0;
+        {
+            size_t ss = 5;
+            while (ss < numWords) {
+                uint16_t sw = (uint16_t)(code[ss] >> 16), so = (uint16_t)(code[ss] & 0xFFFF);
+                if (sw == 0 || ss + sw > numWords) break;
+                if (so == 23 /*OpTypeVector*/ && sw == 4 && code[ss+2] == nativeFloatType && code[ss+3] == 3)
+                    existVec3 = code[ss+1];
+                if (so == 32 /*OpTypePointer*/ && sw == 4 && code[ss+2] == 7 /*Function*/) {
+                    if (code[ss+3] == nativeFloatType && !existPtrFloat) existPtrFloat = code[ss+1];
+                    if (code[ss+3] == nativeUintType && !existPtrUint)   existPtrUint = code[ss+1];
+                }
+                if (so == 21 /*OpTypeInt*/ && sw >= 4 && code[ss+2] == 32 && code[ss+3] == 1)
+                    phB_intType = code[ss+1];
+                ss += sw;
+            }
+            if (!phB_intType) phB_intType = nextId++;
+        }
+        // Search for int constants 0-4
+        {
+            size_t ss = 5;
+            while (ss < numWords) {
+                uint16_t sw = (uint16_t)(code[ss] >> 16), so = (uint16_t)(code[ss] & 0xFFFF);
+                if (sw == 0 || ss + sw > numWords) break;
+                if (so == 43 /*OpConstant*/ && sw >= 4 && code[ss+1] == phB_intType) {
+                    int32_t v; memcpy(&v, &code[ss+3], 4);
+                    if (v == 0) phB_int0 = code[ss+2];
+                    if (v == 1) phB_int1 = code[ss+2];
+                    if (v == 2) phB_int2 = code[ss+2];
+                    if (v == 3) phB_int3 = code[ss+2];
+                    if (v == 4) phB_int4 = code[ss+2];
+                }
+                ss += sw;
+            }
+        }
+        
+        // Allocate IDs only for types that don't already exist
+        uint32_t phB_vec3 = existVec3 ? existVec3 : nextId++;
+        uint32_t phB_struct = nextId++, phB_structPtr = nextId++;
+        uint32_t phB_pFloat = existPtrFloat ? existPtrFloat : nextId++;
+        uint32_t phB_pUint = existPtrUint ? existPtrUint : nextId++;
+        
+        // First pass: collect IDs defined inside RQ function body for OpName stripping
+        std::unordered_set<uint32_t> rqBodyIds;
+        {
+            size_t sp = 5;
+            bool scanInRQ = false, scanPastLabel = false;
+            while (sp < numWords) {
+                uint16_t swc = (uint16_t)(code[sp] >> 16);
+                uint16_t sop = (uint16_t)(code[sp] & 0xFFFF);
+                if (swc == 0 || sp + swc > numWords) break;
+                if (sop == SpvOpFunction && swc >= 5) {
+                    uint32_t fid = code[sp+2];
+                    if (rqFuncIds.count(fid) && fid != entryPointFunc) {
+                        scanInRQ = true; scanPastLabel = false;
+                    }
+                }
+                if (sop == SpvOpFunctionEnd && scanInRQ) { scanInRQ = false; }
+                if (scanInRQ && scanPastLabel && sop != SpvOpFunctionEnd) {
+                    // Collect result ID (position 2 for most instructions with result)
+                    if (swc >= 3) rqBodyIds.insert(code[sp+2]);
+                    if (swc >= 2 && sop == 59 /*OpVariable*/) rqBodyIds.insert(code[sp+2]);
+                }
+                if (scanInRQ && sop == SpvOpLabel && !scanPastLabel) scanPastLabel = true;
+                sp += swc;
+            }
+            fprintf(stderr, "[SPIRV-RQ] PASSTHROUGH: collected %zu body IDs to strip\n", rqBodyIds.size());
+        }
+
+        size_t pp = 5;
+        int stubCount = 0;
+        bool inRQFunc = false;
+        bool pastFirstLabel = false;
+        while (pp < numWords) {
+            uint16_t pwc = (uint16_t)(code[pp] >> 16);
+            uint16_t pop = (uint16_t)(code[pp] & 0xFFFF);
+            if (pwc == 0 || pp + pwc > numWords) break;
+            bool pskip = false;
+
+            // Strip OpName/OpMemberName for gutted IDs
+            if ((pop == 5 /*OpName*/ || pop == 6 /*OpMemberName*/) && pwc >= 2 && rqBodyIds.count(code[pp+1])) {
+                pskip = true;
+            }
+            // Also strip OpDecorate for gutted IDs
+            if (pop == 71 /*OpDecorate*/ && pwc >= 2 && rqBodyIds.count(code[pp+1])) {
+                pskip = true;
+            }
+
+            // Track entering/exiting RQ functions (NOT the entry point)
+            if (pop == SpvOpFunction && pwc >= 5) {
+                uint32_t funcId = code[pp+2];
+                if (rqFuncIds.count(funcId) && funcId != entryPointFunc) {
+                    inRQFunc = true;
+                    pastFirstLabel = false;
+                }
+            }
+            if (pop == SpvOpFunctionEnd && inRQFunc) {
+                inRQFunc = false;
+                pastFirstLabel = false;
+            }
+
+            // Inside RQ function: keep OpFunction, params, first OpLabel
+            // Then emit OpReturnValue 1.0 and skip everything until OpFunctionEnd
+            if (inRQFunc) {
+                if (pop == SpvOpLabel && !pastFirstLabel) {
+                    pastFirstLabel = true;
+                    for (uint16_t j = 0; j < pwc; j++)
+                        out.push_back(code[pp + j]);
+                    
+                    // Emit a function body with a simple loop + return 1.0
+                    if (nativeFloat1 && nativeFloatType && nativeUintType && nativeUint0) {
+                        // Find native pointer types (Function storage)
+                        uint32_t ptrUint = 0, ptrFloat = 0;
+                        {
+                            size_t ss = 5;
+                            while (ss < numWords) {
+                                uint16_t sw = (uint16_t)(code[ss] >> 16);
+                                uint16_t so = (uint16_t)(code[ss] & 0xFFFF);
+                                if (sw == 0 || ss + sw > numWords) break;
+                                if (so == 32 /*OpTypePointer*/ && sw == 4 && code[ss+2] == 7 /*Function*/) {
+                                    if (code[ss+3] == nativeUintType && !ptrUint) ptrUint = code[ss+1];
+                                    if (code[ss+3] == nativeFloatType && !ptrFloat) ptrFloat = code[ss+1];
+                                }
+                                ss += sw;
+                            }
+                        }
+                        
+                        // Find or create uint constant 1
+                        uint32_t nUint1 = 0;
+                        {
+                            size_t ss = 5;
+                            while (ss < numWords) {
+                                uint16_t sw = (uint16_t)(code[ss] >> 16);
+                                uint16_t so = (uint16_t)(code[ss] & 0xFFFF);
+                                if (sw == 0 || ss + sw > numWords) break;
+                                if (so == 43 /*OpConstant*/ && sw >= 4 && code[ss+1] == nativeUintType && code[ss+3] == 1)
+                                    nUint1 = code[ss+2];
+                                ss += sw;
+                            }
+                        }
+                        
+                        if (ptrUint && ptrFloat && nUint1) {
+                            // Declare struct variable using Phase B types
+                            uint32_t varS = nextId++;  // struct variable
+                            uint32_t varI = nextId++;
+                            uint32_t varF = nextId++;
+                            spvEmit(out, 59 /*OpVariable*/, {phB_structPtr, varS, 7});
+                            spvEmit(out, 59 /*OpVariable*/, {ptrUint, varI, 7});
+                            spvEmit(out, 59 /*OpVariable*/, {ptrFloat, varF, 7});
+                            
+                            // Access struct member 2 (float) via OpAccessChain
+                            // Need int constant 2 for the index
+                            if (phB_int2 && phB_pFloat) {
+                                uint32_t ptrMember = nextId++;
+                                spvEmit(out, 65 /*OpAccessChain*/, {phB_pFloat, ptrMember, varS, phB_int2});
+                                spvEmit(out, 62 /*OpStore*/, {ptrMember, nativeFloat1});
+                                uint32_t loadM = nextId++;
+                                spvEmit(out, 61 /*OpLoad*/, {nativeFloatType, loadM, ptrMember});
+                                spvEmit(out, 254 /*OpReturnValue*/, {loadM});
+                                fprintf(stderr, "[SPIRV-RQ] PASSTHROUGH: gutted RQ func with STRUCT access body\n");
+                            } else {
+                                // Fallback: just use the counter loop
+                                spvEmit(out, 62 /*OpStore*/, {varI, nativeUint0});
+                                spvEmit(out, 62 /*OpStore*/, {varF, nativeFloat1});
+                                
+                                uint32_t lblMerge = nextId++, lblLoop = nextId++;
+                                uint32_t lblBody = nextId++, lblCont = nextId++;
+                                spvEmit(out, 249 /*OpBranch*/, {lblLoop});
+                                
+                                spvEmit(out, SpvOpLabel, {lblLoop});
+                                spvEmit(out, 246 /*OpLoopMerge*/, {lblMerge, lblCont, 0});
+                                spvEmit(out, 249 /*OpBranch*/, {lblBody});
+                                
+                                spvEmit(out, SpvOpLabel, {lblBody});
+                                uint32_t loadI = nextId++;
+                                spvEmit(out, 61 /*OpLoad*/, {nativeUintType, loadI, varI});
+                                uint32_t cmp = nextId++;
+                                spvEmit(out, 172 /*OpULessThan*/, {nativeBoolType, cmp, loadI, nUint1});
+                                spvEmit(out, 250 /*OpBranchConditional*/, {cmp, lblCont, lblMerge});
+                                
+                                spvEmit(out, SpvOpLabel, {lblCont});
+                                uint32_t addI = nextId++;
+                                spvEmit(out, 128 /*OpIAdd*/, {nativeUintType, addI, loadI, nUint1});
+                                spvEmit(out, 62 /*OpStore*/, {varI, addI});
+                                spvEmit(out, 249 /*OpBranch*/, {lblLoop});
+                                
+                                spvEmit(out, SpvOpLabel, {lblMerge});
+                                uint32_t loadF = nextId++;
+                                spvEmit(out, 61 /*OpLoad*/, {nativeFloatType, loadF, varF});
+                                spvEmit(out, 254 /*OpReturnValue*/, {loadF});
+                                
+                                fprintf(stderr, "[SPIRV-RQ] PASSTHROUGH: gutted RQ func with LOOP (no int2=%u pF=%u)\n", phB_int2, phB_pFloat);
+                            }
+                        } else {
+                            spvEmit(out, 254 /*OpReturnValue*/, {nativeFloat1});
+                            fprintf(stderr, "[SPIRV-RQ] PASSTHROUGH: gutted RQ func return 1.0 (ptrU=%u ptrF=%u u1=%u)\n",
+                                    ptrUint, ptrFloat, nUint1);
+                        }
+                    } else {
+                        spvEmit(out, 254 /*OpReturnValue*/, {nativeFloat1});
+                        fprintf(stderr, "[SPIRV-RQ] PASSTHROUGH: gutted RQ func to return 1.0 (basic)\n");
+                    }
+                    pskip = true;
+                } else if (pastFirstLabel && pop != SpvOpFunctionEnd) {
+                    pskip = true;
+                }
+            }
+
+            // DO NOT stub calls — keep them live
+            // (the gutted function body returns 1.0 when called)
+
+            if (!pskip) {
+                for (uint16_t j = 0; j < pwc; j++)
+                    out.push_back(code[pp + j]);
+            }
+            pp += pwc;
+        }
+        
+        // Inject Phase B types before first OpFunction using pre-allocated IDs
+        {
+            std::vector<uint32_t> typeInject;
+            auto E = [&](uint16_t o, std::vector<uint32_t> a){ spvEmit(typeInject, o, a); };
+            
+            if (nativeFloatType && nativeUintType) {
+                // Only emit types that don't already exist (pre-scanned above)
+                if (!existVec3)     E(SpvOpTypeVector,  {phB_vec3, nativeFloatType, 3});
+                if (!existPtrFloat) E(SpvOpTypePointer, {phB_pFloat, 7, nativeFloatType});
+                if (!existPtrUint)  E(SpvOpTypePointer, {phB_pUint, 7, nativeUintType});
+                E(SpvOpTypeStruct,  {phB_struct, phB_vec3, phB_vec3, nativeFloatType, nativeFloatType, nativeFloatType, nativeUintType, nativeUintType});
+                E(SpvOpTypePointer, {phB_structPtr, 7 /*Function*/, phB_struct});
+                
+                // Emit signed int type if shader doesn't have one
+                {
+                    bool intFound = false;
+                    size_t ss = 5;
+                    while (ss < numWords) {
+                        uint16_t sw = (uint16_t)(code[ss] >> 16), so = (uint16_t)(code[ss] & 0xFFFF);
+                        if (sw == 0 || ss + sw > numWords) break;
+                        if (so == 21 && sw >= 4 && code[ss+2] == 32 && code[ss+3] == 1)
+                            intFound = true;
+                        ss += sw;
+                    }
+                    if (!intFound) E(SpvOpTypeInt, {phB_intType, 32, 1});
+                }
+                
+                if (!phB_int0) { phB_int0 = nextId++; E(SpvOpConstant, {phB_intType, phB_int0, 0}); }
+                if (!phB_int1) { phB_int1 = nextId++; E(SpvOpConstant, {phB_intType, phB_int1, 1}); }
+                if (!phB_int2) { phB_int2 = nextId++; E(SpvOpConstant, {phB_intType, phB_int2, 2}); }
+                if (!phB_int3) { phB_int3 = nextId++; E(SpvOpConstant, {phB_intType, phB_int3, 3}); }
+                if (!phB_int4) { phB_int4 = nextId++; E(SpvOpConstant, {phB_intType, phB_int4, 4}); }
+            }
+            
+            size_t funcPos = 0;
+            for (size_t i = 5; i < out.size(); ) {
+                uint16_t w = (uint16_t)(out[i] >> 16);
+                uint16_t o2 = (uint16_t)(out[i] & 0xFFFF);
+                if (w == 0 || i + w > out.size()) break;
+                if (o2 == SpvOpFunction) { funcPos = i; break; }
+                i += w;
+            }
+            if (funcPos > 0 && !typeInject.empty()) {
+                out.insert(out.begin() + funcPos, typeInject.begin(), typeInject.end());
+                fprintf(stderr, "[SPIRV-RQ] PASSTHROUGH: injected %zu type words before OpFunction\n", typeInject.size());
+            }
+        }
+
+        out[3] = nextId; // set bound AFTER all ID allocations
+
+        fprintf(stderr, "[SPIRV-RQ] PASSTHROUGH: %zu -> %zu words, calls LIVE (not stubbed)\n",
+                numWords, out.size());
+#if SPIRV_RQ_DUMP
+        {
+            static int dumpIdx = 0;
+            char path[128];
+            snprintf(path, sizeof(path), "/tmp/spirv_rq_dump_%d.spv", dumpIdx++);
+            FILE* f = fopen(path, "wb");
+            if (f) { fwrite(out.data(), 4, out.size(), f); fclose(f); }
+            fprintf(stderr, "[SPIRV-RQ] Dumped %zu words to %s\n", out.size(), path);
+        }
+#endif
+        return out;
+    }
+#endif // SPIRV_RQ_PASSTHROUGH
+
     // Track when we're inside a function's first block to emit variables
     bool inFunction = false;
     bool emittedFuncVars = false;
+    uint32_t currentFuncId = 0;  // tracks which function we're currently inside
+    bool inEntryRQ = false;      // true when inside entry point that has RQ ops
 
     // Two-phase injection:
     // Phase A: Decorations (must go in annotation section, before types)
@@ -345,6 +773,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
 
         bool skip = false;
 
+#if !SPIRV_RQ_KEEP_TYPES
         // Remove ray query / accel struct capabilities
         if (op == SpvOpCapability && wc >= 2) {
             uint32_t cap = code[pos+1];
@@ -366,6 +795,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             if (strstr(extName, "ray_query") || strstr(extName, "ray_tracing"))
                 skip = true;
         }
+#endif // !SPIRV_RQ_KEEP_TYPES
 
         // Capture GLSL.std.450 extended instruction set ID
         if (op == SpvOpExtInstImport && wc >= 3) {
@@ -374,6 +804,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 glslExtId = code[pos+1];
         }
 
+#if !SPIRV_RQ_KEEP_TYPES
         // Remove OpName for deleted variables/types
         if (op == 5 /*OpName*/ && wc >= 3) {
             uint32_t target = code[pos+1];
@@ -382,6 +813,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 rqPtrTypeIds.count(target) || asPtrTypeIds.count(target))
                 skip = true;
         }
+#endif // !SPIRV_RQ_KEEP_TYPES
 
         // Rewrite OpEntryPoint: remove deleted interface variable IDs
         if (op == SpvOpEntryPoint && wc >= 4) {
@@ -406,19 +838,25 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             // Interface variables: filter out deleted ones, add BVH vars
             for (size_t j = nameEnd; j < wc; j++) {
                 uint32_t id = code[pos + j];
+#if !SPIRV_RQ_KEEP_TYPES
                 if (!rqVarIds.count(id) && !asVarIds.count(id))
+#endif
                     newEP.push_back(id);
             }
             // Add our BVH SSBO variables to the interface
+#if !SPIRV_RQ_NO_SSBO
             newEP.push_back(vNodes);
             newEP.push_back(vTris);
             newEP.push_back(vTlas);
             newEP.push_back(vInst);
+#endif
             spvEmit(out, SpvOpEntryPoint, newEP);
             skip = true;
         }
 
-        // Remove ray query and accel struct types
+#if !SPIRV_RQ_KEEP_TYPES
+        // Remove ray query and accel struct types (always — we rewrite all RQ ops)
+        {
         if (op == SpvOpTypeRayQueryKHR || op == SpvOpTypeAccelStructKHR) skip = true;
         // Remove pointer-to-rq and pointer-to-AS types
         if (op == SpvOpTypePointer && wc >= 4) {
@@ -442,10 +880,13 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             if (rqVarIds.count(code[pos+3]) || asVarIds.count(code[pos+3]))
                 skip = true;
         }
+        } // type/var removal block
+#endif // !SPIRV_RQ_KEEP_TYPES
 
         // --- Phase A: Inject decorations before type definitions start ---
         // Types start with OpTypeVoid/Bool/Int/Float/Vector/etc.
         // Decorations must come before them.
+#if !SPIRV_RQ_MINIMAL
         if (!injectedDecorations &&
             (op == SpvOpTypeVoid || op == SpvOpTypeBool || op == SpvOpTypeInt ||
              op == SpvOpTypeFloat || op == SpvOpTypeVector || op == SpvOpTypeStruct ||
@@ -455,6 +896,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             auto E = [&](uint16_t o, std::vector<uint32_t> a){ spvEmit(out, o, a); };
 
             // BVH SSBO decorations
+#if !SPIRV_RQ_NO_SSBO
             E(SpvOpDecorate, {tNodesRA, (uint32_t)DecArrayStride, 16});
             E(SpvOpDecorate, {tTrisRA,  (uint32_t)DecArrayStride, 16});
             E(SpvOpDecorate, {tNodesS,  (uint32_t)DecBlock});
@@ -480,8 +922,11 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             E(SpvOpDecorate, {vTlas, (uint32_t)DecBinding, 2u});
             E(SpvOpDecorate, {vInst, (uint32_t)DecDescriptorSet, (uint32_t)bvhDescSet});
             E(SpvOpDecorate, {vInst, (uint32_t)DecBinding, 3u});
+#endif // !SPIRV_RQ_NO_SSBO
         }
+#endif // !SPIRV_RQ_MINIMAL (Phase A)
 
+#if !SPIRV_RQ_MINIMAL
         // --- Phase B: Inject types + variables before first OpFunction ---
         if (op == SpvOpFunction && !injectedTypes) {
             injectedTypes = true;
@@ -513,8 +958,8 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             E(SpvOpConstant, {tInt, c8, 8});
             E(SpvOpConstant, {tInt, c9, 9});
             E(SpvOpConstant, {tInt, c10, 10});
-            E(SpvOpConstant, {tInt, cMaxIter, 30}); // max BLAS traversal iterations
-            E(SpvOpConstant, {tInt, cMaxTlasIter, 30}); // max TLAS traversal iterations
+            E(SpvOpConstant, {tInt, cMaxIter, 30}); // max BLAS traversal iterations (30 = safe for TDR)
+            E(SpvOpConstant, {tInt, cMaxTlasIter, 512}); // max TLAS traversal iterations (137K+ nodes)
             E(SpvOpConstant, {tFloat, cf0, zb});
             E(SpvOpConstant, {tFloat, cf_huge, hb});
             E(SpvOpConstant, {tFloat, cf1, f1b});
@@ -528,10 +973,10 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             if (needTrue)  E(SpvOpConstantTrue,  {tBool, cTrue});
             if (needFalse) E(SpvOpConstantFalse, {tBool, cFalse});
 
-            // RQ state struct
+            // RQ state struct (member 8 = hitType is uint to match OpRayQueryGetIntersectionTypeKHR)
             E(SpvOpTypeStruct, {tRQStruct,
                 tVec3, tVec3, tFloat, tFloat,
-                tFloat, tVec2, tInt, tInt, tInt, tInt, tInt});
+                tFloat, tVec2, tInt, tInt, tUint, tInt, tInt});
             E(SpvOpTypePointer, {tRQPtr, (uint32_t)SCFunction, tRQStruct});
 
             // Function-scope pointer types for AccessChain
@@ -543,6 +988,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             E(SpvOpTypePointer, {pVec4F, (uint32_t)SCFunction, tVec4});
 
             // BVH nodes SSBO: buffer { uvec4 data[]; }
+#if !SPIRV_RQ_NO_SSBO
             E(SpvOpTypeRuntimeArray, {tNodesRA, tUvec4});
             E(SpvOpTypeStruct,       {tNodesS, tNodesRA});
             E(SpvOpTypePointer,      {tNodesP, (uint32_t)SCStorageBuffer, tNodesS});
@@ -567,15 +1013,23 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             E(SpvOpVariable,         {tInstP, vInst, (uint32_t)SCStorageBuffer});
 
             fprintf(stderr, "[SPIRV-RQ] Injected BVH SSBOs set=%d bind=0,1,2,3\n", bvhDescSet);
+#else
+            fprintf(stderr, "[SPIRV-RQ] SSBO injection SUPPRESSED (SPIRV_RQ_NO_SSBO=1)\n");
+#endif
         }
+#endif // !SPIRV_RQ_MINIMAL (Phase B)
 
+#if !SPIRV_RQ_MINIMAL
         // Track function entry: emit rq struct variables after first OpLabel
-        if (op == SpvOpFunction) {
+        if (op == SpvOpFunction && wc >= 3) {
             inFunction = true;
             emittedFuncVars = false;
+            currentFuncId = code[pos+2];
+            inEntryRQ = (currentFuncId == entryPointFunc && entryHasRQ);
         }
         if (op == SpvOpFunctionEnd) {
             inFunction = false;
+            inEntryRQ = false;
         }
         // After each OpLabel in a function's first block, emit our variables
         // Only emit variables that haven't been emitted yet (they should only
@@ -603,7 +1057,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             // Copy the OpLabel first
             for (uint16_t j = 0; j < wc; j++)
                 out.push_back(code[pos + j]);
-            // Only emit rq struct variables in functions that use ray queries
+            // Emit rq struct variables in ALL functions that use ray queries
             if (hasRQOps) {
                 for (auto& kv : rqMap) {
                     spvEmit(out, SpvOpVariable, {tRQPtr, kv.second, (uint32_t)SCFunction});
@@ -614,7 +1068,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 spvEmit(out, SpvOpVariable, {pFloat, tvHitU,    (uint32_t)SCFunction});
                 spvEmit(out, SpvOpVariable, {pFloat, tvHitV,    (uint32_t)SCFunction});
                 spvEmit(out, SpvOpVariable, {pInt,   tvHitPrim, (uint32_t)SCFunction});
-                spvEmit(out, SpvOpVariable, {pInt,   tvHitType, (uint32_t)SCFunction});
+                spvEmit(out, SpvOpVariable, {pUint,  tvHitType, (uint32_t)SCFunction});
                 spvEmit(out, SpvOpVariable, {pInt,   tvTriIdx,  (uint32_t)SCFunction});
                 spvEmit(out, SpvOpVariable, {pInt,   tvIter,    (uint32_t)SCFunction});
                 // TLAS traversal variables
@@ -628,6 +1082,19 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             }
             skip = true; // already copied OpLabel
         }
+#endif // !SPIRV_RQ_MINIMAL (func vars & RQ ops section start)
+
+#if SPIRV_RQ_MINIMAL
+        // MINIMAL mode: keep RQ ops unchanged. CRITICAL: Do NOT replace RQ ops with
+        // OpUndef or constants in dead functions — NVIDIA's compiler corrupts the entire
+        // shader even when the function containing modified ops is never called.
+        // Function calls are stubbed by STUB_CALLS instead.
+        { /* intentionally empty — all RQ ops pass through unchanged */ }
+#else // !SPIRV_RQ_MINIMAL — full rewrite mode
+
+        // Rewrite ALL RQ operations, including those in the entry point.
+        // V100 has NO native RT — all RQ ops must be replaced with BVH2 traversal.
+        {
 
         // --- Replace OpRayQueryInitializeKHR ---
         // Run FULL BVH2 stackless traversal eagerly, store results in struct
@@ -673,10 +1140,10 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             uint32_t a7 = newId();
             E(SpvOpAccessChain, {pInt, a7, sv, c7});
             E(SpvOpStore, {a7, cn1});
-            // member 8: hitType = 0 (none)
+            // member 8: hitType = 0u (none) — uint to match OpRayQueryGetIntersectionTypeKHR
             uint32_t a8 = newId();
-            E(SpvOpAccessChain, {pInt, a8, sv, c8});
-            E(SpvOpStore, {a8, c0});
+            E(SpvOpAccessChain, {pUint, a8, sv, c8});
+            E(SpvOpStore, {a8, cu0});
             // member 9: nodeIdx = 0
             uint32_t a9 = newId();
             E(SpvOpAccessChain, {pInt, a9, sv, c9});
@@ -698,12 +1165,43 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             E(SpvOpStore, {tvHitU, cf0});
             E(SpvOpStore, {tvHitV, cf0});
             E(SpvOpStore, {tvHitPrim, cn1});
-            E(SpvOpStore, {tvHitType, c0});
+            E(SpvOpStore, {tvHitType, cu0});
             E(SpvOpStore, {tvIter, c0});
             // TLAS traversal init
             E(SpvOpStore, {tvTlasNi, c0});
             E(SpvOpStore, {tvTlasIter, c0});
             E(SpvOpStore, {tvHitInst, cn1});
+
+#if SPIRV_RQ_ALWAYS_HIT
+            // ALWAYS-HIT: set results and prevent TLAS loop from executing
+            E(SpvOpStore, {tvHitType, cu1});     // committed triangle hit
+            E(SpvOpStore, {tvBestT, cf1});       // hitT = 1.0 (dummy distance)
+            E(SpvOpStore, {tvHitInst, c0});      // instance 0
+            E(SpvOpStore, {tvHitPrim, c0});      // primitive 0
+            E(SpvOpStore, {tvTlasNi, cn1});      // prevent loop from executing (ni=-1 < 0)
+            fprintf(stderr, "[SPIRV-RQ] ALWAYS-HIT mode: bypassing traversal\n");
+#endif
+
+#if SPIRV_RQ_SSBO_TEST
+            // SSBO READ TEST: Load uint word 0 from TLAS SSBO, check if non-zero (integer)
+            {
+                uint32_t ssboPtr = newId(), ssboVal = newId();
+                E(SpvOpAccessChain, {pUvec4SB, ssboPtr, vTlas, c0, c0});  // tlas[0]
+                E(SpvOpLoad, {tUvec4, ssboVal, ssboPtr});
+                uint32_t ssboW0 = newId();
+                E(SpvOpCompositeExtract, {tUint, ssboW0, ssboVal, 0});
+                // Integer comparison: if raw uint bits != 0 → data present
+                uint32_t cu0 = newId(), ssboNz = newId();
+                E(SpvOpBitcast, {tUint, cu0, c0}); // int 0 → uint 0
+                E(SpvOpINotEqual, {tBool, ssboNz, ssboW0, cu0});
+                uint32_t ssboHitType = newId();
+                E(SpvOpSelect, {tUint, ssboHitType, ssboNz, cu1, cu0});
+                E(SpvOpStore, {tvHitType, ssboHitType});
+                E(SpvOpStore, {tvBestT, cf1}); // dummy hitT
+                E(SpvOpStore, {tvTlasNi, cn1}); // skip traversal loop
+                fprintf(stderr, "[SPIRV-RQ] SSBO_TEST: uint read from TLAS[0].x\n");
+            }
+#endif
 
             // World-space ray origin and direction
             uint32_t ro = newId(), rd = newId();
@@ -767,6 +1265,12 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
 
             spvEmit(out, SpvOpLabel, {tlInner});
 
+#if SPIRV_RQ_FORCE_TLAS_HIT
+            // DEBUG: Force hit on EVERY iteration
+            E(SpvOpStore, {tvHitType, cu1});    // committed hit
+            E(SpvOpStore, {tvTlasNi, cn1});    // exit loop after this iteration
+#endif
+
             // Load TLAS node: tw0 = tlasNodes[tlasNi*2], tw1 = tlasNodes[tlasNi*2+1]
             uint32_t tlNi2 = newId(), tlNi2p1 = newId();
             E(SpvOpIMul, {tInt, tlNi2, tlNiVal, c2});
@@ -807,7 +1311,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 // Report a committed hit as soon as any TLAS leaf (instance AABB) is reached.
                 // Correct for shadow/occlusion queries; approximate for exact intersection queries.
                 {
-                    E(SpvOpStore, {tvHitType, c1});     // committed triangle hit
+                    E(SpvOpStore, {tvHitType, cu1});     // committed triangle hit
                     E(SpvOpStore, {tvHitInst, instIdx}); // which instance
                     E(SpvOpStore, {tvTlasNi, cn1});     // break TLAS loop (any hit is enough)
                 }
@@ -839,15 +1343,14 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 E(SpvOpIAdd, {tInt, ib7Idx, instBase, c7});
                 E(SpvOpAccessChain, {pVec4SB, pIb7, vInst, c0, ib7Idx});
                 E(SpvOpLoad, {tVec4, ib7, pIb7});
-                // blasNodeOff = floatBitsToInt(ib6.w), blasTriOff = floatBitsToInt(ib7.w)
-                uint32_t ib6wF = newId(), ib7wF = newId(), ib6wU = newId(), ib7wU = newId();
+                // blasNodeOff = int(ib6.w), blasTriOff = int(ib7.w)
+                // Values stored as actual floats (not bit-punned) to avoid denormal flush
+                uint32_t ib6wF = newId(), ib7wF = newId();
                 uint32_t blasNOff = newId(), blasTOff = newId();
                 E(SpvOpCompositeExtract, {tFloat, ib6wF, ib6, 3});
                 E(SpvOpCompositeExtract, {tFloat, ib7wF, ib7, 3});
-                E(SpvOpBitcast, {tUint, ib6wU, ib6wF});
-                E(SpvOpBitcast, {tUint, ib7wU, ib7wF});
-                E(SpvOpBitcast, {tInt, blasNOff, ib6wU});
-                E(SpvOpBitcast, {tInt, blasTOff, ib7wU});
+                E(SpvOpConvertFToS, {tInt, blasNOff, ib6wF});
+                E(SpvOpConvertFToS, {tInt, blasTOff, ib7wF});
                 E(SpvOpStore, {tvBlasNodeOff, blasNOff});
                 E(SpvOpStore, {tvBlasTriOff, blasTOff});
 
@@ -1085,7 +1588,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                     E(SpvOpStore, {tvHitU, uu});
                     E(SpvOpStore, {tvHitV, vv});
                     E(SpvOpStore, {tvHitPrim, tst0}); // BLAS-local primitive index
-                    E(SpvOpStore, {tvHitType, c1});
+                    E(SpvOpStore, {tvHitType, cu1});
                     E(SpvOpStore, {tvHitInst, instIdx}); // record which instance was hit
                     E(SpvOpBranch, {lHitEnd});
                     spvEmit(out, SpvOpLabel, {lHitEnd});
@@ -1244,7 +1747,12 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
 
                 uint32_t tlNiPlus1 = newId(), tlNewNi = newId();
                 E(SpvOpIAdd, {tInt, tlNiPlus1, tlNiVal, c1});
+#if SPIRV_RQ_FORCE_TLAS_HIT
+                // Force AABB test to always pass — always go to left child
+                E(SpvOpCopyObject, {tInt, tlNewNi, tlNiPlus1});
+#else
                 E(SpvOpSelect, {tInt, tlNewNi, tlAh2, tlNiPlus1, tlSkipVal});
+#endif
                 E(SpvOpStore, {tvTlasNi, tlNewNi});
             }
             E(SpvOpBranch, {tlEndIfLbl});
@@ -1265,33 +1773,48 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             // --- TLAS Loop merge: store results to struct ---
             spvEmit(out, SpvOpLabel, {tlMerge});
             {
-                // Store bestT → member 4 (hitT)
-                uint32_t finalT = newId(), pa4 = newId();
-                E(SpvOpLoad, {tFloat, finalT, tvBestT});
-                E(SpvOpAccessChain, {pFloat, pa4, sv, c4});
-                E(SpvOpStore, {pa4, finalT});
-                // Store hitU, hitV → member 5 (bary as vec2)
-                uint32_t finalU = newId(), finalV = newId(), bary = newId(), pa5 = newId();
-                E(SpvOpLoad, {tFloat, finalU, tvHitU});
-                E(SpvOpLoad, {tFloat, finalV, tvHitV});
-                E(SpvOpCompositeConstruct, {tVec2, bary, finalU, finalV});
-                E(SpvOpAccessChain, {pVec2, pa5, sv, c5});
-                E(SpvOpStore, {pa5, bary});
-                // Store hitPrim → member 6
-                uint32_t finalPrim = newId(), pa6 = newId();
-                E(SpvOpLoad, {tInt, finalPrim, tvHitPrim});
-                E(SpvOpAccessChain, {pInt, pa6, sv, c6});
-                E(SpvOpStore, {pa6, finalPrim});
-                // Store hitInst → member 7
-                uint32_t finalInst = newId(), pa7 = newId();
-                E(SpvOpLoad, {tInt, finalInst, tvHitInst});
-                E(SpvOpAccessChain, {pInt, pa7, sv, c7});
-                E(SpvOpStore, {pa7, finalInst});
-                // Store hitType → member 8
-                uint32_t finalType = newId(), pa8 = newId();
-                E(SpvOpLoad, {tInt, finalType, tvHitType});
-                E(SpvOpAccessChain, {pInt, pa8, sv, c8});
-                E(SpvOpStore, {pa8, finalType});
+                // Only overwrite struct members if we actually found a hit.
+                // On miss, keep the initial values (hitT=1e30, hitType=0, etc.)
+                uint32_t finalType = newId();
+                E(SpvOpLoad, {tUint, finalType, tvHitType});
+                uint32_t hasHit = newId();
+                E(SpvOpINotEqual, {tBool, hasHit, finalType, cu0});
+                uint32_t storeLbl = newId(), skipStoreLbl = newId(), mergeStoreLbl = newId();
+                spvEmit(out, SpvOpSelectionMerge, {mergeStoreLbl, 0});
+                E(SpvOpBranchConditional, {hasHit, storeLbl, skipStoreLbl});
+                spvEmit(out, SpvOpLabel, {storeLbl});
+                {
+                    // Store bestT → member 4 (hitT)
+                    uint32_t finalT = newId(), pa4 = newId();
+                    E(SpvOpLoad, {tFloat, finalT, tvBestT});
+                    E(SpvOpAccessChain, {pFloat, pa4, sv, c4});
+                    E(SpvOpStore, {pa4, finalT});
+                    // Store hitU, hitV → member 5 (bary as vec2)
+                    uint32_t finalU = newId(), finalV = newId(), bary = newId(), pa5 = newId();
+                    E(SpvOpLoad, {tFloat, finalU, tvHitU});
+                    E(SpvOpLoad, {tFloat, finalV, tvHitV});
+                    E(SpvOpCompositeConstruct, {tVec2, bary, finalU, finalV});
+                    E(SpvOpAccessChain, {pVec2, pa5, sv, c5});
+                    E(SpvOpStore, {pa5, bary});
+                    // Store hitPrim → member 6
+                    uint32_t finalPrim = newId(), pa6 = newId();
+                    E(SpvOpLoad, {tInt, finalPrim, tvHitPrim});
+                    E(SpvOpAccessChain, {pInt, pa6, sv, c6});
+                    E(SpvOpStore, {pa6, finalPrim});
+                    // Store hitInst → member 7
+                    uint32_t finalInst = newId(), pa7 = newId();
+                    E(SpvOpLoad, {tInt, finalInst, tvHitInst});
+                    E(SpvOpAccessChain, {pInt, pa7, sv, c7});
+                    E(SpvOpStore, {pa7, finalInst});
+                    // Store hitType → member 8 (uint)
+                    uint32_t pa8 = newId();
+                    E(SpvOpAccessChain, {pUint, pa8, sv, c8});
+                    E(SpvOpStore, {pa8, finalType});
+                }
+                E(SpvOpBranch, {mergeStoreLbl});
+                spvEmit(out, SpvOpLabel, {skipStoreLbl});
+                E(SpvOpBranch, {mergeStoreLbl});
+                spvEmit(out, SpvOpLabel, {mergeStoreLbl});
             }
 
             fprintf(stderr, "[SPIRV-RQ] V2 2-level BVH traversal emitted for rq=%u\n", rqVar);
@@ -1334,7 +1857,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             getField(code[pos+2], code[pos+3], 7, tInt, pInt); skip = true;
         }
         if (op == SpvOpRQGetIntersectionType && wc >= 5) {
-            getField(code[pos+2], code[pos+3], 8, tInt, pInt); skip = true;
+            getField(code[pos+2], code[pos+3], 8, tUint, pUint); skip = true;
         }
         if (op == SpvOpRQGetWorldRayDir && wc >= 4) {
             uint32_t sv = rqMap.count(code[pos+3]) ? rqMap[code[pos+3]] : code[pos+3];
@@ -1390,8 +1913,58 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             spvEmit(out, SpvOpCopyObject, {tBool, code[pos+2], cTrue});
             skip = true;
         }
+        } // end of RQ operations rewrite block
+#endif // !SPIRV_RQ_MINIMAL (end of full-rewrite RQ ops)
+
+        // DIAGNOSTIC: Force all image writes to white vec4(1,1,1,1)
+#define SPIRV_RQ_FORCE_WHITE 0
+#if SPIRV_RQ_FORCE_WHITE
+        if (op == 99 /*OpImageWrite*/ && wc >= 4) {
+            uint32_t whiteVec = newId();
+            spvEmit(out, SpvOpCompositeConstruct, {tVec4, whiteVec, cf1, cf1, cf1, cf1});
+            std::vector<uint32_t> args;
+            args.push_back(code[pos+1]);
+            args.push_back(code[pos+2]);
+            args.push_back(whiteVec);
+            for (uint16_t j = 4; j < wc; j++)
+                args.push_back(code[pos+j]);
+            spvEmit(out, (uint16_t)99, args);
+            skip = true;
+        }
+#endif
+        // DIAGNOSTIC: Skip image writes in shaders where entry point has RQ ops
+        // Tests if these shaders overwrite other shaders' correct output
+#define SPIRV_RQ_SKIP_ENTRY_RQ_WRITES 0
+#if SPIRV_RQ_SKIP_ENTRY_RQ_WRITES
+        if (op == 99 /*OpImageWrite*/ && entryHasRQ) {
+            skip = true; // drop the image write entirely
+        }
+#endif
+
+        // DIAGNOSTIC: Replace calls to RQ-containing functions with constant
+#define SPIRV_RQ_STUB_CALLS 0
+#if SPIRV_RQ_STUB_CALLS
+        if (op == 57 /*OpFunctionCall*/ && wc >= 4) {
+            uint32_t resultType = code[pos+1];
+            uint32_t resultId = code[pos+2];
+            uint32_t calledFunc = code[pos+3];
+            bool isRqFunc = rqFuncIds.count(calledFunc) > 0;
+            if (isRqFunc) {
+                if (nativeFloat1 && resultType == nativeFloatType) {
+                    spvEmit(out, SpvOpCopyObject, {nativeFloatType, resultId, nativeFloat1});
+                    fprintf(stderr, "[SPIRV-RQ] STUB_CALL: %%%u = call %%%u -> 1.0f\n", resultId, calledFunc);
+                } else {
+                    spvEmit(out, 1 /*OpUndef*/, {resultType, resultId});
+                    fprintf(stderr, "[SPIRV-RQ] STUB_CALL: %%%u = call %%%u -> OpUndef (type %%%u)\n",
+                            resultId, calledFunc, resultType);
+                }
+                skip = true;
+            }
+        }
+#endif
 
         // Copy unchanged instructions
+        copy_unchanged:
         if (!skip) {
             for (uint16_t j = 0; j < wc; j++)
                 out.push_back(code[pos + j]);
@@ -1402,6 +1975,21 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
     out[3] = nextId; // patch Bound
     fprintf(stderr, "[SPIRV-RQ] Rewrite: %zu -> %zu words, bound %u\n",
             numWords, out.size(), nextId);
+
+#if SPIRV_RQ_DUMP
+    {
+        static int dumpIdx = 0;
+        char path[128];
+        snprintf(path, sizeof(path), "/tmp/spirv_rq_dump_%d.spv", dumpIdx++);
+        FILE* f = fopen(path, "wb");
+        if (f) {
+            fwrite(out.data(), 4, out.size(), f);
+            fclose(f);
+            fprintf(stderr, "[SPIRV-RQ] Dumped %zu words to %s\n", out.size(), path);
+        }
+    }
+#endif
+
     return out;
 }
 

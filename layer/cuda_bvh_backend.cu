@@ -16,6 +16,12 @@
 #include <cfloat>
 #include <algorithm>
 
+// When building for the Vulkan layer, skip all CUDA device operations (cudaMalloc,
+// cudaMemcpy, kernel launches). We only need host-side BVH data for Vulkan compute.
+#ifndef BVH_LAYER_MODE
+#define BVH_LAYER_MODE 1
+#endif
+
 #define CK(x) do{cudaError_t e=(x);if(e){fprintf(stderr,"[CudaBVH] CUDA %s:%d %s\n",__FILE__,__LINE__,cudaGetErrorString(e));}}while(0)
 
 // ======================== Data Structures ========================
@@ -553,6 +559,7 @@ CudaBVH_t cudaBVH_build(const CudaTri* tris, int numTris) {
     h->numB4Nodes = numB4;
     h->numOrderedTris = numOrd;
 
+#if !BVH_LAYER_MODE
     // Upload BVH4
     CK(cudaMalloc(&h->d_bvh4, numB4 * 4 * sizeof(int4)));
     CK(cudaMemcpy(h->d_bvh4, h_bvh4, numB4 * 4 * sizeof(int4), cudaMemcpyHostToDevice));
@@ -561,10 +568,11 @@ CudaBVH_t cudaBVH_build(const CudaTri* tris, int numTris) {
     int constN = (numB4 < CONST_BVH4) ? numB4 : CONST_BVH4;
     CK(cudaMemcpyToSymbol(c_bvh4_bk, h_bvh4, constN * sizeof(BVH4Node)));
     CK(cudaMemcpyToSymbol(c_bvh4N_bk, &constN, sizeof(int)));
+#endif
     // Keep host copy for Vulkan compute upload
     h->h_bvh4Copy = h_bvh4;  // DON'T free — needed for compute shader
 
-    // Upload SoA triangles
+    // Upload SoA triangles (host copies always needed)
     float *h0x=(float*)malloc(numOrd*4),*h0y=(float*)malloc(numOrd*4),*h0z=(float*)malloc(numOrd*4);
     float *h1x=(float*)malloc(numOrd*4),*h1y=(float*)malloc(numOrd*4),*h1z=(float*)malloc(numOrd*4);
     float *h2x=(float*)malloc(numOrd*4),*h2y=(float*)malloc(numOrd*4),*h2z=(float*)malloc(numOrd*4);
@@ -573,23 +581,26 @@ CudaBVH_t cudaBVH_build(const CudaTri* tris, int numTris) {
         h1x[i]=bvh2.ordered[i].v1.x;h1y[i]=bvh2.ordered[i].v1.y;h1z[i]=bvh2.ordered[i].v1.z;
         h2x[i]=bvh2.ordered[i].v2.x;h2y[i]=bvh2.ordered[i].v2.y;h2z[i]=bvh2.ordered[i].v2.z;
     }
+#if !BVH_LAYER_MODE
     CK(cudaMalloc(&h->d_tv0x,numOrd*4));CK(cudaMalloc(&h->d_tv0y,numOrd*4));CK(cudaMalloc(&h->d_tv0z,numOrd*4));
     CK(cudaMalloc(&h->d_tv1x,numOrd*4));CK(cudaMalloc(&h->d_tv1y,numOrd*4));CK(cudaMalloc(&h->d_tv1z,numOrd*4));
     CK(cudaMalloc(&h->d_tv2x,numOrd*4));CK(cudaMalloc(&h->d_tv2y,numOrd*4));CK(cudaMalloc(&h->d_tv2z,numOrd*4));
     CK(cudaMemcpy(h->d_tv0x,h0x,numOrd*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(h->d_tv0y,h0y,numOrd*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(h->d_tv0z,h0z,numOrd*4,cudaMemcpyHostToDevice));
     CK(cudaMemcpy(h->d_tv1x,h1x,numOrd*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(h->d_tv1y,h1y,numOrd*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(h->d_tv1z,h1z,numOrd*4,cudaMemcpyHostToDevice));
     CK(cudaMemcpy(h->d_tv2x,h2x,numOrd*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(h->d_tv2y,h2y,numOrd*4,cudaMemcpyHostToDevice));CK(cudaMemcpy(h->d_tv2z,h2z,numOrd*4,cudaMemcpyHostToDevice));
+#endif
     // Keep host copies for Vulkan compute upload
     h->h_triCopy[0]=h0x; h->h_triCopy[1]=h0y; h->h_triCopy[2]=h0z;
     h->h_triCopy[3]=h1x; h->h_triCopy[4]=h1y; h->h_triCopy[5]=h1z;
     h->h_triCopy[6]=h2x; h->h_triCopy[7]=h2y; h->h_triCopy[8]=h2z;
 
+#if !BVH_LAYER_MODE
     // Pre-allocate work buffers for up to 4M rays
     h->maxRays = 4*1024*1024;
     CK(cudaMalloc(&h->d_survivors, h->maxRays * sizeof(int)));
     CK(cudaMalloc(&h->d_numSurvivors, sizeof(int)));
     CK(cudaMalloc(&h->d_hitT, h->maxRays * sizeof(float)));
-
+#endif
     // Store scene bounds for auto-camera
     for (int a = 0; a < 3; a++) {
         h->bboxMin[a] = bmin[a];
@@ -643,11 +654,13 @@ CudaBVH_t cudaBVH_build(const CudaTri* tris, int numTris) {
 void cudaBVH_destroy(CudaBVH_t bvh) {
     if (!bvh) return;
     CudaBVHHandle* h = (CudaBVHHandle*)bvh;
+#if !BVH_LAYER_MODE
     CK(cudaFree(h->d_bvh4));
     CK(cudaFree(h->d_tv0x));CK(cudaFree(h->d_tv0y));CK(cudaFree(h->d_tv0z));
     CK(cudaFree(h->d_tv1x));CK(cudaFree(h->d_tv1y));CK(cudaFree(h->d_tv1z));
     CK(cudaFree(h->d_tv2x));CK(cudaFree(h->d_tv2y));CK(cudaFree(h->d_tv2z));
     CK(cudaFree(h->d_survivors));CK(cudaFree(h->d_numSurvivors));CK(cudaFree(h->d_hitT));
+#endif
     free(h->h_bvh2Stackless);
     free(h->h_triPacked);
     for (int i = 0; i < 9; i++) free(h->h_triCopy[i]);
@@ -1404,9 +1417,10 @@ CudaBVH_t cudaBVH_buildFromAABBs(const float* aabbs, int numAABBs) {
 // Fast TLAS-only builder: LBVH (Morton sort) → stackless BVH2 only.
 // ~50× faster than SAH for 200K AABBs (<20ms vs >1000ms).
 int cudaBVH_buildTLASFast(const float* aabbs, int numAABBs,
-                           uint32_t** outNodes) {
+                           uint32_t** outNodes, int** outOrdered) {
     if (!aabbs || numAABBs <= 0 || !outNodes) return 0;
     *outNodes = nullptr;
+    if (outOrdered) *outOrdered = nullptr;
 
     // Build LBVH from AABBs (Morton code sort + median splits)
     LBVHBuilder lbvh;
@@ -1471,12 +1485,22 @@ int cudaBVH_buildTLASFast(const float* aabbs, int numAABBs,
         p[7] = (uint32_t)skip_targets[i];
     }
     *outNodes = packed;
+
+    // Export ordered[] mapping: sorted position → original instance index
+    if (outOrdered) {
+        int* ord = (int*)malloc(numAABBs * sizeof(int));
+        for (int i = 0; i < numAABBs; i++) ord[i] = lbvh.ordered[i];
+        *outOrdered = ord;
+    }
+
     return numDFS;
 }
 
 void cudaBVH_resetDevice(void) {
+#if !BVH_LAYER_MODE
     cudaDeviceSynchronize();
     cudaDeviceReset();
+#endif
 }
 
 } // extern "C"

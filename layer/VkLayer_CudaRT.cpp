@@ -16,6 +16,7 @@
 #include <vulkan/vk_layer.h>
 
 #include "cuda_bvh_backend.h"
+#include <cuda_runtime.h>
 #include "spirv_ray_query_rewriter.h"
 #include "shaders/bvh4_trace_spv.h"
 #include "shaders/bvh2_stackless_spv.h"
@@ -24,9 +25,12 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cmath>
+#include <dlfcn.h>
+#include <unistd.h>
 #include <unordered_map>
 #include <vector>
 #include <mutex>
+#include <chrono>
 #include <algorithm>
 #include <time.h>
 
@@ -105,7 +109,9 @@ struct DeviceDispatch {
 
     // Queue submit (for deferred BLAS build after GPU execution)
     PFN_vkQueueSubmit QueueSubmit;
+    PFN_vkQueueSubmit2KHR QueueSubmit2KHR;
     PFN_vkQueueWaitIdle QueueWaitIdle;
+    PFN_vkQueuePresentKHR QueuePresentKHR;
 
     // Stored handles
     VkDevice device;
@@ -141,6 +147,7 @@ struct BufferInfo {
     VkDeviceMemory memory;
     VkDeviceSize memOffset;
     VkDeviceAddress devAddr;
+    VkBufferUsageFlags usage;
 };
 struct MemInfo {
     void* hostPtr;
@@ -208,6 +215,7 @@ static CudaBVH_t g_tlasBVH = nullptr;  // TLAS BVH over instance AABBs (first bu
 // Fast TLAS path: raw BVH2 stackless data (per-frame rebuilds)
 static uint32_t* g_fastTLASNodes = nullptr;
 static int g_fastTLASNodeCount = 0;
+static int* g_fastTLASOrdered = nullptr;  // sorted→original instance index mapping
 
 // ═══════════════════════════════════════════
 // Multi-BLAS tracking: all built BLASes concatenated into single buffers
@@ -745,7 +753,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
     LOAD_DEV(CmdFillBuffer);
     LOAD_DEV(GetImageMemoryRequirements);
     LOAD_DEV(QueueSubmit);
+    // QueueSubmit2KHR might not exist — load manually
+    disp.QueueSubmit2KHR = (PFN_vkQueueSubmit2KHR)nextGDPA(*pDevice, "vkQueueSubmit2KHR");
+    if (!disp.QueueSubmit2KHR)
+        disp.QueueSubmit2KHR = (PFN_vkQueueSubmit2KHR)nextGDPA(*pDevice, "vkQueueSubmit2");
     LOAD_DEV(QueueWaitIdle);
+    disp.QueuePresentKHR = (PFN_vkQueuePresentKHR)nextGDPA(*pDevice, "vkQueuePresentKHR");
     disp.device = *pDevice;
     disp.physicalDevice = gpu;
     // Query and store memory properties for staging buffer allocation
@@ -815,8 +828,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateBuffer(
         std::lock_guard<std::mutex> lock(g_lock);
         BufferInfo bi = {};
         bi.size = pCreateInfo->size;
+        bi.usage = pCreateInfo->usage;
         g_buffers[(uint64_t)*pBuffer] = bi;
-        if(g_trackVerbose) LOG("  [track] CreateBuffer: buf=0x%lx size=%zu", (uint64_t)*pBuffer, (size_t)pCreateInfo->size);
+        // Log large SHADER_DEVICE_ADDRESS buffers (likely instance/AS buffers)
+        if ((pCreateInfo->usage & VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT) && pCreateInfo->size > 1000000)
+            LOG("  [track] CreateBuffer: buf=0x%lx size=%zu usage=0x%x (DEVICE_ADDR, injected TRANSFER_SRC)",
+                (uint64_t)*pBuffer, (size_t)pCreateInfo->size, (uint32_t)modCI.usage);
     }
     return res;
 }
@@ -828,7 +845,51 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_AllocateMemory(
     VkDeviceMemory* pMemory)
 {
     void* key = getKey(device);
-    VkResult res = g_deviceMap[key].AllocateMemory(device, pAllocateInfo, pAllocator, pMemory);
+    auto& disp = g_deviceMap[key];
+
+    // Check if this allocation should be exported for CUDA interop
+    // Inject for all large allocations (needed for TLAS instance buffer reading)
+    bool hasDeviceAddr = false;
+    bool hasExport = false;
+    const VkBaseInStructure* s = (const VkBaseInStructure*)pAllocateInfo->pNext;
+    while (s) {
+        if (s->sType == VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO) {
+            auto flags = (const VkMemoryAllocateFlagsInfo*)s;
+            if (flags->flags & VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT)
+                hasDeviceAddr = true;
+        }
+        if (s->sType == VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO)
+            hasExport = true;
+        s = s->pNext;
+    }
+
+    // Export DISABLED — was causing device lost by modifying all allocations
+    // Only enable for the specific TLAS instance buffer when needed
+    if (false && !hasExport && pAllocateInfo->allocationSize >= 1000000) {
+        // Inject export info for large device-address allocations
+        VkExportMemoryAllocateInfo exportInfo = {VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
+        exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        exportInfo.pNext = pAllocateInfo->pNext;
+
+        VkMemoryAllocateInfo modAlloc = *pAllocateInfo;
+        modAlloc.pNext = &exportInfo;
+
+        VkResult res = disp.AllocateMemory(device, &modAlloc, pAllocator, pMemory);
+        if (res == VK_SUCCESS) {
+            std::lock_guard<std::mutex> lock(g_lock);
+            auto& mi = g_memories[(uint64_t)*pMemory];
+            mi.hostPtr = nullptr;
+            mi.mapOffset = 0;
+            mi.allocSize = pAllocateInfo->allocationSize;
+            mi.device = device;
+            static int expLog = 0;
+            if (expLog++ < 5)
+                LOG("  [track] AllocateMemory+EXPORT: mem=0x%lx size=%zu", (uint64_t)*pMemory, (size_t)pAllocateInfo->allocationSize);
+        }
+        return res;
+    }
+
+    VkResult res = disp.AllocateMemory(device, pAllocateInfo, pAllocator, pMemory);
     if (res == VK_SUCCESS) {
         std::lock_guard<std::mutex> lock(g_lock);
         auto& mi = g_memories[(uint64_t)*pMemory];
@@ -960,6 +1021,13 @@ static void* resolveDeviceAddress(VkDeviceAddress addr) {
             auto mit = g_memories.find((uint64_t)bi.memory);
             if (mit != g_memories.end() && mit->second.hostPtr) {
                 VkDeviceSize memOff = (addr - bi.devAddr) + bi.memOffset;
+                static int resolveLog = 0;
+                if (resolveLog < 3)
+                    LOG("  → resolveDeviceAddress: addr=0x%lx → buf=0x%lx devAddr=0x%lx off=%zu bufSz=%zu memOff=%zu mapOff=%zu",
+                        (uint64_t)addr, bufId, (uint64_t)bi.devAddr,
+                        (size_t)(addr - bi.devAddr), (size_t)bi.size,
+                        (size_t)memOff, (size_t)mit->second.mapOffset);
+                resolveLog++;
                 return (char*)mit->second.hostPtr + memOff - mit->second.mapOffset;
             }
         }
@@ -973,6 +1041,17 @@ static void* readDeviceAddressData(VkDeviceAddress addr, VkDeviceSize size) {
     // First try host-visible path (fast, zero-copy)
     void* hostPtr = resolveDeviceAddress(addr);
     if (hostPtr) {
+        // Debug: check if data is all zeros
+        static int hostReadLog = 0;
+        if (hostReadLog < 5) {
+            const uint32_t* u32 = (const uint32_t*)hostPtr;
+            int nonZero = 0;
+            for (size_t i = 0; i < std::min(size, (VkDeviceSize)256) / 4; i++)
+                if (u32[i]) nonZero++;
+            LOG("  → Host-visible read: addr=0x%lx size=%zu nonZero=%d/64 first4=[%08x %08x %08x %08x]",
+                (uint64_t)addr, (size_t)size, nonZero, u32[0], u32[1], u32[2], u32[3]);
+            hostReadLog++;
+        }
         void* copy = malloc(size);
         memcpy(copy, hostPtr, size);
         return copy;
@@ -1087,11 +1166,24 @@ static void* readDeviceAddressData(VkDeviceAddress addr, VkDeviceSize size) {
     beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
     beginCB(cmdBuf, &beginInfo);
 
+    // Pre-fill staging buffer with sentinel to verify copy works
+    auto cmdFill = (PFN_vkCmdFillBuffer)disp.GetDeviceProcAddr(device, "vkCmdFillBuffer");
+    if (cmdFill) cmdFill(cmdBuf, stagingBuf, 0, size, 0xDEADBEEF);
+
+    // Memory barrier: make sure fill completes before copy
+    VkMemoryBarrier fillBarrier = {VK_STRUCTURE_TYPE_MEMORY_BARRIER};
+    fillBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    fillBarrier.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+    auto cmdBarrier = (PFN_vkCmdPipelineBarrier)disp.GetDeviceProcAddr(device, "vkCmdPipelineBarrier");
+    if (cmdBarrier) cmdBarrier(cmdBuf, VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT, 0, 1, &fillBarrier, 0, nullptr, 0, nullptr);
+
     VkBufferCopy copyRegion = {};
     copyRegion.srcOffset = srcOffset;
     copyRegion.dstOffset = 0;
     copyRegion.size = size;
-    disp.CmdCopyBuffer(cmdBuf, srcBuffer, stagingBuf, 1, &copyRegion);
+    auto cmdCopy = (PFN_vkCmdCopyBuffer)disp.GetDeviceProcAddr(device, "vkCmdCopyBuffer");
+    if (cmdCopy) cmdCopy(cmdBuf, srcBuffer, stagingBuf, 1, &copyRegion);
+    else LOG("  !! CmdCopyBuffer not available!");
     endCB(cmdBuf);
 
     VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
@@ -1105,6 +1197,20 @@ static void* readDeviceAddressData(VkDeviceAddress addr, VkDeviceSize size) {
     disp.MapMemory(device, stagingMem, 0, size, 0, &mapped);
     void* data = nullptr;
     if (mapped) {
+        // Check if sentinel was overwritten (copy actually happened)
+        const uint32_t* mU = (const uint32_t*)mapped;
+        static int verifyLog = 0;
+        if (verifyLog < 5) {
+            int sentinel = 0, zero = 0, other = 0;
+            for (int i = 0; i < std::min((int)(size/4), 64); i++) {
+                if (mU[i] == 0xDEADBEEF) sentinel++;
+                else if (mU[i] == 0) zero++;
+                else other++;
+            }
+            LOG("  → Staging verify: sentinel=%d zero=%d other=%d/64 first4=[%08x %08x %08x %08x]",
+                sentinel, zero, other, mU[0], mU[1], mU[2], mU[3]);
+            verifyLog++;
+        }
         data = malloc(size);
         memcpy(data, mapped, size);
         disp.UnmapMemory(device, stagingMem);
@@ -1139,6 +1245,7 @@ static std::mutex g_rqShaderMutex;
 // Track pipeline layouts: Key = VkPipelineLayout handle, Value = set layouts used
 struct PipelineLayoutInfo {
     std::vector<VkDescriptorSetLayout> setLayouts;
+    std::vector<VkPushConstantRange> pushConstantRanges;
 };
 static std::unordered_map<uint64_t, PipelineLayoutInfo> g_pipelineLayouts;
 static std::mutex g_pipelineLayoutMutex;
@@ -1179,7 +1286,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateShaderModule(
     fprintf(stderr, "[CudaRT]   shader %zu words, hasRayQuery=%d\n", numWords, (int)hasRayQuery);
 
     // Try to rewrite ray query ops
-    SpirvRewriteResult rw = spirvTryRewriteRayQuery(spirvCode, numWords);
+    SpirvRewriteResult rw;
+    static int noRewrite = -1;
+    if (noRewrite < 0) {
+        const char* e = getenv("CUDA_RT_NO_REWRITE");
+        noRewrite = (e && atoi(e)) ? 1 : 0;
+    }
+    if (noRewrite) {
+        rw.rewritten = false;
+        fprintf(stderr, "[CudaRT] CUDA_RT_NO_REWRITE=1: skipping SPIR-V rewrite\n");
+    } else {
+        rw = spirvTryRewriteRayQuery(spirvCode, numWords);
+    }
 
     if (rw.rewritten) {
         LOG("CreateShaderModule: REWRITTEN ray query shader (%zu→%zu words, BVH set=%d)",
@@ -1343,10 +1461,12 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBuildAccelerationStructuresKHR(
                 g_pendingTLAS.instanceAddr = info.pGeometries[0].geometry.instances.data.deviceAddress;
                 g_pendingTLAS.instanceCount = ppBuildRangeInfos[i][0].primitiveCount;
                 g_pendingTLAS.pending = true;
+                bool arrayOfPtrs = info.pGeometries[0].geometry.instances.arrayOfPointers;
                 if (tlasCount <= 3 || (tlasCount % 100) == 0)
-                    LOG("CmdBuildAS: TLAS #%d dst=0x%lx instances=%u addr=0x%lx → DEFERRED",
+                    LOG("CmdBuildAS: TLAS #%d dst=0x%lx instances=%u addr=0x%lx arrayOfPtrs=%d → DEFERRED",
                         tlasCount, (uint64_t)info.dstAccelerationStructure,
-                        g_pendingTLAS.instanceCount, (uint64_t)g_pendingTLAS.instanceAddr);
+                        g_pendingTLAS.instanceCount, (uint64_t)g_pendingTLAS.instanceAddr,
+                        (int)arrayOfPtrs);
             } else {
                 if (tlasCount <= 3)
                     LOG("CmdBuildAS: TLAS #%d dst=0x%lx prims=%u (no instances geometry, skipped)",
@@ -1626,18 +1746,142 @@ static void processPendingTLAS() {
     VkDeviceAddress addr = g_pendingTLAS.instanceAddr;
     if (numInst == 0 || addr == 0) return;
 
+    auto t0 = std::chrono::steady_clock::now();
+
     static int tlasRebuildCount = 0;
     bool verbose = (tlasRebuildCount < 3);
 
-    if (verbose)
+    if (verbose) {
         LOG("[TLAS] Reading %u instances from addr=0x%lx...", numInst, (uint64_t)addr);
+        // Dump all known buffers that overlap this address
+        std::lock_guard<std::mutex> lock(g_lock);
+        int found = 0;
+        for (auto& [bufId, bi] : g_buffers) {
+            if (bi.devAddr && addr >= bi.devAddr && addr < bi.devAddr + bi.size) {
+                auto mit = g_memories.find((uint64_t)bi.memory);
+                bool hasHost = (mit != g_memories.end() && mit->second.hostPtr);
+                LOG("[TLAS]   → Buffer hit: buf=0x%lx devAddr=0x%lx size=%zu off=%zu hostPtr=%s mem=0x%lx memOff=%zu",
+                    bufId, (uint64_t)bi.devAddr, (size_t)bi.size,
+                    (size_t)(addr - bi.devAddr), hasHost ? "YES" : "NO",
+                    (uint64_t)bi.memory, (size_t)bi.memOffset);
+                found++;
+            }
+        }
+        if (!found) LOG("[TLAS]   → NO buffer found for addr=0x%lx!", (uint64_t)addr);
+    }
 
     // VkAccelerationStructureInstanceKHR is 64 bytes each
     VkDeviceSize dataSize = (VkDeviceSize)numInst * 64;
-    void* rawData = readDeviceAddressData(addr, dataSize);
+
+    // Debug: try both paths explicitly to diagnose which is taken
+    if (verbose) {
+        void* hostPtr = resolveDeviceAddress(addr);
+        if (hostPtr) {
+            const uint32_t* u = (const uint32_t*)hostPtr;
+            int nz = 0;
+            for (int i = 0; i < 16; i++) if (u[i]) nz++;
+            LOG("[TLAS] resolveDeviceAddress → hostPtr=%p nonZero=%d/16 first4=[%08x %08x %08x %08x]",
+                hostPtr, nz, u[0], u[1], u[2], u[3]);
+        } else {
+            LOG("[TLAS] resolveDeviceAddress → NULL (DEVICE_LOCAL, will use staging copy)");
+        }
+    }
+
+    // Instance data is in DEVICE_LOCAL memory — staging copy always returns zeros.
+    // Use fd-based CUDA import (fast path after first successful import).
+    static bool useFdImport = false;  // once fd-import works, skip staging entirely
+    void* rawData = nullptr;
+    
+    if (!useFdImport) {
+        // First attempt: try staging copy
+        rawData = readDeviceAddressData(addr, dataSize);
+        if (rawData) {
+            const uint32_t* check = (const uint32_t*)rawData;
+            int nz = 0;
+            for (int i = 0; i < 64; i++) if (check[i]) nz++;
+            if (nz > 0) {
+                // Staging copy worked! Use it.
+                goto have_data;
+            }
+            // Staging copy returned zeros — try fd-import
+        }
+    }
+    
+    // Fd-import path: export Vulkan memory to CUDA via file descriptor
+    {
+        if (verbose) LOG("[TLAS] Using fd-based CUDA import for instance data...");
+        VkDeviceMemory instMem = VK_NULL_HANDLE;
+        VkDeviceSize instMemOff = 0;
+        VkDeviceSize instBufOff = 0;
+        VkDevice instDevice = VK_NULL_HANDLE;
+        VkDeviceSize instAllocSize = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_lock);
+            for (auto& [bufId, bi] : g_buffers) {
+                if (bi.devAddr && addr >= bi.devAddr && addr < bi.devAddr + bi.size) {
+                    instMem = bi.memory;
+                    instMemOff = bi.memOffset;
+                    instBufOff = addr - bi.devAddr;
+                    auto mit = g_memories.find((uint64_t)bi.memory);
+                    if (mit != g_memories.end()) {
+                        instDevice = mit->second.device;
+                        instAllocSize = mit->second.allocSize;
+                    }
+                    break;
+                }
+            }
+        }
+        if (instDevice && instMem) {
+            void* dkey = getKey(instDevice);
+            auto dit = g_deviceMap.find(dkey);
+            if (dit != g_deviceMap.end() && dit->second.GetMemoryFdKHR) {
+                VkMemoryGetFdInfoKHR fdInfo = {VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
+                fdInfo.memory = instMem;
+                fdInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+                int fd = -1;
+                VkResult fdRes = dit->second.GetMemoryFdKHR(instDevice, &fdInfo, &fd);
+                if (fdRes == VK_SUCCESS && fd >= 0) {
+                    cudaExternalMemory_t extMem = nullptr;
+                    cudaExternalMemoryHandleDesc extDesc = {};
+                    extDesc.type = cudaExternalMemoryHandleTypeOpaqueFd;
+                    extDesc.handle.fd = fd;
+                    extDesc.size = instAllocSize > 0 ? instAllocSize : dataSize + instMemOff + instBufOff;
+                    
+                    if (cudaImportExternalMemory(&extMem, &extDesc) == cudaSuccess && extMem) {
+                        cudaExternalMemoryBufferDesc fullBufDesc = {};
+                        fullBufDesc.offset = instMemOff + instBufOff;
+                        fullBufDesc.size = dataSize;
+                        void* devPtr = nullptr;
+                        if (cudaExternalMemoryGetMappedBuffer(&devPtr, extMem, &fullBufDesc) == cudaSuccess && devPtr) {
+                            if (rawData) free(rawData);
+                            rawData = malloc(dataSize);
+                            cudaMemcpy(rawData, devPtr, dataSize, cudaMemcpyDeviceToHost);
+                            cudaFree(devPtr);
+                            useFdImport = true;  // cache: always use fd-import from now on
+                            if (verbose) LOG("[TLAS] CUDA fd-import: %zu bytes read successfully", (size_t)dataSize);
+                        }
+                        cudaDestroyExternalMemory(extMem);
+                    } else {
+                        close(fd);
+                    }
+                }
+            }
+        }
+    }
+
+have_data:
     if (!rawData) {
         LOG("[TLAS] FAILED to read instance buffer!");
         return;
+    }
+    auto t1 = std::chrono::steady_clock::now();
+    // Quick validation of read data
+    if (verbose) {
+        const uint32_t* u = (const uint32_t*)rawData;
+        int totalNZ = 0;
+        for (int i = 0; i < 256; i++) if (u[i]) totalNZ++;
+        LOG("[TLAS] readDeviceAddressData: %zu bytes, sample nonZero=%d/256",
+            (size_t)dataSize, totalNZ);
     }
 
     // Quick degenerate check before full parse — sample first 1000 entries
@@ -1827,30 +2071,29 @@ static void processPendingTLAS() {
     if (verbose)
         LOG("[TLAS] Parsed %u instances (%.0f%% unique), building TLAS BVH...", numInst, uniquePct);
 
-    // Build TLAS BVH from world-space AABBs
-    // First build: use full path (creates g_tlasBVH for initial uploadBVH2Data)
-    // Subsequent: use fast path (BVH2-only, ~10× faster)
-    if (!g_tlasBVH) {
-        g_tlasBVH = cudaBVH_buildFromAABBs(worldAABBs.data(), (int)numInst);
-        if (g_tlasBVH) {
-            g_tlasGeneration++;
-            LOG("[TLAS] Initial TLAS BVH built: %d nodes over %u instances (gen=%lu)",
-                cudaBVH_getNumBVH4Nodes(g_tlasBVH), numInst, g_tlasGeneration);
-        } else {
-            LOG("[TLAS] FAILED to build initial TLAS BVH!");
+    auto t2 = std::chrono::steady_clock::now();
+
+    // Build TLAS BVH from world-space AABBs — fast LBVH only (SAH too slow for 200K)
+    // Set g_tlasBVH sentinel to mark "first build done" without the slow SAH path
+    if (g_fastTLASNodes) { free(g_fastTLASNodes); g_fastTLASNodes = nullptr; }
+    if (g_fastTLASOrdered) { free(g_fastTLASOrdered); g_fastTLASOrdered = nullptr; }
+    g_fastTLASNodeCount = cudaBVH_buildTLASFast(worldAABBs.data(), (int)numInst,
+                                                 &g_fastTLASNodes, &g_fastTLASOrdered);
+    if (g_fastTLASNodeCount > 0) {
+        if (!g_tlasBVH) {
+            // Create a dummy SAH handle so reupload trigger works
+            g_tlasBVH = cudaBVH_buildFromAABBs(worldAABBs.data(), std::min((int)numInst, 8));
         }
+        g_tlasGeneration++;
+        auto t3 = std::chrono::steady_clock::now();
+        auto ms_read = std::chrono::duration_cast<std::chrono::milliseconds>(t1 - t0).count();
+        auto ms_parse = std::chrono::duration_cast<std::chrono::milliseconds>(t2 - t1).count();
+        auto ms_build = std::chrono::duration_cast<std::chrono::milliseconds>(t3 - t2).count();
+        if (g_tlasGeneration <= 3 || (g_tlasGeneration % 100 == 0))
+            LOG("[TLAS] Fast TLAS BVH2: %d nodes over %u instances (gen=%lu) [read=%ldms parse=%ldms build=%ldms]",
+                g_fastTLASNodeCount, numInst, g_tlasGeneration, ms_read, ms_parse, ms_build);
     } else {
-        // Fast path: BVH2 stackless only
-        if (g_fastTLASNodes) { free(g_fastTLASNodes); g_fastTLASNodes = nullptr; }
-        g_fastTLASNodeCount = cudaBVH_buildTLASFast(worldAABBs.data(), (int)numInst, &g_fastTLASNodes);
-        if (g_fastTLASNodeCount > 0) {
-            g_tlasGeneration++;
-            if (verbose || (g_tlasGeneration % 100 == 0))
-                LOG("[TLAS] Fast TLAS BVH2: %d nodes over %u instances (gen=%lu)",
-                    g_fastTLASNodeCount, numInst, g_tlasGeneration);
-        } else {
-            LOG("[TLAS] FAILED fast TLAS build!");
-        }
+        LOG("[TLAS] FAILED fast TLAS build!");
     }
     tlasRebuildCount++;
 }
@@ -1860,6 +2103,48 @@ static void processPendingTLAS() {
 // ═══════════════════════════════════════════
 
 // Helper: create a DEVICE_LOCAL buffer, stage data via HOST_VISIBLE + one-shot cmdBuf copy
+// createBufferHostVisible: Use HOST_VISIBLE+HOST_COHERENT memory with direct map/memcpy.
+// Slower than DEVICE_LOCAL but guaranteed to be accessible by GPU immediately.
+// Use for debugging SSBO visibility issues.
+static bool createBufferHostVisible(DeviceDispatch& disp, const void* data, VkDeviceSize size,
+                                     VkBufferUsageFlags usage, VkBuffer& outBuf, VkDeviceMemory& outMem)
+{
+    VkBufferCreateInfo bufCI = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bufCI.size = size;
+    bufCI.usage = usage;
+    bufCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (disp.CreateBuffer(disp.device, &bufCI, nullptr, &outBuf) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements memReqs;
+    disp.GetBufferMemoryRequirements(disp.device, outBuf, &memReqs);
+
+    int memType = -1;
+    for (uint32_t i = 0; i < disp.memProps.memoryTypeCount; i++) {
+        if ((memReqs.memoryTypeBits & (1 << i)) &&
+            (disp.memProps.memoryTypes[i].propertyFlags &
+             (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+             (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            memType = i; break;
+        }
+    }
+    if (memType < 0) { disp.DestroyBuffer(disp.device, outBuf, nullptr); return false; }
+
+    VkMemoryAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = memType;
+    if (disp.AllocateMemory(disp.device, &allocInfo, nullptr, &outMem) != VK_SUCCESS) {
+        disp.DestroyBuffer(disp.device, outBuf, nullptr); return false;
+    }
+    disp.BindBufferMemory(disp.device, outBuf, outMem, 0);
+
+    void* mapped = nullptr;
+    disp.MapMemory(disp.device, outMem, 0, size, 0, &mapped);
+    if (!mapped) return false;
+    memcpy(mapped, data, size);
+    disp.UnmapMemory(disp.device, outMem);
+    return true;
+}
+
 static bool createBufferWithData(DeviceDispatch& disp, const void* data, VkDeviceSize size,
                                   VkBufferUsageFlags usage, VkBuffer& outBuf, VkDeviceMemory& outMem)
 {
@@ -2097,7 +2382,7 @@ static bool setupBVH2Descriptors(DeviceDispatch& disp) {
         }
         disp.UpdateDescriptorSets(disp.device, 4, writes, 0, nullptr);
         g_bvh2.descSetIdx = 4; // must match SPIR-V rewriter's bvhDescSet
-        g_bvh2.ready = true; // safe to bind — shaders will see null BVH and exit immediately
+        // NOTE: g_bvh2.ready remains false until uploadBVH2Data uploads real data
         LOG("[BVH2] Null-safe BVH buffers initialized (huge AABB + skip=-1)");
     }
 
@@ -2235,12 +2520,12 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
             memcpy(dst + 12, gi.invTransform + 0, 16);
             memcpy(dst + 16, gi.invTransform + 4, 16);
             memcpy(dst + 20, gi.invTransform + 8, 16);
-            // vec4[6] = (blasMin.xyz, uintBitsToFloat(blasNodeOff))
+            // vec4[6] = (blasMin.xyz, float(blasNodeOff))
             dst[24] = gi.blasMinX; dst[25] = gi.blasMinY; dst[26] = gi.blasMinZ;
-            memcpy(dst + 27, &gi.blasNodeOff, 4);
-            // vec4[7] = (blasMax.xyz, uintBitsToFloat(blasTriOff))
+            dst[27] = (float)gi.blasNodeOff;  // store as actual float (avoid denormal flush)
+            // vec4[7] = (blasMax.xyz, float(blasTriOff))
             dst[28] = gi.blasMaxX; dst[29] = gi.blasMaxY; dst[30] = gi.blasMaxZ;
-            memcpy(dst + 31, &gi.blasTriOff, 4);
+            dst[31] = (float)gi.blasTriOff;   // store as actual float
         }
         if (!createBufferWithData(disp, instPacked.data(), instancesSize,
                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.instancesBuf, g_bvh2.instancesMem)) {
@@ -2343,18 +2628,23 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
     VkDeviceSize tlasNodesSize = 0;
     if (tlasNodeData && numTlasNodes > 0) {
         tlasNodesSize = (VkDeviceSize)numTlasNodes * 8 * sizeof(uint32_t);
-        if (!createBufferWithData(disp, tlasNodeData, tlasNodesSize,
+        if (!createBufferHostVisible(disp, tlasNodeData, tlasNodesSize,
                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.tlasNodesBuf, g_bvh2.tlasNodesMem)) {
             LOG("[BVH2] TLAS reupload: failed to create TLAS nodes buffer");
             return false;
         }
     }
 
-    // Upload instance data
+    // Upload instance data — reordered to match TLAS BVH leaf indices
+    // The LBVH builder sorts instances by Morton code; TLAS leaf triStart indexes
+    // into the sorted order. Instance SSBO must match this order so the shader can
+    // directly use the decoded triStart as the instance index.
     VkDeviceSize instancesSize = (VkDeviceSize)numInst * 8 * 4 * sizeof(float);
     std::vector<float> instPacked(numInst * 32);
     for (int i = 0; i < numInst; i++) {
-        const InstanceGPU& gi = g_instances[i];
+        // Map sorted position → original instance index
+        int origIdx = (g_fastTLASOrdered && i < numInst) ? g_fastTLASOrdered[i] : i;
+        const InstanceGPU& gi = g_instances[origIdx];
         float* dst = instPacked.data() + i * 32;
         memcpy(dst + 0, gi.transform + 0, 16);
         memcpy(dst + 4, gi.transform + 4, 16);
@@ -2363,11 +2653,11 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
         memcpy(dst + 16, gi.invTransform + 4, 16);
         memcpy(dst + 20, gi.invTransform + 8, 16);
         dst[24] = gi.blasMinX; dst[25] = gi.blasMinY; dst[26] = gi.blasMinZ;
-        memcpy(dst + 27, &gi.blasNodeOff, 4);
+        dst[27] = (float)gi.blasNodeOff;  // store as actual float (avoid denormal flush)
         dst[28] = gi.blasMaxX; dst[29] = gi.blasMaxY; dst[30] = gi.blasMaxZ;
-        memcpy(dst + 31, &gi.blasTriOff, 4);
+        dst[31] = (float)gi.blasTriOff;   // store as actual float
     }
-    if (!createBufferWithData(disp, instPacked.data(), instancesSize,
+    if (!createBufferHostVisible(disp, instPacked.data(), instancesSize,
                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.instancesBuf, g_bvh2.instancesMem)) {
         LOG("[BVH2] TLAS reupload: failed to create instances buffer");
         return false;
@@ -2403,9 +2693,114 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
     g_bvh2.tlasGen = g_tlasGeneration;
 
     static int reuploadCount = 0;
-    if (reuploadCount < 5)
+    if (reuploadCount < 5) {
         LOG("[BVH2] TLAS reupload #%d: %d nodes, %d instances (gen=%lu)",
             reuploadCount, numTlasNodes, numInst, g_tlasGeneration);
+        // Dump root TLAS node AABB (node 0)
+        if (tlasNodeData && numTlasNodes > 0) {
+            float bmin[3], bmax[3];
+            memcpy(&bmin[0], &tlasNodeData[0], 4);
+            memcpy(&bmin[1], &tlasNodeData[1], 4);
+            memcpy(&bmin[2], &tlasNodeData[2], 4);
+            memcpy(&bmax[0], &tlasNodeData[3], 4);
+            memcpy(&bmax[1], &tlasNodeData[4], 4);
+            memcpy(&bmax[2], &tlasNodeData[5], 4);
+            int32_t leaf_enc, skip;
+            memcpy(&leaf_enc, &tlasNodeData[6], 4);
+            memcpy(&skip, &tlasNodeData[7], 4);
+            LOG("[BVH2] TLAS root node: AABB=(%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f) leaf=%d skip=%d",
+                bmin[0], bmin[1], bmin[2], bmax[0], bmax[1], bmax[2], leaf_enc, skip);
+        }
+        // Dump first instance transform
+        if (numInst > 0) {
+            float* i0 = instPacked.data();
+            LOG("[BVH2] Instance 0 transform row0: (%.3f,%.3f,%.3f,%.3f)",
+                i0[0], i0[1], i0[2], i0[3]);
+            LOG("[BVH2] Instance 0 transform row1: (%.3f,%.3f,%.3f,%.3f)",
+                i0[4], i0[5], i0[6], i0[7]);
+            LOG("[BVH2] Instance 0 transform row2: (%.3f,%.3f,%.3f,%.3f)",
+                i0[8], i0[9], i0[10], i0[11]);
+            LOG("[BVH2] Instance 0 invTransform row0: (%.3f,%.3f,%.3f,%.3f)",
+                i0[12], i0[13], i0[14], i0[15]);
+            LOG("[BVH2] Instance 0 invTransform row1: (%.3f,%.3f,%.3f,%.3f)",
+                i0[16], i0[17], i0[18], i0[19]);
+            LOG("[BVH2] Instance 0 invTransform row2: (%.3f,%.3f,%.3f,%.3f)",
+                i0[20], i0[21], i0[22], i0[23]);
+            uint32_t noff, toff;
+            memcpy(&noff, &i0[27], 4);
+            memcpy(&toff, &i0[31], 4);
+            LOG("[BVH2] Instance 0 blasBounds: (%.3f,%.3f,%.3f)-(%.3f,%.3f,%.3f) nOff=%u tOff=%u",
+                i0[24], i0[25], i0[26], i0[28], i0[29], i0[30], noff, toff);
+        }
+    }
+
+    // ── CPU-side TLAS traversal test ──
+    // Mimics the GPU shader's BVH2 stackless traversal to verify correctness
+    if (reuploadCount < 3 && tlasNodeData && numTlasNodes > 0) {
+        // Root AABB
+        float rmin[3], rmax[3];
+        memcpy(rmin, &tlasNodeData[0], 12);
+        memcpy(rmax, &tlasNodeData[3], 12);
+        float cx = (rmin[0]+rmax[0])*0.5f, cy = (rmin[1]+rmax[1])*0.5f, cz = (rmin[2]+rmax[2])*0.5f;
+        float ex = (rmax[0]-rmin[0]), ey = (rmax[1]-rmin[1]), ez = (rmax[2]-rmin[2]);
+
+        // Test rays: from just outside root AABB toward center
+        struct TestRay { float ox,oy,oz, dx,dy,dz; const char* name; };
+        TestRay rays[] = {
+            {cx, cy, rmax[2]+100.f, 0,0,-1, "+Z toward center"},
+            {cx, cy, rmin[2]-100.f, 0,0, 1, "-Z toward center"},
+            {rmax[0]+100.f, cy, cz, -1,0,0, "+X toward center"},
+            {cx, rmax[1]+100.f, cz, 0,-1,0, "+Y toward center"},
+            {cx, cy, cz, 0,0,-1, "from center -Z"},
+            {cx, cy, cz, 1,0,0, "from center +X"},
+        };
+
+        for (auto& ray : rays) {
+            float invDx = (fabsf(ray.dx) > 1e-8f) ? 1.0f/ray.dx : (ray.dx >= 0 ? 1e8f : -1e8f);
+            float invDy = (fabsf(ray.dy) > 1e-8f) ? 1.0f/ray.dy : (ray.dy >= 0 ? 1e8f : -1e8f);
+            float invDz = (fabsf(ray.dz) > 1e-8f) ? 1.0f/ray.dz : (ray.dz >= 0 ? 1e8f : -1e8f);
+            float oodx = -ray.ox * invDx;
+            float oody = -ray.oy * invDy;
+            float oodz = -ray.oz * invDz;
+            float bestT = 1e30f;
+
+            int ni = 0, iter = 0, leafHits = 0, internalHits = 0, totalIter = 0;
+            while (ni >= 0 && iter < 10000) {
+                const uint32_t* p = tlasNodeData + ni * 8;
+                float bmin[3], bmax[3];
+                memcpy(bmin, p+0, 12);
+                memcpy(bmax, p+3, 12);
+                int32_t leaf_enc, skip;
+                memcpy(&leaf_enc, p+6, 4);
+                memcpy(&skip, p+7, 4);
+
+                if (leaf_enc != 0) {
+                    // Leaf node — TLAS hit!
+                    leafHits++;
+                    ni = skip;  // continue to next subtree
+                } else {
+                    // Internal node — AABB slab test (same math as GPU shader)
+                    float t1x = bmin[0]*invDx + oodx, t2x = bmax[0]*invDx + oodx;
+                    float t1y = bmin[1]*invDy + oody, t2y = bmax[1]*invDy + oody;
+                    float t1z = bmin[2]*invDz + oodz, t2z = bmax[2]*invDz + oodz;
+                    float tNear = fmaxf(fmaxf(fminf(t1x,t2x), fminf(t1y,t2y)), fminf(t1z,t2z));
+                    float tFar  = fminf(fminf(fmaxf(t1x,t2x), fmaxf(t1y,t2y)), fmaxf(t1z,t2z));
+                    bool hit = (tNear <= tFar) && (tFar > 0.0f) && (tNear < bestT);
+                    if (hit) {
+                        internalHits++;
+                        ni = ni + 1;  // traverse left child
+                    } else {
+                        ni = skip;    // skip to next subtree
+                    }
+                }
+                iter++;
+                totalIter = iter;
+            }
+            LOG("[BVH2-CPU] Ray '%s' o=(%.1f,%.1f,%.1f) d=(%.1f,%.1f,%.1f): %d leaf hits, %d internal hits, %d iters",
+                ray.name, ray.ox,ray.oy,ray.oz, ray.dx,ray.dy,ray.dz, leafHits, internalHits, totalIter);
+        }
+    }
+
     reuploadCount++;
     return true;
 }
@@ -3242,10 +3637,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreatePipelineLayout(
     auto& disp = g_deviceMap[key];
     VkResult result = disp.CreatePipelineLayout(device, pCreateInfo, pAllocator, pPipelineLayout);
     if (result == VK_SUCCESS && pPipelineLayout && *pPipelineLayout) {
-        // Track the set layouts used in this pipeline layout
+        // Track the set layouts and push constants used in this pipeline layout
         PipelineLayoutInfo info;
         info.setLayouts.assign(pCreateInfo->pSetLayouts,
                                pCreateInfo->pSetLayouts + pCreateInfo->setLayoutCount);
+        if (pCreateInfo->pushConstantRangeCount > 0 && pCreateInfo->pPushConstantRanges) {
+            info.pushConstantRanges.assign(pCreateInfo->pPushConstantRanges,
+                                            pCreateInfo->pPushConstantRanges + pCreateInfo->pushConstantRangeCount);
+        }
         std::lock_guard<std::mutex> lock(g_pipelineLayoutMutex);
         g_pipelineLayouts[(uint64_t)*pPipelineLayout] = std::move(info);
     }
@@ -3292,14 +3691,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateComputePipelines(
             disp.CreateDescriptorSetLayout(device, &emptyCI, nullptr, &g_emptyDSLayout);
         }
 
-        // Get the app's original pipeline layout's set layouts for compatibility
+        // Get the app's original pipeline layout's set layouts + push constants
         VkPipelineLayout origLayout = modInfos[i].layout;
         std::vector<VkDescriptorSetLayout> appSetLayouts;
+        std::vector<VkPushConstantRange> appPushConstants;
         {
             std::lock_guard<std::mutex> lock2(g_pipelineLayoutMutex);
             auto plt = g_pipelineLayouts.find((uint64_t)origLayout);
             if (plt != g_pipelineLayouts.end()) {
                 appSetLayouts = plt->second.setLayouts;
+                appPushConstants = plt->second.pushConstantRanges;
             }
         }
 
@@ -3311,25 +3712,36 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateComputePipelines(
         }
         sets[bvhSet] = g_bvh2.dsLayout;
 
-        // Copy push constant ranges from original layout too
         VkPipelineLayoutCreateInfo plCI = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         plCI.setLayoutCount = bvhSet + 1;
         plCI.pSetLayouts = sets.data();
-        // Retrieve original push constant ranges
-        // We need to track push constants too — for now use the tracked layout info
+        plCI.pushConstantRangeCount = (uint32_t)appPushConstants.size();
+        plCI.pPushConstantRanges = appPushConstants.empty() ? nullptr : appPushConstants.data();
 
         if (disp.CreatePipelineLayout(device, &plCI, nullptr, &extLayouts[i]) != VK_SUCCESS) {
             LOG("[BVH2] Failed to create extended pipeline layout for RQ pipeline");
             extLayouts[i] = VK_NULL_HANDLE;
         } else {
-            LOG("[BVH2] Created COMPATIBLE extended layout with %zu app sets + BVH2 at set=%u",
-                appSetLayouts.size(), bvhSet);
+            LOG("[BVH2] Created COMPATIBLE extended layout with %zu app sets, %zu push consts + BVH2 at set=%u",
+                appSetLayouts.size(), appPushConstants.size(), bvhSet);
         }
     }
 
-    // Create pipelines with ORIGINAL layouts (don't modify the pipeline itself)
+    // Create pipelines with EXTENDED layout for RQ pipelines so set 4 is accessible.
+    // The extended layout includes the app's original sets [0..N-1] for compatibility,
+    // plus our BVH2 SSBO set at index 4. Without this, the driver ignores set 4.
+    static int noExtLayout = -1;
+    if (noExtLayout < 0) {
+        const char* e = getenv("CUDA_RT_NO_EXT_LAYOUT");
+        noExtLayout = (e && atoi(e)) ? 1 : 0;
+    }
+    for (uint32_t i = 0; i < createInfoCount; i++) {
+        if (extLayouts[i] && !noExtLayout) {
+            modInfos[i].layout = extLayouts[i];
+        }
+    }
     VkResult result = disp.CreateComputePipelines(device, pipelineCache, createInfoCount,
-                                                   pCreateInfos, pAllocator, pPipelines);
+                                                    modInfos.data(), pAllocator, pPipelines);
 
     if (result == VK_SUCCESS) {
         for (uint32_t i = 0; i < createInfoCount; i++) {
@@ -3533,9 +3945,21 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
     void* key = getKey(queue);
     auto& disp = g_deviceMap[key];
 
+    // Fast path: after BLAS builds are done, pass through with zero overhead
+    if (g_blasBuildsDone) {
+        return disp.QueueSubmit(queue, submitCount, pSubmits, fence);
+    }
+
     // Call real submit first
     VkResult res = disp.QueueSubmit(queue, submitCount, pSubmits, fence);
     if (res != VK_SUCCESS) return res;
+
+    static int qsCount = 0;
+    qsCount++;
+    if (qsCount <= 10 || (qsCount % 100) == 0)
+        LOG("[QS] QueueSubmit #%d (TLAS gen=%lu pending=%d addr=0x%lx cnt=%u)",
+            qsCount, g_tlasGeneration, g_pendingTLAS.pending ? 1 : 0,
+            (uint64_t)g_pendingTLAS.instanceAddr, g_pendingTLAS.instanceCount);
 
     // If we have pending BLAS builds, wait for GPU to finish then read vertex data
     bool hasPending = false;
@@ -3546,34 +3970,147 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
         hasTLAS = g_pendingTLAS.pending;
     }
 
-    // For TLAS: check throttle BEFORE QueueWaitIdle to avoid serializing every frame
-    if (hasTLAS && !hasPending) {
-        // Only actually process if the throttle allows it
-        static int tlasRate = -1;
-        if (tlasRate < 0) {
-            const char* env = getenv("CUDA_RT_TLAS_RATE");
-            tlasRate = env ? atoi(env) : 300;  // rebuild every 300 QueueSubmits (~5s)
-        }
-        static int qsTlasCount = 0;
-        qsTlasCount++;
-        bool shouldRebuild = (g_tlasGeneration == 0) ||  // always build first time
-                             (tlasRate > 0 && (qsTlasCount % tlasRate) == 0);
-        if (!shouldRebuild) {
-            // Skip this TLAS rebuild — clear pending flag without QueueWaitIdle
-            std::lock_guard<std::mutex> lock(g_lock);
-            g_pendingTLAS.pending = false;
-            hasTLAS = false;
-        }
+    // Periodic TLAS retry: if TLAS gen is 0 but we have the address, re-read on later submits
+    if (!hasTLAS && !hasPending && g_tlasGeneration == 0 &&
+        g_pendingTLAS.instanceAddr != 0 && g_pendingTLAS.instanceCount > 0 &&
+        qsCount > 3 && (qsCount % 5) == 0 && qsCount < 200) {
+        // Force a retry
+        g_pendingTLAS.pending = true;
+        hasTLAS = true;
+        LOG("[TLAS] Periodic retry at QueueSubmit #%d (gen still 0)", qsCount);
     }
 
-    if (hasPending || hasTLAS) {
+    // TLAS: never process from QueueSubmit — it causes blocking stalls
+    // Clear pending flag immediately; QueuePresent will handle TLAS once BVH2 is ready
+    if (hasTLAS) {
+        std::lock_guard<std::mutex> lock(g_lock);
+        // Don't clear pending — let QueuePresent detect it
+    }
+
+    if (hasPending) {
         // Wait for this submission to complete so GPU buffers are filled
         disp.QueueWaitIdle(queue);
-        if (hasPending) processPendingBLAS();
-        if (hasTLAS) processPendingTLAS();
+        processPendingBLAS();
+    }
+    // Clear TLAS pending without stalling — will be processed from QueuePresent
+    if (hasTLAS) {
+        std::lock_guard<std::mutex> lock(g_lock);
+        g_pendingTLAS.pending = false;
     }
 
     return res;
+}
+
+// ═══════════════════════════════════════════
+// Intercepted: QueueSubmit2KHR — same deferred logic as QueueSubmit
+// ═══════════════════════════════════════════
+static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit2KHR(
+    VkQueue queue,
+    uint32_t submitCount,
+    const VkSubmitInfo2KHR* pSubmits,
+    VkFence fence)
+{
+    void* key = getKey(queue);
+    auto& disp = g_deviceMap[key];
+
+    // Call real submit2 first
+    VkResult res = disp.QueueSubmit2KHR(queue, submitCount, pSubmits, fence);
+    if (res != VK_SUCCESS) return res;
+
+    static int qs2Count = 0;
+    qs2Count++;
+    if (qs2Count <= 5 || (qs2Count % 200) == 0)
+        LOG("[QS2] QueueSubmit2 #%d (TLAS gen=%lu addr=0x%lx cnt=%u)",
+            qs2Count, g_tlasGeneration, (uint64_t)g_pendingTLAS.instanceAddr,
+            g_pendingTLAS.instanceCount);
+
+    // Same deferred TLAS logic as QueueSubmit
+    bool hasTLAS = false;
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        hasTLAS = g_pendingTLAS.pending;
+    }
+
+    // Periodic TLAS retry via QueueSubmit2
+    if (!hasTLAS && g_tlasGeneration == 0 &&
+        g_pendingTLAS.instanceAddr != 0 && g_pendingTLAS.instanceCount > 0 &&
+        qs2Count > 5 && (qs2Count % 10) == 0 && qs2Count < 500) {
+        g_pendingTLAS.pending = true;
+        hasTLAS = true;
+        LOG("[TLAS] Periodic retry via QueueSubmit2 #%d", qs2Count);
+    }
+
+    if (hasTLAS) {
+        // Throttle check
+        static int tlasRate = -1;
+        if (tlasRate < 0) {
+            const char* env = getenv("CUDA_RT_TLAS_RATE");
+            tlasRate = env ? atoi(env) : 300;
+        }
+        bool shouldRebuild = false; // DISABLED for testing
+        if (shouldRebuild) {
+            disp.QueueWaitIdle(queue);
+            processPendingTLAS();
+        } else {
+            std::lock_guard<std::mutex> lock(g_lock);
+            g_pendingTLAS.pending = false;
+        }
+    }
+
+    return res;
+}
+
+// ─── QueuePresentKHR: per-frame hook for deferred TLAS retry ───
+static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
+    VkQueue queue,
+    const VkPresentInfoKHR* pPresentInfo)
+{
+    void* key = getKey(queue);
+    DeviceDispatch* pDisp = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        auto it = g_deviceMap.find(key);
+        if (it != g_deviceMap.end()) pDisp = &it->second;
+    }
+    if (!pDisp || !pDisp->QueuePresentKHR) return VK_ERROR_DEVICE_LOST;
+
+    static uint32_t presentCount = 0;
+    presentCount++;
+    if (presentCount <= 5 || presentCount % 100 == 0) {
+        LOG("[PRESENT] QueuePresent #%u (TLAS gen=%u addr=0x%llx)",
+            presentCount, g_tlasGeneration,
+            (unsigned long long)g_pendingTLAS.instanceAddr);
+    }
+
+    // One-time TLAS build on first eligible present
+    static bool tlasBuildDone = false;
+    if (!tlasBuildDone && g_bvh2.ready && g_tlasGeneration == 0 && g_pendingTLAS.instanceAddr != 0) {
+        tlasBuildDone = true;
+        LOG("[PRESENT] Building TLAS at present #%u (ready=%d addr=0x%llx)...",
+            presentCount, (int)g_bvh2.ready, (unsigned long long)g_pendingTLAS.instanceAddr);
+        if (pDisp->QueueWaitIdle) pDisp->QueueWaitIdle(queue);
+        {
+            std::lock_guard<std::mutex> lock(g_lock);
+            g_pendingTLAS.pending = true;
+        }
+        processPendingTLAS();
+        {
+            std::lock_guard<std::mutex> lock(g_lock);
+            g_pendingTLAS.pending = false;
+        }
+        if (g_tlasGeneration > 0) {
+            LOG("[PRESENT] TLAS built (gen=%u), reuploading to SSBOs...", g_tlasGeneration);
+            reuploadTLASData(*pDisp);
+        }
+    }
+    // Log diagnostic for first 20 presents to debug timing
+    if (presentCount <= 20 && presentCount > 5) {
+        LOG("[PRESENT] #%u: ready=%d gen=%u addr=0x%llx tlasDone=%d",
+            presentCount, (int)g_bvh2.ready, g_tlasGeneration,
+            (unsigned long long)g_pendingTLAS.instanceAddr, (int)tlasBuildDone);
+    }
+
+    return pDisp->QueuePresentKHR(queue, pPresentInfo);
 }
 
 static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
@@ -3595,9 +4132,11 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
         }
         if (needFullUpload) {
             uploadBVH2Data(disp, g_lastBLAS);
-        } else if (needTLASReupload) {
-            reuploadTLASData(disp);
         }
+        // TLAS reupload disabled for testing
+        // else if (needTLASReupload) {
+        //     reuploadTLASData(disp);
+        // }
     }
 
     // Check if the currently bound compute pipeline is a ray query pipeline
@@ -3616,13 +4155,39 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
                 VkPipelineLayout layout = it->second.layout;
                 if (layout && g_bvh2.descSet) {
                     static int bindCount = 0;
-                    if (bindCount < 3)
+                    static int rqDispPerFrame = 0;
+                    static uint64_t rqTotalDisp = 0;
+                    static uint64_t rqTotalThreads = 0;
+                    rqDispPerFrame++;
+                    rqTotalDisp++;
+                    rqTotalThreads += (uint64_t)groupCountX * groupCountY * groupCountZ;
+                    if (bindCount < 5)
                         LOG("[BVH2] Binding desc set at set=%u for RQ dispatch %dx%dx%d (pipe=0x%lx)",
                             g_bvh2.descSetIdx, groupCountX, groupCountY, groupCountZ, pipeHandle);
+                    // Per-second stats
+                    static auto lastStatTime = std::chrono::steady_clock::now();
+                    auto now = std::chrono::steady_clock::now();
+                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastStatTime).count();
+                    if (elapsed >= 5000) {
+                        double fps = rqTotalDisp * 1000.0 / elapsed;
+                        LOG("[BVH2] STATS: %d RQ dispatches/frame, %.1f dispatches/sec, avg threads/disp=%lu",
+                            rqDispPerFrame, fps, rqTotalThreads / std::max(rqTotalDisp, (uint64_t)1));
+                        rqTotalDisp = 0;
+                        rqTotalThreads = 0;
+                        lastStatTime = now;
+                    }
+                    rqDispPerFrame = 0; // reset per QueueSubmit ideally, approximation OK
                     bindCount++;
-                    disp.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                                layout, g_bvh2.descSetIdx, 1,
-                                                &g_bvh2.descSet, 0, nullptr);
+                    static int noBindBVH = -1;
+                    if (noBindBVH < 0) {
+                        const char* e = getenv("CUDA_RT_NO_BIND_BVH");
+                        noBindBVH = (e && atoi(e)) ? 1 : 0;
+                    }
+                    if (!noBindBVH) {
+                        disp.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                    layout, g_bvh2.descSetIdx, 1,
+                                                    &g_bvh2.descSet, 0, nullptr);
+                    }
                 }
             }
         }
@@ -3689,6 +4254,26 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetInstanceProcAddr(VkInst
     if (strcmp(pName, "vkGetPhysicalDeviceProperties2KHR") == 0)
         return (PFN_vkVoidFunction)layer_GetPhysicalDeviceProperties2;
 
+    // Device-level functions that apps may resolve via InstanceProcAddr
+    // (GravityMark does this for vkQueueSubmit, bypassing device-level intercept)
+    INTERCEPT(QueueSubmit);
+    INTERCEPT(CmdDispatch);
+    INTERCEPT(CmdBuildAccelerationStructuresKHR);
+    INTERCEPT(CmdBindPipeline);
+    INTERCEPT(CmdBindDescriptorSets);
+    INTERCEPT(CmdPipelineBarrier);
+    INTERCEPT(CreateShaderModule);
+    INTERCEPT(CreateComputePipelines);
+    INTERCEPT(CreatePipelineLayout);
+    if (strcmp(pName, "vkQueueSubmit2KHR") == 0 || strcmp(pName, "vkQueueSubmit2") == 0)
+        return (PFN_vkVoidFunction)layer_QueueSubmit2KHR;
+    if (strcmp(pName, "vkQueuePresentKHR") == 0)
+        return (PFN_vkVoidFunction)layer_QueuePresentKHR;
+
+    // Debug: log Queue/Submit function lookups
+    if (pName && strstr(pName, "Queue"))
+        fprintf(stderr, "[CudaRT] GetInstanceProcAddr: %s\n", pName);
+
     // Forward to next layer
     if (instance) {
         void* key = getKey(instance);
@@ -3747,8 +4332,20 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetDeviceProcAddr(VkDevice
     INTERCEPT(CreateComputePipelines);
     INTERCEPT(CmdDispatch);
     INTERCEPT(QueueSubmit);
-    // Debug: log ALL GetDeviceProcAddr queries
-    if (pName && (strstr(pName, "Shader") || strstr(pName, "Create"))) {
+    // QueueSubmit2 for Vulkan 1.3+ apps (GravityMark uses this for per-frame rendering)
+    if (strcmp(pName, "vkQueueSubmit2KHR") == 0 || strcmp(pName, "vkQueueSubmit2") == 0) {
+        void* key = getKey(device);
+        auto it = g_deviceMap.find(key);
+        if (it != g_deviceMap.end() && it->second.QueueSubmit2KHR) {
+            return (PFN_vkVoidFunction)layer_QueueSubmit2KHR;
+        }
+    }
+    // QueuePresentKHR: per-frame WSI present hook
+    if (strcmp(pName, "vkQueuePresentKHR") == 0) {
+        return (PFN_vkVoidFunction)layer_QueuePresentKHR;
+    }
+    // Debug: log ALL Queue and Submit function lookups
+    if (pName && (strstr(pName, "Queue") || strstr(pName, "Submit"))) {
         fprintf(stderr, "[CudaRT] GetDeviceProcAddr: %s\n", pName);
     }
 
