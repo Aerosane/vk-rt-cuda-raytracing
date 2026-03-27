@@ -295,6 +295,14 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
         case SpvOpConstantFalse: cFalse = code[pos+2]; break;
         case SpvOpTypeRayQueryKHR:    rqTypeIds.insert(code[pos+1]); break;
         case SpvOpTypeAccelStructKHR: asTypeIds.insert(code[pos+1]); break;
+        case SpvOpTypeArray:
+        case SpvOpTypeRuntimeArray:
+            // Arrays of RQ or AS types must also be stripped
+            if (wc>=3) {
+                if (rqTypeIds.count(code[pos+2])) rqTypeIds.insert(code[pos+1]);
+                if (asTypeIds.count(code[pos+2])) asTypeIds.insert(code[pos+1]);
+            }
+            break;
         case SpvOpTypePointer:
             if (wc>=4) {
                 if (rqTypeIds.count(code[pos+3])) rqPtrTypeIds.insert(code[pos+1]);
@@ -359,33 +367,38 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
     uint32_t cu0 = newId(), cu1 = newId(), cu2 = newId(), cu3 = newId(), cu7 = newId();
     uint32_t cf1 = newId(), cfn1 = newId(); // float 1.0, float -1.0
     float tiny = 1e-8f; uint32_t cf_tiny = newId();
-    // Pre-allocated traversal local variables (per-function, emitted at first OpLabel)
-    uint32_t tvNi = newId(), tvBestT = newId(), tvHitU = newId(), tvHitV = newId();
-    uint32_t tvHitPrim = newId(), tvHitType = newId(), tvTriIdx = newId();
-    uint32_t tvIter = newId(); // iteration counter for max-iteration guard
-    uint32_t cMaxIter = newId(); // constant: max iterations (200)
+    // Traversal local variables — allocated PER-FUNCTION at each OpLabel
+    // (must be unique IDs per function to avoid duplicate definitions)
+    uint32_t tvNi = 0, tvBestT = 0, tvHitU = 0, tvHitV = 0;
+    uint32_t tvHitPrim = 0, tvHitType = 0, tvTriIdx = 0;
+    uint32_t tvIter = 0;
+    uint32_t cMaxIter = newId(); // constant: max iterations (200) — shared across functions
     // TLAS traversal variables
-    uint32_t tvTlasNi = newId();     // TLAS node index
-    uint32_t tvTlasIter = newId();   // TLAS iteration counter
-    uint32_t tvLocalRo = newId();    // local-space ray origin (vec3)
-    uint32_t tvLocalRd = newId();    // local-space ray direction (vec3)
-    uint32_t tvHitInst = newId();    // hit instance index
-    uint32_t tvBlasNodeOff = newId(); // per-instance BLAS node offset
-    uint32_t tvBlasTriOff  = newId(); // per-instance BLAS tri offset
-    uint32_t cMaxTlasIter = newId(); // constant: max TLAS iterations
+    uint32_t tvTlasNi = 0, tvTlasIter = 0;
+    uint32_t tvLocalRo = 0, tvLocalRd = 0;
+    uint32_t tvHitInst = 0;
+    uint32_t tvBlasNodeOff = 0, tvBlasTriOff = 0;
+    uint32_t cMaxTlasIter = newId(); // constant: shared across functions
     uint32_t glslExtId = 0; // will find existing GLSL.std.450 import
+
+    // Lambda to allocate fresh per-function traversal variable IDs
+    auto allocFuncVars = [&]() {
+        tvNi = newId(); tvBestT = newId(); tvHitU = newId(); tvHitV = newId();
+        tvHitPrim = newId(); tvHitType = newId(); tvTriIdx = newId();
+        tvIter = newId();
+        tvTlasNi = newId(); tvTlasIter = newId();
+        tvLocalRo = newId(); tvLocalRd = newId();
+        tvHitInst = newId();
+        tvBlasNodeOff = newId(); tvBlasTriOff = newId();
+    };
 
     // Build output
     std::vector<uint32_t> out;
     out.reserve(numWords * 2);
     for (int i = 0; i < 5; i++) out.push_back(code[i]); // header
 
-    // Mapping: original rq var -> new struct var
-    // Pre-allocate one struct variable per ray query variable
+    // Mapping: original rq var -> new struct var (re-allocated per function)
     std::unordered_map<uint32_t, uint32_t> rqMap;
-    for (uint32_t rqv : rqVarIds) {
-        rqMap[rqv] = newId();
-    }
 
     // Pre-scan: identify functions that contain RQ operations
     // Used to intercept calls to these functions and replace with constants
@@ -858,7 +871,12 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
         // Remove ray query and accel struct types (always — we rewrite all RQ ops)
         {
         if (op == SpvOpTypeRayQueryKHR || op == SpvOpTypeAccelStructKHR) skip = true;
-        // Remove pointer-to-rq and pointer-to-AS types
+        // Remove arrays of RQ/AS types
+        if ((op == SpvOpTypeArray || op == SpvOpTypeRuntimeArray) && wc >= 3) {
+            if (rqTypeIds.count(code[pos+1]) || asTypeIds.count(code[pos+1]))
+                skip = true;
+        }
+        // Remove pointer-to-rq and pointer-to-AS types (including pointers to arrays of AS)
         if (op == SpvOpTypePointer && wc >= 4) {
             if (rqTypeIds.count(code[pos+3]) || asTypeIds.count(code[pos+3]))
                 skip = true;
@@ -877,8 +895,27 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
 
         // Remove loads of rq/AS variables (we'll inline access)
         if (op == SpvOpLoad && wc >= 4) {
-            if (rqVarIds.count(code[pos+3]) || asVarIds.count(code[pos+3]))
+            if (rqVarIds.count(code[pos+3]) || asVarIds.count(code[pos+3]) ||
+                rqTypeIds.count(code[pos+1]) || asTypeIds.count(code[pos+1])) {
+                // Also mark the result ID as dead so downstream uses get stripped
+                asVarIds.insert(code[pos+2]);
                 skip = true;
+            }
+        }
+        // Remove AccessChain into AS/RQ variables (e.g., array element access)
+        if (op == SpvOpAccessChain && wc >= 4) {
+            if (asVarIds.count(code[pos+3]) || rqVarIds.count(code[pos+3]) ||
+                asPtrTypeIds.count(code[pos+1]) || rqPtrTypeIds.count(code[pos+1])) {
+                asVarIds.insert(code[pos+2]); // mark result as dead
+                skip = true;
+            }
+        }
+        // Remove CopyObject of dead AS/RQ values
+        if (op == SpvOpCopyObject && wc >= 4) {
+            if (asVarIds.count(code[pos+3]) || rqVarIds.count(code[pos+3]))  {
+                asVarIds.insert(code[pos+2]);
+                skip = true;
+            }
         }
         } // type/var removal block
 #endif // !SPIRV_RQ_KEEP_TYPES
@@ -1059,6 +1096,12 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 out.push_back(code[pos + j]);
             // Emit rq struct variables in ALL functions that use ray queries
             if (hasRQOps) {
+                // Allocate FRESH IDs for this function (avoid duplicate definitions)
+                allocFuncVars();
+                rqMap.clear();
+                for (uint32_t rqv : rqVarIds) {
+                    rqMap[rqv] = newId();
+                }
                 for (auto& kv : rqMap) {
                     spvEmit(out, SpvOpVariable, {tRQPtr, kv.second, (uint32_t)SCFunction});
                 }

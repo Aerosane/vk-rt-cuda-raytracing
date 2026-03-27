@@ -4634,7 +4634,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit2KHR(
             const char* env = getenv("CUDA_RT_TLAS_RATE");
             tlasRate = env ? atoi(env) : 300;
         }
-        bool shouldRebuild = false; // DISABLED for testing
+        bool shouldRebuild = (g_bvh2.ready && g_tlasBVH && g_bvh2.tlasGen != g_tlasGeneration);
         if (shouldRebuild) {
             disp.QueueWaitIdle(queue);
             processPendingTLAS();
@@ -4800,10 +4800,9 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
         if (needFullUpload) {
             uploadBVH2Data(disp, g_lastBLAS);
         }
-        // TLAS reupload disabled for testing
-        // else if (needTLASReupload) {
-        //     reuploadTLASData(disp);
-        // }
+        else if (needTLASReupload) {
+            reuploadTLASData(disp);
+        }
     }
 
     // Track whether this dispatch is an RQ (ray query) pipeline dispatch
