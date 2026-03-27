@@ -215,6 +215,7 @@ struct PendingBLAS {
     std::vector<PendingBLASGeo> geometries;
 };
 static std::vector<PendingBLAS> g_pendingBLAS;
+static std::vector<PendingBLAS> g_latePendingBLAS;  // BLASes captured after initial build
 static bool g_blasBuildsDone = false; // true once we've built BVH from real data
 
 // ═══════════════════════════════════════════
@@ -1686,17 +1687,25 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBuildAccelerationStructuresKHR(
         if (isTLAS) {
             tlasCount++;
             // Capture instance buffer for deferred read after QueueSubmit
+            // IMPORTANT: Keep the TLAS with the MOST instances when multiple
+            // TLASes are built per frame (Q2RTX builds 2: main scene + secondary)
             if (info.geometryCount > 0 &&
                 info.pGeometries[0].geometryType == VK_GEOMETRY_TYPE_INSTANCES_KHR) {
-                g_pendingTLAS.instanceAddr = info.pGeometries[0].geometry.instances.data.deviceAddress;
-                g_pendingTLAS.instanceCount = ppBuildRangeInfos[i][0].primitiveCount;
-                g_pendingTLAS.pending = true;
+                uint32_t newCount = ppBuildRangeInfos[i][0].primitiveCount;
+                VkDeviceAddress newAddr = info.pGeometries[0].geometry.instances.data.deviceAddress;
                 bool arrayOfPtrs = info.pGeometries[0].geometry.instances.arrayOfPointers;
-                if (tlasCount <= 3 || (tlasCount % 100) == 0)
-                    LOG("CmdBuildAS: TLAS #%d dst=0x%lx instances=%u addr=0x%lx arrayOfPtrs=%d → DEFERRED",
+                // Only overwrite if this TLAS has MORE instances (prefer primary scene)
+                if (newCount >= g_pendingTLAS.instanceCount || !g_pendingTLAS.pending) {
+                    g_pendingTLAS.instanceAddr = newAddr;
+                    g_pendingTLAS.instanceCount = newCount;
+                    g_pendingTLAS.pending = true;
+                }
+                if (tlasCount <= 5 || (tlasCount % 100) == 0)
+                    LOG("CmdBuildAS: TLAS #%d dst=0x%lx instances=%u addr=0x%lx arrayOfPtrs=%d → %s (pending=%u)",
                         tlasCount, (uint64_t)info.dstAccelerationStructure,
-                        g_pendingTLAS.instanceCount, (uint64_t)g_pendingTLAS.instanceAddr,
-                        (int)arrayOfPtrs);
+                        newCount, (uint64_t)newAddr, (int)arrayOfPtrs,
+                        (newCount >= g_pendingTLAS.instanceCount || !g_pendingTLAS.pending) ? "ACCEPTED" : "SKIPPED(smaller)",
+                        g_pendingTLAS.instanceCount);
             } else {
                 if (tlasCount <= 3)
                     LOG("CmdBuildAS: TLAS #%d dst=0x%lx prims=%u (no instances geometry, skipped)",
@@ -1706,7 +1715,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBuildAccelerationStructuresKHR(
         }
 
         // For BLAS: store geometry metadata for deferred build after QueueSubmit
-        if (info.type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR && !g_blasBuildsDone) {
+        if (info.type == VK_ACCELERATION_STRUCTURE_TYPE_BOTTOM_LEVEL_KHR) {
             PendingBLAS pb;
             pb.asKey = (uint64_t)info.dstAccelerationStructure;
 
@@ -1735,12 +1744,22 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBuildAccelerationStructuresKHR(
 
             if (!pb.geometries.empty()) {
                 std::lock_guard<std::mutex> lock(g_lock);
-                g_pendingBLAS.push_back(std::move(pb));
-                static int logCount = 0;
-                if (logCount < 5)
-                    LOG("CmdBuildAS[%u]: BLAS dst=0x%lx geos=%zu prims=%u → DEFERRED",
-                        i, pb.asKey, pb.geometries.size(), totalPrims);
-                logCount++;
+                if (!g_blasBuildsDone) {
+                    g_pendingBLAS.push_back(std::move(pb));
+                    static int logCount = 0;
+                    if (logCount < 5)
+                        LOG("CmdBuildAS[%u]: BLAS dst=0x%lx geos=%zu prims=%u → DEFERRED",
+                            i, (uint64_t)info.dstAccelerationStructure, pb.geometries.size(), totalPrims);
+                    logCount++;
+                } else {
+                    // Late BLAS — capture for incremental build
+                    static int lateLog = 0;
+                    if (lateLog < 5)
+                        LOG("CmdBuildAS[%u]: LATE BLAS dst=0x%lx prims=%u → QUEUED",
+                            i, (uint64_t)info.dstAccelerationStructure, totalPrims);
+                    lateLog++;
+                    g_latePendingBLAS.push_back(std::move(pb));
+                }
             }
         }
     }
@@ -1893,6 +1912,115 @@ static void processPendingBLAS() {
         LOG("[Deferred] Best BLAS: %d tris, %d BVH4 nodes — engine READY",
             cudaBVH_getNumTris(bestBVH), cudaBVH_getNumBVH4Nodes(bestBVH));
     }
+}
+
+// Process late BLAS builds (dynamic geometry) — called before TLAS rebuild
+// Returns true if new BLASes were added (requires SSBO re-upload)
+static bool processLateBLAS() {
+    std::vector<PendingBLAS> late;
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        if (g_latePendingBLAS.empty()) return false;
+        late = std::move(g_latePendingBLAS);
+        g_latePendingBLAS.clear();
+    }
+
+    static int lateCount = 0;
+    int newBLAS = 0;
+
+    for (auto& pb : late) {
+        // Skip if we already have this BLAS
+        {
+            std::lock_guard<std::mutex> lock(g_lock);
+            if (g_asKeyToBLASIdx.count(pb.asKey)) continue;
+        }
+
+        std::vector<CudaTri> capturedTris;
+        for (auto& pg : pb.geometries) {
+            void* vertHost = readDeviceAddressData(pg.vertAddr, pg.vertDataSize);
+            void* idxHost = nullptr;
+            if (pg.idxAddr)
+                idxHost = readDeviceAddressData(pg.idxAddr, pg.idxDataSize);
+            if (!vertHost) continue;
+
+            for (uint32_t p = 0; p < pg.primCount; p++) {
+                uint32_t i0, i1, i2;
+                if (idxHost && pg.indexType == VK_INDEX_TYPE_UINT16) {
+                    uint16_t* idx16 = (uint16_t*)idxHost;
+                    i0 = idx16[p*3]; i1 = idx16[p*3+1]; i2 = idx16[p*3+2];
+                } else if (idxHost && pg.indexType == VK_INDEX_TYPE_UINT32) {
+                    uint32_t* idx32 = (uint32_t*)idxHost;
+                    i0 = idx32[p*3]; i1 = idx32[p*3+1]; i2 = idx32[p*3+2];
+                } else {
+                    i0 = p*3; i1 = p*3+1; i2 = p*3+2;
+                }
+                CudaTri tri;
+                float* v0 = (float*)((char*)vertHost + i0 * pg.vertexStride);
+                float* v1 = (float*)((char*)vertHost + i1 * pg.vertexStride);
+                float* v2 = (float*)((char*)vertHost + i2 * pg.vertexStride);
+                tri.v0[0]=v0[0]; tri.v0[1]=v0[1]; tri.v0[2]=v0[2];
+                tri.v1[0]=v1[0]; tri.v1[1]=v1[1]; tri.v1[2]=v1[2];
+                tri.v2[0]=v2[0]; tri.v2[1]=v2[1]; tri.v2[2]=v2[2];
+                capturedTris.push_back(tri);
+            }
+            free(vertHost);
+            free(idxHost);
+        }
+
+        if (!capturedTris.empty()) {
+            CudaBVH_t bvh = cudaBVH_build(capturedTris.data(), (int)capturedTris.size());
+            if (bvh) {
+                std::lock_guard<std::mutex> lock(g_lock);
+                BLASEntry entry = {};
+                entry.bvh = bvh;
+                entry.asKey = pb.asKey;
+                entry.numTris = (int)capturedTris.size();
+
+                uint32_t* bvh2Data = nullptr;
+                int numNodes = cudaBVH_getStacklessBVH2(bvh, &bvh2Data);
+                int numTris = (int)capturedTris.size();
+
+                // Compute offset from existing entries
+                int nodeOff = 0, triOff = 0;
+                for (auto& be : g_blasEntries) {
+                    nodeOff += be.numNodes;
+                    triOff += be.numTris;
+                }
+                entry.nodeOffset = nodeOff;
+                entry.triOffset = triOff;
+                entry.numNodes = numNodes;
+                entry.numTriVec4s = numTris * 3;
+
+                if (bvh2Data && numNodes > 0) {
+                    memcpy(&entry.minX, bvh2Data + 0, 4);
+                    memcpy(&entry.minY, bvh2Data + 1, 4);
+                    memcpy(&entry.minZ, bvh2Data + 2, 4);
+                    memcpy(&entry.maxX, bvh2Data + 3, 4);
+                    memcpy(&entry.maxY, bvh2Data + 4, 4);
+                    memcpy(&entry.maxZ, bvh2Data + 5, 4);
+                }
+
+                g_asKeyToBLASIdx[pb.asKey] = (int)g_blasEntries.size();
+                g_blasEntries.push_back(entry);
+                newBLAS++;
+
+                // Update device address mapping
+                for (auto& [devAddr, asHandle] : g_asDevAddrToHandle) {
+                    if (asHandle == pb.asKey) {
+                        g_blasDevAddrToIdx[devAddr] = (int)g_blasEntries.size() - 1;
+                    }
+                }
+            }
+        }
+    }
+
+    if (newBLAS > 0) {
+        lateCount += newBLAS;
+        LOG("[Late-BLAS] Built %d new BLASes (%d total late), %d BLASes now",
+            newBLAS, lateCount, (int)g_blasEntries.size());
+        return true;
+    }
+    return false;
 }
 
 // Helper: invert a 3×4 row-major affine matrix (rotation+translation)
@@ -2136,11 +2264,23 @@ have_data:
             memcpy(&ref, p + i*64 + 56, 8);
             if (ref) blasRefCounts[ref]++;
         }
-        // Find most-referenced BLAS as fallback for unmapped instances
+        // Find most-referenced MAPPED BLAS as fallback for unmapped instances
         uint64_t bestRef = 0;
         int bestCount = 0;
+        int bestMappedIdx = -1;
+        int bestMappedTris = 0;
         for (auto& [ref, cnt] : blasRefCounts) {
             if (cnt > bestCount) { bestCount = cnt; bestRef = ref; }
+            auto it = g_blasDevAddrToIdx.find(ref);
+            if (it != g_blasDevAddrToIdx.end()) {
+                int idx = it->second;
+                int tris = (idx < (int)g_blasEntries.size()) ? g_blasEntries[idx].numTris : 0;
+                // Prefer the largest mapped BLAS (world geometry) as fallback
+                if (tris > bestMappedTris) {
+                    bestMappedTris = tris;
+                    bestMappedIdx = idx;
+                }
+            }
         }
         if (bestRef) {
             auto it = g_blasDevAddrToIdx.find(bestRef);
@@ -2148,17 +2288,31 @@ have_data:
                 fallbackBlasIdx = it->second;
             }
         }
+        // If most-referenced BLAS is unmapped, fall back to largest mapped BLAS
+        if (fallbackBlasIdx < 0 && bestMappedIdx >= 0) {
+            fallbackBlasIdx = bestMappedIdx;
+            if (verbose)
+                LOG("[TLAS] Using largest mapped BLAS#%d (%d tris) as fallback", bestMappedIdx, bestMappedTris);
+        }
         if (verbose) {
-            LOG("[TLAS] %zu unique BLAS refs, fallbackIdx=%d (%d BLASes available)",
-                blasRefCounts.size(), fallbackBlasIdx, (int)g_blasEntries.size());
+            LOG("[TLAS] %zu unique BLAS refs, fallbackIdx=%d (%d BLASes available, %zu tracked devAddrs)",
+                blasRefCounts.size(), fallbackBlasIdx, (int)g_blasEntries.size(), g_blasDevAddrToIdx.size());
             for (auto& [ref, cnt] : blasRefCounts) {
                 auto it = g_blasDevAddrToIdx.find(ref);
                 int idx = (it != g_blasDevAddrToIdx.end()) ? it->second : -1;
                 if (idx >= 0)
                     LOG("  blasRef=0x%lx → BLAS#%d (%d tris), %d instances",
                         ref, idx, g_blasEntries[idx].numTris, cnt);
-                else
+                else {
                     LOG("  blasRef=0x%lx → UNMAPPED, %d instances", ref, cnt);
+                    // Dump all tracked addresses for debugging
+                    LOG("  [DEBUG] All %zu tracked BLAS devAddrs:", g_blasDevAddrToIdx.size());
+                    int dumpCount = 0;
+                    for (auto& [da, bi] : g_blasDevAddrToIdx) {
+                        LOG("    devAddr=0x%lx → BLAS#%d", da, bi);
+                        if (++dumpCount >= 10) { LOG("    ... (%zu more)", g_blasDevAddrToIdx.size() - 10); break; }
+                    }
+                }
             }
         }
     }
@@ -3822,8 +3976,6 @@ static VKAPI_ATTR VkDeviceAddress VKAPI_CALL layer_GetAccelerationStructureDevic
     VkDevice device,
     const VkAccelerationStructureDeviceAddressInfoKHR* pInfo)
 {
-    LOG("GetASDeviceAddr: AS=0x%lx", (uint64_t)pInfo->accelerationStructure);
-
     // Check if this is one of our fake AS handles (< 0x10000 = fake from g_nextASHandle)
     uint64_t asVal = (uint64_t)pInfo->accelerationStructure;
     bool isFakeAS = (asVal >= 0x1000 && asVal < 0x100000);
@@ -3838,6 +3990,12 @@ static VKAPI_ATTR VkDeviceAddress VKAPI_CALL layer_GetAccelerationStructureDevic
     if (addr == 0)
         addr = 0xDEAD000000000000ULL | asVal;
 
+    static int addrLogCount = 0;
+    if (addrLogCount < 40)
+        LOG("GetASDeviceAddr: AS=0x%lx → devAddr=0x%lx%s", asVal, (uint64_t)addr,
+            isFakeAS ? " (FAKE)" : "");
+    addrLogCount++;
+
     // Track device address → AS handle mapping (for TLAS→BLAS resolution)
     {
         std::lock_guard<std::mutex> lock(g_lock);
@@ -3846,6 +4004,8 @@ static VKAPI_ATTR VkDeviceAddress VKAPI_CALL layer_GetAccelerationStructureDevic
         auto it = g_asKeyToBLASIdx.find(asVal);
         if (it != g_asKeyToBLASIdx.end()) {
             g_blasDevAddrToIdx[addr] = it->second;
+            if (addrLogCount <= 40)
+                LOG("  → mapped to BLAS#%d", it->second);
         }
     }
     return addr;
@@ -4637,6 +4797,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit2KHR(
         bool shouldRebuild = (g_bvh2.ready && g_tlasBVH && g_bvh2.tlasGen != g_tlasGeneration);
         if (shouldRebuild) {
             disp.QueueWaitIdle(queue);
+            bool hasNewBLAS = processLateBLAS();
+            if (hasNewBLAS) uploadBVH2Data(disp, g_lastBLAS);
             processPendingTLAS();
         } else {
             std::lock_guard<std::mutex> lock(g_lock);
@@ -4679,6 +4841,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
         {
             std::lock_guard<std::mutex> lock(g_lock);
             g_pendingTLAS.pending = true;
+        }
+        bool hasNewBLAS = processLateBLAS();  // Build any dynamic BLASes before TLAS rebuild
+        if (hasNewBLAS) {
+            LOG("[PRESENT] Late BLASes added, re-uploading BLAS SSBOs...");
+            uploadBVH2Data(*pDisp, g_lastBLAS);
         }
         processPendingTLAS();
         {
