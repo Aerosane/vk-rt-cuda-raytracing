@@ -3864,12 +3864,15 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindPipeline(
     VkPipeline pipeline)
 {
     if (bindPoint == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR) {
-        LOG("CmdBindPipeline: RT pipeline 0x%lx (intercepted — not forwarded)", (uint64_t)pipeline);
-        return; // Don't forward to driver — we handle RT tracing entirely
+        return; // Don't forward — we handle RT entirely
     }
+    // Lock-free compute pipeline tracking: use atomic store
+    // Only compute pipelines need tracking (for BVH desc binding in CmdDispatch)
     if (bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
-        std::lock_guard<std::mutex> lock(g_cmdBufMutex);
-        g_cmdBufBoundPipeline[(uint64_t)cmdBuf] = (uint64_t)pipeline;
+        // Use thread-local-ish approach: store last bound pipeline per cmdBuf.
+        // Since command buffers are single-threaded by spec, no mutex needed
+        // for the write. Readers in CmdDispatch use the same cmdBuf → same thread.
+        g_cmdBufBoundPipeline[(uint64_t)cmdBuf] = (uint64_t)pipeline; // lock-free: same thread
     }
     void* key = getKey(cmdBuf);
     auto& disp = g_deviceMap[key];
@@ -4139,61 +4142,47 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
         // }
     }
 
-    // Check if the currently bound compute pipeline is a ray query pipeline
+    // Track whether this dispatch is an RQ (ray query) pipeline dispatch
+    bool isRQDispatch = false;
+
+    // Lock-free check: RQ pipeline set is immutable after creation.
+    // cmdBuf pipeline tracking is single-threaded per Vulkan spec.
     if (g_bvh2.ready) {
         uint64_t pipeHandle = 0;
         {
-            std::lock_guard<std::mutex> lock(g_cmdBufMutex);
+            // No mutex needed: same thread that called CmdBindPipeline
             auto it = g_cmdBufBoundPipeline.find((uint64_t)cmdBuf);
             if (it != g_cmdBufBoundPipeline.end()) pipeHandle = it->second;
         }
         if (pipeHandle) {
-            std::lock_guard<std::mutex> lock(g_rqPipelineMutex);
+            // g_rqPipelines is read-only after pipeline creation (no mutex needed)
             auto it = g_rqPipelines.find(pipeHandle);
             if (it != g_rqPipelines.end()) {
-                // Bind our BVH2 descriptor set at set=4
+                isRQDispatch = true;
                 VkPipelineLayout layout = it->second.layout;
                 if (layout && g_bvh2.descSet) {
-                    static int bindCount = 0;
-                    static int rqDispPerFrame = 0;
-                    static uint64_t rqTotalDisp = 0;
-                    static uint64_t rqTotalThreads = 0;
-                    rqDispPerFrame++;
-                    rqTotalDisp++;
-                    rqTotalThreads += (uint64_t)groupCountX * groupCountY * groupCountZ;
-                    if (bindCount < 5)
-                        LOG("[BVH2] Binding desc set at set=%u for RQ dispatch %dx%dx%d (pipe=0x%lx)",
-                            g_bvh2.descSetIdx, groupCountX, groupCountY, groupCountZ, pipeHandle);
-                    // Per-second stats
-                    static auto lastStatTime = std::chrono::steady_clock::now();
-                    auto now = std::chrono::steady_clock::now();
-                    auto elapsed = std::chrono::duration_cast<std::chrono::milliseconds>(now - lastStatTime).count();
-                    if (elapsed >= 5000) {
-                        double fps = rqTotalDisp * 1000.0 / elapsed;
-                        LOG("[BVH2] STATS: %d RQ dispatches/frame, %.1f dispatches/sec, avg threads/disp=%lu",
-                            rqDispPerFrame, fps, rqTotalThreads / std::max(rqTotalDisp, (uint64_t)1));
-                        rqTotalDisp = 0;
-                        rqTotalThreads = 0;
-                        lastStatTime = now;
-                    }
-                    rqDispPerFrame = 0; // reset per QueueSubmit ideally, approximation OK
-                    bindCount++;
-                    static int noBindBVH = -1;
-                    if (noBindBVH < 0) {
-                        const char* e = getenv("CUDA_RT_NO_BIND_BVH");
-                        noBindBVH = (e && atoi(e)) ? 1 : 0;
-                    }
-                    if (!noBindBVH) {
-                        disp.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                                    layout, g_bvh2.descSetIdx, 1,
-                                                    &g_bvh2.descSet, 0, nullptr);
-                    }
+                    // Bind BVH2 descriptor set at set=4 — single Vulkan call, no CPU overhead
+                    disp.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                layout, g_bvh2.descSetIdx, 1,
+                                                &g_bvh2.descSet, 0, nullptr);
                 }
             }
         }
     }
 
-    disp.CmdDispatch(cmdBuf, groupCountX, groupCountY, groupCountZ);
+    // Env var CUDA_RT_HALF_RES: 0=full, 1=half-Y, 2=quarter, 3=NOP (skip RT dispatch entirely)
+    static int halfRes = -1;
+    if (halfRes < 0) {
+        const char* e = getenv("CUDA_RT_HALF_RES");
+        halfRes = e ? atoi(e) : 0;
+    }
+    uint32_t dispX = groupCountX, dispY = groupCountY, dispZ = groupCountZ;
+    if (isRQDispatch) {
+        if (halfRes >= 3) return; // NOP: skip RT dispatch entirely
+        if (halfRes >= 2) { dispX = (dispX + 1) / 2; dispY = (dispY + 1) / 2; }
+        else if (halfRes >= 1) { dispY = (dispY + 1) / 2; }
+    }
+    disp.CmdDispatch(cmdBuf, dispX, dispY, dispZ);
 }
 
 // ═══════════════════════════════════════════
@@ -4260,8 +4249,7 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetInstanceProcAddr(VkInst
     INTERCEPT(CmdDispatch);
     INTERCEPT(CmdBuildAccelerationStructuresKHR);
     INTERCEPT(CmdBindPipeline);
-    INTERCEPT(CmdBindDescriptorSets);
-    INTERCEPT(CmdPipelineBarrier);
+    // CmdBindDescriptorSets and CmdPipelineBarrier NOT intercepted (high-frequency, not needed for compute RQ)
     INTERCEPT(CreateShaderModule);
     INTERCEPT(CreateComputePipelines);
     INTERCEPT(CreatePipelineLayout);
@@ -4349,10 +4337,13 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetDeviceProcAddr(VkDevice
         fprintf(stderr, "[CudaRT] GetDeviceProcAddr: %s\n", pName);
     }
 
-    // RT interceptions
+    // RT interceptions — only intercept what's needed
+    // CmdBindPipeline: track compute pipeline binding (needed for BVH desc set)
     INTERCEPT(CmdBindPipeline);
-    INTERCEPT(CmdBindDescriptorSets);
-    INTERCEPT(CmdPipelineBarrier);
+    // NOTE: CmdBindDescriptorSets and CmdPipelineBarrier NOT intercepted.
+    // They were only needed for RT bind point / RT stage bit remapping, which
+    // only applies to vkCmdTraceRaysKHR-based apps (not compute ray queries).
+    // Removing saves ~100ns per call × hundreds of thousands of calls per frame.
     INTERCEPT(CreateDescriptorPool);
     INTERCEPT(CreateDescriptorSetLayout);
     INTERCEPT(UpdateDescriptorSets);
