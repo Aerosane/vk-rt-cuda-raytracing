@@ -2904,12 +2904,12 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
             memcpy(dst + 12, gi.invTransform + 0, 16);
             memcpy(dst + 16, gi.invTransform + 4, 16);
             memcpy(dst + 20, gi.invTransform + 8, 16);
-            // vec4[6] = (blasMin.xyz, float(blasNodeOff))
+            // vec4[6] = (blasMin.xyz, uintBitsToFloat(blasNodeOff))
             dst[24] = gi.blasMinX; dst[25] = gi.blasMinY; dst[26] = gi.blasMinZ;
-            dst[27] = (float)gi.blasNodeOff;  // store as actual float (avoid denormal flush)
-            // vec4[7] = (blasMax.xyz, float(blasTriOff))
+            memcpy(&dst[27], &gi.blasNodeOff, 4);  // raw uint32 bits as float
+            // vec4[7] = (blasMax.xyz, uintBitsToFloat(blasTriOff))
             dst[28] = gi.blasMaxX; dst[29] = gi.blasMaxY; dst[30] = gi.blasMaxZ;
-            dst[31] = (float)gi.blasTriOff;   // store as actual float
+            memcpy(&dst[31], &gi.blasTriOff, 4);   // raw uint32 bits as float
         }
         if (!createBufferWithData(disp, instPacked.data(), instancesSize,
                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.instancesBuf, g_bvh2.instancesMem)) {
@@ -3037,9 +3037,9 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
         memcpy(dst + 16, gi.invTransform + 4, 16);
         memcpy(dst + 20, gi.invTransform + 8, 16);
         dst[24] = gi.blasMinX; dst[25] = gi.blasMinY; dst[26] = gi.blasMinZ;
-        dst[27] = (float)gi.blasNodeOff;  // store as actual float (avoid denormal flush)
+        memcpy(&dst[27], &gi.blasNodeOff, 4);  // raw uint32 bits as float
         dst[28] = gi.blasMaxX; dst[29] = gi.blasMaxY; dst[30] = gi.blasMaxZ;
-        dst[31] = (float)gi.blasTriOff;   // store as actual float
+        memcpy(&dst[31], &gi.blasTriOff, 4);   // raw uint32 bits as float
     }
     if (!createBufferHostVisible(disp, instPacked.data(), instancesSize,
                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.instancesBuf, g_bvh2.instancesMem)) {
