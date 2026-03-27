@@ -107,6 +107,38 @@ struct DeviceDispatch {
     PFN_vkCmdFillBuffer CmdFillBuffer;
     PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
 
+    // Render pass profiling
+    PFN_vkCmdBeginRenderPass CmdBeginRenderPass;
+    PFN_vkCmdEndRenderPass CmdEndRenderPass;
+    PFN_vkCreateRenderPass CreateRenderPass;
+    PFN_vkCmdDrawIndexed CmdDrawIndexed;
+    PFN_vkCmdDraw CmdDraw;
+    PFN_vkCmdDrawIndexedIndirect CmdDrawIndexedIndirect;
+    PFN_vkCmdDrawIndirect CmdDrawIndirect;
+    PFN_vkCmdExecuteCommands CmdExecuteCommands;
+    PFN_vkCmdWaitEvents CmdWaitEvents;
+    PFN_vkCmdDrawIndexedIndirectCount CmdDrawIndexedIndirectCount;
+    PFN_vkCmdDrawIndirectCount CmdDrawIndirectCount;
+    PFN_vkCreateQueryPool CreateQueryPool;
+    PFN_vkDestroyQueryPool DestroyQueryPool;
+    PFN_vkGetQueryPoolResults GetQueryPoolResults;
+    PFN_vkCmdWriteTimestamp CmdWriteTimestamp;
+    PFN_vkCmdResetQueryPool CmdResetQueryPool;
+
+    // Async compute queue
+    PFN_vkGetDeviceQueue GetDeviceQueue;
+    PFN_vkCreateCommandPool CreateCommandPool;
+    PFN_vkAllocateCommandBuffers AllocateCommandBuffers;
+    PFN_vkBeginCommandBuffer BeginCommandBuffer;
+    PFN_vkEndCommandBuffer EndCommandBuffer;
+    PFN_vkCreateSemaphore CreateSemaphore_;
+    PFN_vkDestroySemaphore DestroySemaphore;
+    PFN_vkCreateFence CreateFence;
+    PFN_vkDestroyFence DestroyFence;
+    PFN_vkWaitForFences WaitForFences;
+    PFN_vkResetFences ResetFences;
+    PFN_vkResetCommandBuffer ResetCommandBuffer;
+
     // Queue submit (for deferred BLAS build after GPU execution)
     PFN_vkQueueSubmit QueueSubmit;
     PFN_vkQueueSubmit2KHR QueueSubmit2KHR;
@@ -244,6 +276,62 @@ struct TrackedImage {
     VkFormat format;
 };
 static std::unordered_map<uint64_t, TrackedImage> g_storageImages;  // key: VkImage
+
+// ═══════════════════════════════════════════
+// Render pass profiling: GPU timestamps per render pass
+// ═══════════════════════════════════════════
+struct RenderPassInfo {
+    uint32_t colorAttachments;
+    uint32_t depthAttachment;   // 0 or 1
+    uint32_t subpassCount;
+};
+static std::unordered_map<uint64_t, RenderPassInfo> g_renderPassInfo;
+
+struct FrameProfile {
+    VkQueryPool queryPool;
+    uint32_t    queryIdx;       // next query slot to use
+    bool        ready;
+    uint32_t    rpCount;        // render passes this frame
+    // Per-pass timing
+    struct PassTiming {
+        uint64_t renderPass;    // handle
+        uint32_t startQuery;
+        uint32_t endQuery;
+        uint32_t width, height;
+        uint32_t colorAttachments;
+    };
+    std::vector<PassTiming> passes;
+    // Compute dispatch timing
+    uint32_t computeStartQuery;
+    uint32_t computeEndQuery;
+    uint32_t computeDispatches;
+    // RP2 mid-pass timestamp
+    uint32_t rp2MidQuery;
+    uint32_t rp2PreEndQuery;
+};
+static FrameProfile g_profile = {};
+static float g_timestampPeriod = 0.0f;  // ns per tick
+
+// ═══════════════════════════════════════════
+// Async compute queue: submit RT dispatches on family 2
+// ═══════════════════════════════════════════
+struct AsyncCompute {
+    VkQueue       queue;
+    uint32_t      queueFamily;
+    VkCommandPool cmdPool;
+    VkCommandBuffer cmdBuf;
+    VkSemaphore   rtDoneSemaphore;  // signals when RT dispatch completes
+    VkFence       fence;
+    bool          ready;
+    bool          hasPendingWork;
+    // Track what to dispatch
+    VkPipeline    pipeline;
+    VkPipelineLayout layout;
+    VkDescriptorSet descSets[8];
+    uint32_t      descSetCount;
+    uint32_t      groupCountX, groupCountY, groupCountZ;
+};
+static AsyncCompute g_async = {};
 
 // CUDA→Vulkan shared staging buffer (DEVICE_LOCAL with external memory)
 struct StagingInterop {
@@ -752,6 +840,36 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
     LOAD_DEV(CmdDispatch);
     LOAD_DEV(CmdFillBuffer);
     LOAD_DEV(GetImageMemoryRequirements);
+    // Render pass profiling
+    LOAD_DEV(CmdBeginRenderPass);
+    LOAD_DEV(CmdEndRenderPass);
+    LOAD_DEV(CreateRenderPass);
+    LOAD_DEV(CmdDrawIndexed);
+    LOAD_DEV(CmdDraw);
+    LOAD_DEV(CmdDrawIndexedIndirect);
+    LOAD_DEV(CmdDrawIndirect);
+    LOAD_DEV(CmdExecuteCommands);
+    LOAD_DEV(CmdWaitEvents);
+    LOAD_DEV(CmdDrawIndexedIndirectCount);
+    LOAD_DEV(CmdDrawIndirectCount);
+    LOAD_DEV(CreateQueryPool);
+    LOAD_DEV(DestroyQueryPool);
+    LOAD_DEV(GetQueryPoolResults);
+    LOAD_DEV(CmdWriteTimestamp);
+    LOAD_DEV(CmdResetQueryPool);
+    // Async compute queue
+    LOAD_DEV(GetDeviceQueue);
+    LOAD_DEV(CreateCommandPool);
+    LOAD_DEV(AllocateCommandBuffers);
+    LOAD_DEV(BeginCommandBuffer);
+    LOAD_DEV(EndCommandBuffer);
+    disp.CreateSemaphore_ = (PFN_vkCreateSemaphore)nextGDPA(*pDevice, "vkCreateSemaphore");
+    LOAD_DEV(DestroySemaphore);
+    LOAD_DEV(CreateFence);
+    LOAD_DEV(DestroyFence);
+    LOAD_DEV(WaitForFences);
+    LOAD_DEV(ResetFences);
+    LOAD_DEV(ResetCommandBuffer);
     LOAD_DEV(QueueSubmit);
     // QueueSubmit2KHR might not exist — load manually
     disp.QueueSubmit2KHR = (PFN_vkQueueSubmit2KHR)nextGDPA(*pDevice, "vkQueueSubmit2KHR");
@@ -779,7 +897,119 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
     std::lock_guard<std::mutex> lock(g_lock);
     g_deviceMap[getKey(*pDevice)] = disp;
 
-    LOG("Device created — intercepting RT calls");
+    // ── Setup async compute queue (family 2 = compute-only on V100) ──
+    {
+        // Get physical device properties for timestamp period
+        auto getProps = (PFN_vkGetPhysicalDeviceProperties)
+            nextGIPA(g_instance, "vkGetPhysicalDeviceProperties");
+        if (getProps) {
+            VkPhysicalDeviceProperties props;
+            getProps(gpu, &props);
+            g_timestampPeriod = props.limits.timestampPeriod; // ns per tick
+            LOG("  → Timestamp period: %.2f ns/tick", g_timestampPeriod);
+        }
+
+        // Enumerate queue families to find async compute (compute-only)
+        auto getQueueFamilyProps = (PFN_vkGetPhysicalDeviceQueueFamilyProperties)
+            nextGIPA(g_instance, "vkGetPhysicalDeviceQueueFamilyProperties");
+        uint32_t qfCount = 0;
+        if (getQueueFamilyProps) {
+            getQueueFamilyProps(gpu, &qfCount, nullptr);
+            std::vector<VkQueueFamilyProperties> qfProps(qfCount);
+            getQueueFamilyProps(gpu, &qfCount, qfProps.data());
+
+            // Find compute-only queue family (no graphics bit)
+            uint32_t asyncFamily = UINT32_MAX;
+            for (uint32_t i = 0; i < qfCount; i++) {
+                if ((qfProps[i].queueFlags & VK_QUEUE_COMPUTE_BIT) &&
+                    !(qfProps[i].queueFlags & VK_QUEUE_GRAPHICS_BIT) &&
+                    qfProps[i].queueCount > 0) {
+                    asyncFamily = i;
+                    LOG("  → Found async compute queue family %u (%u queues)",
+                        i, qfProps[i].queueCount);
+                    break;
+                }
+            }
+
+            if (asyncFamily != UINT32_MAX) {
+                // Check if app already requested this queue family
+                bool appRequestedIt = false;
+                for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
+                    if (pCreateInfo->pQueueCreateInfos[i].queueFamilyIndex == asyncFamily) {
+                        appRequestedIt = true;
+                        break;
+                    }
+                }
+
+                // Try to get a queue from this family
+                // If the app didn't request it, we need to recreate the device... skip for now
+                // and use a queue from family 0 (app always requests family 0)
+                if (!appRequestedIt) {
+                    // Use last queue from family 0 as our "async" queue
+                    // This won't give true async overlap but avoids device recreation
+                    uint32_t family0Count = 0;
+                    for (uint32_t i = 0; i < pCreateInfo->queueCreateInfoCount; i++) {
+                        if (pCreateInfo->pQueueCreateInfos[i].queueFamilyIndex == 0) {
+                            family0Count = pCreateInfo->pQueueCreateInfos[i].queueCount;
+                            break;
+                        }
+                    }
+                    if (family0Count > 1) {
+                        // Use queue index 1 from family 0 for async work
+                        disp.GetDeviceQueue(*pDevice, 0, family0Count - 1, &g_async.queue);
+                        g_async.queueFamily = 0;
+                        LOG("  → Using family 0 queue %u for async compute (shared family)", family0Count - 1);
+                    } else {
+                        LOG("  → Only 1 queue in family 0, async compute disabled");
+                    }
+                } else {
+                    // App requested this family — get queue 0 from it
+                    disp.GetDeviceQueue(*pDevice, asyncFamily, 0, &g_async.queue);
+                    g_async.queueFamily = asyncFamily;
+                    LOG("  → Got async compute queue from family %u", asyncFamily);
+                }
+
+                if (g_async.queue) {
+                    // Create command pool for async queue
+                    VkCommandPoolCreateInfo cpCI = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+                    cpCI.queueFamilyIndex = g_async.queueFamily;
+                    cpCI.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+                    disp.CreateCommandPool(*pDevice, &cpCI, nullptr, &g_async.cmdPool);
+
+                    VkCommandBufferAllocateInfo cbAI = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+                    cbAI.commandPool = g_async.cmdPool;
+                    cbAI.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                    cbAI.commandBufferCount = 1;
+                    disp.AllocateCommandBuffers(*pDevice, &cbAI, &g_async.cmdBuf);
+
+                    // Create semaphore + fence for sync
+                    VkSemaphoreCreateInfo semCI = {VK_STRUCTURE_TYPE_SEMAPHORE_CREATE_INFO};
+                    disp.CreateSemaphore_(*pDevice, &semCI, nullptr, &g_async.rtDoneSemaphore);
+
+                    VkFenceCreateInfo fenceCI = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+                    fenceCI.flags = VK_FENCE_CREATE_SIGNALED_BIT; // start signaled
+                    disp.CreateFence(*pDevice, &fenceCI, nullptr, &g_async.fence);
+
+                    g_async.ready = true;
+                    g_async.hasPendingWork = false;
+                    LOG("  → Async compute ready: queue=%p pool=%p cmdBuf=%p",
+                        g_async.queue, g_async.cmdPool, g_async.cmdBuf);
+                }
+            }
+        }
+
+        // Create timestamp query pool for render pass profiling (32 queries = 16 passes)
+        VkQueryPoolCreateInfo qpCI = {VK_STRUCTURE_TYPE_QUERY_POOL_CREATE_INFO};
+        qpCI.queryType = VK_QUERY_TYPE_TIMESTAMP;
+        qpCI.queryCount = 64;  // 32 render passes × 2 (begin+end)
+        disp.CreateQueryPool(*pDevice, &qpCI, nullptr, &g_profile.queryPool);
+        g_profile.queryIdx = 0;
+        g_profile.ready = true;
+        LOG("  → Timestamp query pool created (64 slots)");
+    }
+
+    LOG("Device created — intercepting RT calls (async compute: %s)",
+        g_async.ready ? "ENABLED" : "disabled");
     return VK_SUCCESS;
 }
 
@@ -3856,6 +4086,340 @@ static VKAPI_ATTR void VKAPI_CALL layer_UpdateDescriptorSets(
 #endif
 
 // ═══════════════════════════════════════════
+// Intercepted: CreateRenderPass — track attachment configuration
+// ═══════════════════════════════════════════
+static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateRenderPass(
+    VkDevice device,
+    const VkRenderPassCreateInfo* pCreateInfo,
+    const VkAllocationCallbacks* pAllocator,
+    VkRenderPass* pRenderPass)
+{
+    void* key = getKey(device);
+    auto& disp = g_deviceMap[key];
+    VkResult res = disp.CreateRenderPass(device, pCreateInfo, pAllocator, pRenderPass);
+    if (res == VK_SUCCESS && pRenderPass) {
+        RenderPassInfo info = {};
+        // Count color vs depth attachments
+        for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++) {
+            VkFormat fmt = pCreateInfo->pAttachments[i].format;
+            if (fmt == VK_FORMAT_D16_UNORM || fmt == VK_FORMAT_D32_SFLOAT ||
+                fmt == VK_FORMAT_D16_UNORM_S8_UINT || fmt == VK_FORMAT_D24_UNORM_S8_UINT ||
+                fmt == VK_FORMAT_D32_SFLOAT_S8_UINT) {
+                info.depthAttachment = 1;
+            } else {
+                info.colorAttachments++;
+            }
+        }
+        info.subpassCount = pCreateInfo->subpassCount;
+        g_renderPassInfo[(uint64_t)*pRenderPass] = info;
+
+        // Log detailed attachment info: format, samples, loadOp, storeOp, layouts
+        for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++) {
+            auto& att = pCreateInfo->pAttachments[i];
+            LOG("[PROFILE] CreateRenderPass 0x%lx att[%u]: fmt=%u samples=%u load=%u store=%u initL=%u finalL=%u",
+                (uint64_t)*pRenderPass, i, att.format, att.samples, att.loadOp, att.storeOp,
+                att.initialLayout, att.finalLayout);
+        }
+        // Log subpass resolve attachments
+        for (uint32_t s = 0; s < pCreateInfo->subpassCount; s++) {
+            auto& sub = pCreateInfo->pSubpasses[s];
+            if (sub.pResolveAttachments) {
+                for (uint32_t r = 0; r < sub.colorAttachmentCount; r++) {
+                    if (sub.pResolveAttachments[r].attachment != VK_ATTACHMENT_UNUSED)
+                        LOG("[PROFILE] CreateRenderPass 0x%lx subpass[%u] resolve[%u]: att=%u layout=%u",
+                            (uint64_t)*pRenderPass, s, r, sub.pResolveAttachments[r].attachment,
+                            sub.pResolveAttachments[r].layout);
+                }
+            }
+        }
+        // Log subpass dependencies
+        for (uint32_t d = 0; d < pCreateInfo->dependencyCount; d++) {
+            auto& dep = pCreateInfo->pDependencies[d];
+            LOG("[PROFILE] CreateRenderPass 0x%lx dep[%u]: src=%u dst=%u srcStage=0x%x dstStage=0x%x srcAcc=0x%x dstAcc=0x%x flags=0x%x",
+                (uint64_t)*pRenderPass, d, dep.srcSubpass, dep.dstSubpass,
+                dep.srcStageMask, dep.dstStageMask, dep.srcAccessMask, dep.dstAccessMask, dep.dependencyFlags);
+        }
+        LOG("[PROFILE] CreateRenderPass 0x%lx: %u color + %u depth, %u subpasses",
+            (uint64_t)*pRenderPass, info.colorAttachments, info.depthAttachment, info.subpassCount);
+    }
+    return res;
+}
+
+// ═══════════════════════════════════════════
+// Intercepted: CmdBeginRenderPass — GPU timestamp + tracking
+// ═══════════════════════════════════════════
+// Draw call counting per render pass (diagnostic)
+static thread_local uint32_t g_currentRP = UINT32_MAX;
+static thread_local uint32_t g_drawsInRP[8] = {};
+static thread_local uint32_t g_logRPIdx = 0;
+static uint64_t g_drawCountFrame = 0;
+static uint64_t g_logFrame = 0;
+
+static VKAPI_ATTR void VKAPI_CALL layer_CmdBeginRenderPass(
+    VkCommandBuffer cmdBuf,
+    const VkRenderPassBeginInfo* pRenderPassBegin,
+    VkSubpassContents contents)
+{
+    void* key = getKey(cmdBuf);
+    auto& disp = g_deviceMap[key];
+
+    // Write GPU timestamp before render pass
+    if (g_profile.ready && g_profile.queryPool && g_profile.queryIdx < 62) {
+        uint32_t qi = g_profile.queryIdx;
+        disp.CmdResetQueryPool(cmdBuf, g_profile.queryPool, qi, 2);
+        disp.CmdWriteTimestamp(cmdBuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                               g_profile.queryPool, qi);
+
+        FrameProfile::PassTiming pt = {};
+        pt.renderPass = (uint64_t)pRenderPassBegin->renderPass;
+        pt.startQuery = qi;
+        pt.endQuery = qi + 1;
+        pt.width = pRenderPassBegin->renderArea.extent.width;
+        pt.height = pRenderPassBegin->renderArea.extent.height;
+
+        auto rpIt = g_renderPassInfo.find((uint64_t)pRenderPassBegin->renderPass);
+        if (rpIt != g_renderPassInfo.end())
+            pt.colorAttachments = rpIt->second.colorAttachments;
+
+        g_profile.passes.push_back(pt);
+        g_profile.queryIdx += 2;
+        g_profile.rpCount++;
+    }
+
+    // Track current render pass index for draw call counting
+    g_currentRP = g_profile.rpCount > 0 ? g_profile.rpCount - 1 : 0;
+    if (g_currentRP < 8) g_drawsInRP[g_currentRP] = 0;
+
+    // Log subpass contents type for diagnostic
+    if (g_logFrame < 20) {
+        const char* cstr = (contents == VK_SUBPASS_CONTENTS_INLINE) ? "INLINE" : "SECONDARY_CMD_BUFS";
+        fprintf(stderr, "[CudaRT] Frame %lu RP%u: contents=%s\n",
+                (unsigned long)g_logFrame, g_logRPIdx, cstr);
+    }
+    g_logRPIdx++;
+
+    disp.CmdBeginRenderPass(cmdBuf, pRenderPassBegin, contents);
+
+    // Mid-RP timestamp: for RP2, add a BOTTOM_OF_PIPE timestamp right after begin
+    // This tells us if the stall is at render pass begin (load/clear) or at end
+    if (g_profile.ready && g_profile.queryPool && g_currentRP == 2 &&
+        g_profile.queryIdx < 62) {
+        uint32_t qi = g_profile.queryIdx;
+        disp.CmdResetQueryPool(cmdBuf, g_profile.queryPool, qi, 1);
+        disp.CmdWriteTimestamp(cmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                               g_profile.queryPool, qi);
+        g_profile.rp2MidQuery = qi;
+        g_profile.queryIdx += 1;
+    }
+}
+
+static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndexed(
+    VkCommandBuffer cmdBuf, uint32_t indexCount, uint32_t instanceCount,
+    uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
+{
+    if (g_currentRP < 8) g_drawsInRP[g_currentRP]++;
+    // Explicit diagnostic: log ALL draws in RP2
+    static uint64_t rp2DrawLog = 0;
+    if (g_currentRP == 2 && rp2DrawLog < 10) {
+        rp2DrawLog++;
+        LOG("!!! CmdDrawIndexed in RP2: idx=%u inst=%u", indexCount, instanceCount);
+    }
+    void* key = getKey(cmdBuf);
+    auto& disp = g_deviceMap[key];
+    // For RP2 (the bottleneck): optionally reduce draw calls
+    static int rpSkip = -1;
+    if (rpSkip < 0) { const char* e = getenv("CUDA_RT_SKIP_RP"); rpSkip = e ? atoi(e) : -1; }
+    if (rpSkip >= 0 && g_currentRP == (uint32_t)rpSkip) return;
+    disp.CmdDrawIndexed(cmdBuf, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+}
+
+static VKAPI_ATTR void VKAPI_CALL layer_CmdDraw(
+    VkCommandBuffer cmdBuf, uint32_t vertexCount, uint32_t instanceCount,
+    uint32_t firstVertex, uint32_t firstInstance)
+{
+    if (g_currentRP < 8) g_drawsInRP[g_currentRP]++;
+    static uint64_t rp2Log = 0;
+    if (g_currentRP == 2 && rp2Log < 10) {
+        rp2Log++;
+        LOG("!!! CmdDraw in RP2: vtx=%u inst=%u", vertexCount, instanceCount);
+    }
+    void* key = getKey(cmdBuf);
+    auto& disp = g_deviceMap[key];
+    static int rpSkip = -1;
+    if (rpSkip < 0) { const char* e = getenv("CUDA_RT_SKIP_RP"); rpSkip = e ? atoi(e) : -1; }
+    if (rpSkip >= 0 && g_currentRP == (uint32_t)rpSkip) return;
+    disp.CmdDraw(cmdBuf, vertexCount, instanceCount, firstVertex, firstInstance);
+}
+
+static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndexedIndirect(
+    VkCommandBuffer cmdBuf, VkBuffer buffer, VkDeviceSize offset,
+    uint32_t drawCount, uint32_t stride)
+{
+    if (g_currentRP < 8) g_drawsInRP[g_currentRP] += drawCount;
+    void* key = getKey(cmdBuf);
+    auto& disp = g_deviceMap[key];
+    static int rpSkip = -1;
+    if (rpSkip < 0) { const char* e = getenv("CUDA_RT_SKIP_RP"); rpSkip = e ? atoi(e) : -1; }
+    if (rpSkip >= 0 && g_currentRP == (uint32_t)rpSkip) return;
+    disp.CmdDrawIndexedIndirect(cmdBuf, buffer, offset, drawCount, stride);
+}
+
+static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndirect(
+    VkCommandBuffer cmdBuf, VkBuffer buffer, VkDeviceSize offset,
+    uint32_t drawCount, uint32_t stride)
+{
+    if (g_currentRP < 8) g_drawsInRP[g_currentRP] += drawCount;
+    void* key = getKey(cmdBuf);
+    auto& disp = g_deviceMap[key];
+    static int rpSkip = -1;
+    if (rpSkip < 0) { const char* e = getenv("CUDA_RT_SKIP_RP"); rpSkip = e ? atoi(e) : -1; }
+    if (rpSkip >= 0 && g_currentRP == (uint32_t)rpSkip) return;
+    disp.CmdDrawIndirect(cmdBuf, buffer, offset, drawCount, stride);
+}
+
+// ═══════════════════════════════════════════
+// Intercepted: CmdDrawIndexedIndirectCount — GPU-driven draw count
+// ═══════════════════════════════════════════
+static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndexedIndirectCount(
+    VkCommandBuffer cmdBuf, VkBuffer buffer, VkDeviceSize offset,
+    VkBuffer countBuffer, VkDeviceSize countBufferOffset,
+    uint32_t maxDrawCount, uint32_t stride)
+{
+    if (g_currentRP < 8) g_drawsInRP[g_currentRP] += maxDrawCount;
+    static uint64_t rp2Log = 0;
+    if (g_currentRP == 2 && rp2Log < 20) {
+        rp2Log++;
+        LOG("!!! CmdDrawIndexedIndirectCount in RP2: maxDraw=%u", maxDrawCount);
+    }
+    void* key = getKey(cmdBuf);
+    auto& disp = g_deviceMap[key];
+    static int rpSkip = -1;
+    if (rpSkip < 0) { const char* e = getenv("CUDA_RT_SKIP_RP"); rpSkip = e ? atoi(e) : -1; }
+    if (rpSkip >= 0 && g_currentRP == (uint32_t)rpSkip) return;
+    // Cap maxDrawCount for performance tuning (CUDA_RT_MAX_DRAW env var)
+    static int maxDrawCap = -2;
+    if (maxDrawCap == -2) { const char* e = getenv("CUDA_RT_MAX_DRAW"); maxDrawCap = e ? atoi(e) : -1; }
+    uint32_t capped = maxDrawCount;
+    if (maxDrawCap > 0 && capped > (uint32_t)maxDrawCap) capped = (uint32_t)maxDrawCap;
+    disp.CmdDrawIndexedIndirectCount(cmdBuf, buffer, offset, countBuffer, countBufferOffset, capped, stride);
+}
+
+static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndirectCount(
+    VkCommandBuffer cmdBuf, VkBuffer buffer, VkDeviceSize offset,
+    VkBuffer countBuffer, VkDeviceSize countBufferOffset,
+    uint32_t maxDrawCount, uint32_t stride)
+{
+    if (g_currentRP < 8) g_drawsInRP[g_currentRP] += maxDrawCount;
+    static uint64_t rp2Log = 0;
+    if (g_currentRP == 2 && rp2Log < 20) {
+        rp2Log++;
+        LOG("!!! CmdDrawIndirectCount in RP2: maxDraw=%u", maxDrawCount);
+    }
+    void* key = getKey(cmdBuf);
+    auto& disp = g_deviceMap[key];
+    static int rpSkip = -1;
+    if (rpSkip < 0) { const char* e = getenv("CUDA_RT_SKIP_RP"); rpSkip = e ? atoi(e) : -1; }
+    if (rpSkip >= 0 && g_currentRP == (uint32_t)rpSkip) return;
+    static int maxDrawCap2 = -2;
+    if (maxDrawCap2 == -2) { const char* e = getenv("CUDA_RT_MAX_DRAW"); maxDrawCap2 = e ? atoi(e) : -1; }
+    uint32_t capped = maxDrawCount;
+    if (maxDrawCap2 > 0 && capped > (uint32_t)maxDrawCap2) capped = (uint32_t)maxDrawCap2;
+    disp.CmdDrawIndirectCount(cmdBuf, buffer, offset, countBuffer, countBufferOffset, capped, stride);
+}
+
+// ═══════════════════════════════════════════
+// Intercepted: CmdWaitEvents — check for event waits inside render passes
+// ═══════════════════════════════════════════
+static VKAPI_ATTR void VKAPI_CALL layer_CmdWaitEvents(
+    VkCommandBuffer cmdBuf,
+    uint32_t eventCount,
+    const VkEvent* pEvents,
+    VkPipelineStageFlags srcStageMask,
+    VkPipelineStageFlags dstStageMask,
+    uint32_t memoryBarrierCount,
+    const VkMemoryBarrier* pMemoryBarriers,
+    uint32_t bufferMemoryBarrierCount,
+    const VkBufferMemoryBarrier* pBufferMemoryBarriers,
+    uint32_t imageMemoryBarrierCount,
+    const VkImageMemoryBarrier* pImageMemoryBarriers)
+{
+    void* key = getKey(cmdBuf);
+    auto& disp = g_deviceMap[key];
+
+    LOG("CmdWaitEvents: RP%u events=%u src=0x%x dst=0x%x", g_currentRP, eventCount, srcStageMask, dstStageMask);
+
+    disp.CmdWaitEvents(cmdBuf, eventCount, pEvents, srcStageMask, dstStageMask,
+                       memoryBarrierCount, pMemoryBarriers,
+                       bufferMemoryBarrierCount, pBufferMemoryBarriers,
+                       imageMemoryBarrierCount, pImageMemoryBarriers);
+}
+
+// ═══════════════════════════════════════════
+// Intercepted: CmdExecuteCommands — count secondary command buffers
+// ═══════════════════════════════════════════
+static VKAPI_ATTR void VKAPI_CALL layer_CmdExecuteCommands(
+    VkCommandBuffer cmdBuf, uint32_t commandBufferCount,
+    const VkCommandBuffer* pCommandBuffers)
+{
+    void* key = getKey(cmdBuf);
+    auto& disp = g_deviceMap[key];
+
+    static uint64_t execFrame = 0;
+    execFrame++;
+    if (execFrame <= 10 || execFrame % 300 == 0) {
+        LOG("CmdExecuteCommands: RP%u, %u secondary bufs", g_currentRP, commandBufferCount);
+    }
+    if (g_currentRP < 8) g_drawsInRP[g_currentRP] += commandBufferCount; // count as draws
+
+    disp.CmdExecuteCommands(cmdBuf, commandBufferCount, pCommandBuffers);
+}
+
+// ═══════════════════════════════════════════
+// Intercepted: CmdEndRenderPass — GPU timestamp end
+// ═══════════════════════════════════════════
+static VKAPI_ATTR void VKAPI_CALL layer_CmdEndRenderPass(
+    VkCommandBuffer cmdBuf)
+{
+    void* key = getKey(cmdBuf);
+    auto& disp = g_deviceMap[key];
+
+    // Pre-end timestamp (inside RP, before EndRenderPass) for RP2 diagnosis
+    uint32_t savedRP = g_currentRP; // save before we reset it
+    
+    // Log draw counts per render pass (first few frames + periodic)
+    g_drawCountFrame++;
+    if (g_currentRP < 8 && (g_drawCountFrame <= 10 || g_drawCountFrame % 300 == 0)) {
+        if (g_drawsInRP[g_currentRP] > 0)
+            LOG("[PROFILE] RP%u ended: %u draw calls", g_currentRP, g_drawsInRP[g_currentRP]);
+    }
+    g_currentRP = UINT32_MAX;
+
+    // Reset per-frame RP counter
+    if (g_logRPIdx >= 5) { g_logRPIdx = 0; g_logFrame++; }
+
+    // For RP2: write timestamp INSIDE the render pass, BEFORE ending it
+    if (g_profile.ready && g_profile.queryPool && savedRP == 2 && g_profile.queryIdx < 62) {
+        uint32_t qi = g_profile.queryIdx;
+        disp.CmdResetQueryPool(cmdBuf, g_profile.queryPool, qi, 1);
+        disp.CmdWriteTimestamp(cmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                               g_profile.queryPool, qi);
+        g_profile.rp2PreEndQuery = qi;
+        g_profile.queryIdx += 1;
+    }
+
+    disp.CmdEndRenderPass(cmdBuf);
+
+    // Write GPU timestamp after render pass
+    if (g_profile.ready && g_profile.queryPool && !g_profile.passes.empty()) {
+        auto& lastPass = g_profile.passes.back();
+        if (lastPass.endQuery < 64) {
+            disp.CmdWriteTimestamp(cmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                   g_profile.queryPool, lastPass.endQuery);
+        }
+    }
+}
+
+// ═══════════════════════════════════════════
 // Intercepted: CmdBindPipeline — track compute pipeline + RT no-op
 // ═══════════════════════════════════════════
 static VKAPI_ATTR void VKAPI_CALL layer_CmdBindPipeline(
@@ -3863,8 +4427,14 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindPipeline(
     VkPipelineBindPoint bindPoint,
     VkPipeline pipeline)
 {
-    if (bindPoint == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR) {
+    if (bindPoint == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR) [[unlikely]] {
         return; // Don't forward — we handle RT entirely
+    }
+    // RP2 diagnostic: log graphics pipeline binds
+    static uint64_t rp2BindLog = 0;
+    if (g_currentRP == 2 && rp2BindLog < 10) {
+        rp2BindLog++;
+        LOG("!!! CmdBindPipeline in RP2: bind=%d pipe=0x%lx", bindPoint, (uint64_t)pipeline);
     }
     // Lock-free compute pipeline tracking: use atomic store
     // Only compute pipelines need tracking (for BVH desc binding in CmdDispatch)
@@ -3892,7 +4462,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindDescriptorSets(
     uint32_t dynamicOffsetCount,
     const uint32_t* pDynamicOffsets)
 {
-    if (bindPoint == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR) {
+    if (bindPoint == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR) [[unlikely]] {
         LOG("CmdBindDescriptorSets: RT bindpoint set=%u count=%u (intercepted)", firstSet, descriptorSetCount);
         return; // Don't forward — driver doesn't support RT bind point in stripped mode
     }
@@ -3924,6 +4494,20 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdPipelineBarrier(
     VkPipelineStageFlags dst = dstStageMask;
     if (src & RT_STAGE) { src = (src & ~RT_STAGE) | COMPUTE_STAGE; }
     if (dst & RT_STAGE) { dst = (dst & ~RT_STAGE) | COMPUTE_STAGE; }
+
+    // Diagnostic: log barriers (especially inside render passes)
+    static uint64_t barrierCount = 0;
+    barrierCount++;
+    if (barrierCount <= 50 || barrierCount % 300 == 0) {
+        LOG("CmdPipelineBarrier: RP%u src=0x%x dst=0x%x mem=%u buf=%u img=%u dep=0x%x",
+            g_currentRP, src, dst, memoryBarrierCount,
+            bufferMemoryBarrierCount, imageMemoryBarrierCount, dependencyFlags);
+        for (uint32_t i = 0; i < imageMemoryBarrierCount && i < 3; i++) {
+            LOG("  imgBarrier[%u]: srcAccess=0x%x dstAccess=0x%x oldL=%u newL=%u",
+                i, pImageMemoryBarriers[i].srcAccessMask, pImageMemoryBarriers[i].dstAccessMask,
+                pImageMemoryBarriers[i].oldLayout, pImageMemoryBarriers[i].newLayout);
+        }
+    }
 
     void* key = getKey(cmdBuf);
     auto& disp = g_deviceMap[key];
@@ -4113,6 +4697,86 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
             (unsigned long long)g_pendingTLAS.instanceAddr, (int)tlasBuildDone);
     }
 
+    // ── Read GPU timestamps from previous frame's render passes ──
+    if (g_profile.ready && g_profile.queryPool && !g_profile.passes.empty()) {
+        static uint64_t profileFrame = 0;
+        profileFrame++;
+        bool shouldLog = (profileFrame <= 3) || (profileFrame % 300 == 0);
+
+        if (shouldLog && pDisp->GetQueryPoolResults) {
+            // Read all timestamps at once
+            uint64_t timestamps[64];
+            VkResult qr = pDisp->GetQueryPoolResults(
+                pDisp->device, g_profile.queryPool,
+                0, g_profile.queryIdx,
+                sizeof(timestamps), timestamps,
+                sizeof(uint64_t),
+                VK_QUERY_RESULT_64_BIT | VK_QUERY_RESULT_WAIT_BIT);
+
+            if (qr == VK_SUCCESS) {
+                double totalMs = 0;
+                double totalGapMs = 0;
+                LOG("[PROFILE] ═══ Frame %lu: %u render passes ═══", profileFrame, g_profile.rpCount);
+                for (size_t i = 0; i < g_profile.passes.size(); i++) {
+                    auto& pt = g_profile.passes[i];
+                    double ms = (timestamps[pt.endQuery] - timestamps[pt.startQuery])
+                                * g_timestampPeriod / 1e6;
+                    totalMs += ms;
+                    // Calculate gap before this pass (time since previous pass ended)
+                    double gapMs = 0;
+                    if (i > 0) {
+                        auto& prev = g_profile.passes[i-1];
+                        gapMs = (timestamps[pt.startQuery] - timestamps[prev.endQuery])
+                                * g_timestampPeriod / 1e6;
+                        totalGapMs += gapMs;
+                    }
+                    if (i == 0)
+                        LOG("[PROFILE]   RP%zu (%u color, rp=0x%lx): %ux%u → %.2f ms",
+                            i, pt.colorAttachments, pt.renderPass, pt.width, pt.height, ms);
+                    else
+                        LOG("[PROFILE]   [gap: %.2f ms] → RP%zu (%u color, rp=0x%lx): %ux%u → %.2f ms",
+                            gapMs, i, pt.colorAttachments, pt.renderPass, pt.width, pt.height, ms);
+                }
+                LOG("[PROFILE]   TOTAL: %.2f ms render + %.2f ms gaps = %.2f ms",
+                    totalMs, totalGapMs, totalMs + totalGapMs);
+
+                // Compute dispatch timing
+                if (g_profile.computeDispatches > 0 &&
+                    g_profile.computeStartQuery < 64 && g_profile.computeEndQuery < 64) {
+                    double compMs = (timestamps[g_profile.computeEndQuery] - timestamps[g_profile.computeStartQuery])
+                                    * g_timestampPeriod / 1e6;
+                    LOG("[PROFILE]   COMPUTE: %.2f ms (%u RQ dispatches)", compMs, g_profile.computeDispatches);
+                }
+                // RP2 mid-pass analysis
+                if (g_profile.rp2MidQuery > 0 && g_profile.rp2MidQuery < 64 &&
+                    g_profile.passes.size() > 2) {
+                    auto& rp2 = g_profile.passes[2];
+                    double beginToMid = (timestamps[g_profile.rp2MidQuery] - timestamps[rp2.startQuery])
+                                        * g_timestampPeriod / 1e6;
+                    double midToEnd = (timestamps[rp2.endQuery] - timestamps[g_profile.rp2MidQuery])
+                                      * g_timestampPeriod / 1e6;
+                    LOG("[PROFILE]   RP2 SPLIT: begin→mid=%.2f ms, mid→end=%.2f ms", beginToMid, midToEnd);
+                    if (g_profile.rp2PreEndQuery > 0 && g_profile.rp2PreEndQuery < 64) {
+                        double midToPreEnd = (timestamps[g_profile.rp2PreEndQuery] - timestamps[g_profile.rp2MidQuery])
+                                              * g_timestampPeriod / 1e6;
+                        double preEndToEnd = (timestamps[rp2.endQuery] - timestamps[g_profile.rp2PreEndQuery])
+                                              * g_timestampPeriod / 1e6;
+                        LOG("[PROFILE]   RP2 DETAIL: insideRP=%.2f ms, EndRenderPass=%.2f ms", midToPreEnd, preEndToEnd);
+                    }
+                }
+            }
+        }
+        // Reset for next frame
+        g_profile.passes.clear();
+        g_profile.queryIdx = 0;
+        g_profile.rpCount = 0;
+        g_profile.computeStartQuery = 0;
+        g_profile.computeEndQuery = 0;
+        g_profile.computeDispatches = 0;
+        g_profile.rp2MidQuery = 0;
+        g_profile.rp2PreEndQuery = 0;
+    }
+
     return pDisp->QueuePresentKHR(queue, pPresentInfo);
 }
 
@@ -4147,7 +4811,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
 
     // Lock-free check: RQ pipeline set is immutable after creation.
     // cmdBuf pipeline tracking is single-threaded per Vulkan spec.
-    if (g_bvh2.ready) {
+    if (g_bvh2.ready) [[likely]] {
         uint64_t pipeHandle = 0;
         {
             // No mutex needed: same thread that called CmdBindPipeline
@@ -4181,6 +4845,22 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
         if (halfRes >= 3) return; // NOP: skip RT dispatch entirely
         if (halfRes >= 2) { dispX = (dispX + 1) / 2; dispY = (dispY + 1) / 2; }
         else if (halfRes >= 1) { dispY = (dispY + 1) / 2; }
+
+        // GPU timestamps around RQ compute dispatch for profiling
+        if (g_profile.ready && g_profile.queryPool && g_profile.queryIdx < 60) {
+            uint32_t qi = g_profile.queryIdx;
+            disp.CmdResetQueryPool(cmdBuf, g_profile.queryPool, qi, 2);
+            disp.CmdWriteTimestamp(cmdBuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                   g_profile.queryPool, qi);
+            disp.CmdDispatch(cmdBuf, dispX, dispY, dispZ);
+            disp.CmdWriteTimestamp(cmdBuf, VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT,
+                                   g_profile.queryPool, qi + 1);
+            g_profile.computeStartQuery = qi;
+            g_profile.computeEndQuery = qi + 1;
+            g_profile.queryIdx += 2;
+            g_profile.computeDispatches++;
+            return;
+        }
     }
     disp.CmdDispatch(cmdBuf, dispX, dispY, dispZ);
 }
@@ -4249,6 +4929,20 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetInstanceProcAddr(VkInst
     INTERCEPT(CmdDispatch);
     INTERCEPT(CmdBuildAccelerationStructuresKHR);
     INTERCEPT(CmdBindPipeline);
+    INTERCEPT(CmdBeginRenderPass);
+    INTERCEPT(CmdEndRenderPass);
+    INTERCEPT(CreateRenderPass);
+    INTERCEPT(CmdDrawIndexed);
+    INTERCEPT(CmdDraw);
+    INTERCEPT(CmdDrawIndexedIndirect);
+    INTERCEPT(CmdDrawIndirect);
+    INTERCEPT(CmdDrawIndexedIndirectCount);
+    INTERCEPT(CmdDrawIndirectCount);
+    if (!strcmp(pName, "vkCmdDrawIndexedIndirectCountKHR")) return (PFN_vkVoidFunction)layer_CmdDrawIndexedIndirectCount;
+    if (!strcmp(pName, "vkCmdDrawIndirectCountKHR")) return (PFN_vkVoidFunction)layer_CmdDrawIndirectCount;
+    INTERCEPT(CmdExecuteCommands);
+    INTERCEPT(CmdPipelineBarrier);
+    INTERCEPT(CmdWaitEvents);
     // CmdBindDescriptorSets and CmdPipelineBarrier NOT intercepted (high-frequency, not needed for compute RQ)
     INTERCEPT(CreateShaderModule);
     INTERCEPT(CreateComputePipelines);
@@ -4340,6 +5034,20 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetDeviceProcAddr(VkDevice
     // RT interceptions — only intercept what's needed
     // CmdBindPipeline: track compute pipeline binding (needed for BVH desc set)
     INTERCEPT(CmdBindPipeline);
+    INTERCEPT(CmdBeginRenderPass);
+    INTERCEPT(CmdEndRenderPass);
+    INTERCEPT(CreateRenderPass);
+    INTERCEPT(CmdDrawIndexed);
+    INTERCEPT(CmdDraw);
+    INTERCEPT(CmdDrawIndexedIndirect);
+    INTERCEPT(CmdDrawIndirect);
+    INTERCEPT(CmdDrawIndexedIndirectCount);
+    INTERCEPT(CmdDrawIndirectCount);
+    if (!strcmp(pName, "vkCmdDrawIndexedIndirectCountKHR")) return (PFN_vkVoidFunction)layer_CmdDrawIndexedIndirectCount;
+    if (!strcmp(pName, "vkCmdDrawIndirectCountKHR")) return (PFN_vkVoidFunction)layer_CmdDrawIndirectCount;
+    INTERCEPT(CmdExecuteCommands);
+    INTERCEPT(CmdPipelineBarrier);
+    INTERCEPT(CmdWaitEvents);
     // NOTE: CmdBindDescriptorSets and CmdPipelineBarrier NOT intercepted.
     // They were only needed for RT bind point / RT stage bit remapping, which
     // only applies to vkCmdTraceRaysKHR-based apps (not compute ray queries).
