@@ -3,9 +3,9 @@
 // Set to 0 for no-hit stub (debug), 1 for full BVH2 traversal
 #define SPIRV_RQ_FULL_TRAVERSAL 1
 // Set to 1 to skip BLAS traversal — report a hit as soon as TLAS leaf (instance AABB) is hit.
-#define SPIRV_RQ_TLAS_ONLY 0  // TEMP: test TLAS traversal only
+#define SPIRV_RQ_TLAS_ONLY 0
 // Set to 1 to ALWAYS report hit — bypasses traversal entirely (tests RT pipeline feedback path)
-#define SPIRV_RQ_ALWAYS_HIT 0
+#define SPIRV_RQ_ALWAYS_HIT 0  // 0=real traversal, 1=debug always-hit stub
 // Set to 1 to force TLAS AABB test to always pass
 #define SPIRV_RQ_FORCE_TLAS_HIT 0
 // Set to 1 to dump rewritten SPIR-V to /tmp/spirv_rq_dump_*.spv

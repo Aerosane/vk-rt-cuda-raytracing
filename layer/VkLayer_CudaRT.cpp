@@ -1744,19 +1744,29 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBuildAccelerationStructuresKHR(
 
             if (!pb.geometries.empty()) {
                 std::lock_guard<std::mutex> lock(g_lock);
+                size_t numGeos = pb.geometries.size();
+                uint64_t asKey = pb.asKey;
+                // Log vertex format/stride for first few BLASes
+                static int fmtLog = 0;
+                if (fmtLog < 3 && !pb.geometries.empty()) {
+                    auto& g0 = pb.geometries[0];
+                    LOG("  BLAS geo[0]: fmt=%u stride=%u idxType=%u maxVert=%u prims=%u",
+                        g0.vertexFormat, g0.vertexStride, g0.indexType, g0.maxVertex, g0.primCount);
+                    fmtLog++;
+                }
                 if (!g_blasBuildsDone) {
                     g_pendingBLAS.push_back(std::move(pb));
                     static int logCount = 0;
                     if (logCount < 5)
                         LOG("CmdBuildAS[%u]: BLAS dst=0x%lx geos=%zu prims=%u → DEFERRED",
-                            i, (uint64_t)info.dstAccelerationStructure, pb.geometries.size(), totalPrims);
+                            i, asKey, numGeos, totalPrims);
                     logCount++;
                 } else {
                     // Late BLAS — capture for incremental build
                     static int lateLog = 0;
                     if (lateLog < 5)
-                        LOG("CmdBuildAS[%u]: LATE BLAS dst=0x%lx prims=%u → QUEUED",
-                            i, (uint64_t)info.dstAccelerationStructure, totalPrims);
+                        LOG("CmdBuildAS[%u]: LATE BLAS dst=0x%lx geos=%zu prims=%u → QUEUED",
+                            i, asKey, numGeos, totalPrims);
                     lateLog++;
                     g_latePendingBLAS.push_back(std::move(pb));
                 }
@@ -1837,6 +1847,18 @@ static void processPendingBLAS() {
         }
 
         if (!capturedTris.empty()) {
+            // Validate first few tris of first 2 BLASes
+            static int triDump = 0;
+            if (triDump < 2) {
+                int n = std::min((int)capturedTris.size(), 3);
+                LOG("[BLAS-Val] asKey=0x%lx: %d tris, dumping %d:", (uint64_t)pb.asKey, (int)capturedTris.size(), n);
+                for (int t = 0; t < n; t++) {
+                    auto& tri = capturedTris[t];
+                    LOG("  tri[%d]: (%.1f,%.1f,%.1f) (%.1f,%.1f,%.1f) (%.1f,%.1f,%.1f)",
+                        t, tri.v0[0],tri.v0[1],tri.v0[2], tri.v1[0],tri.v1[1],tri.v1[2], tri.v2[0],tri.v2[1],tri.v2[2]);
+                }
+                triDump++;
+            }
             CudaBVH_t bvh = cudaBVH_build(capturedTris.data(), (int)capturedTris.size());
             if (bvh) {
                 std::lock_guard<std::mutex> lock(g_lock);
@@ -2906,10 +2928,10 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
             memcpy(dst + 20, gi.invTransform + 8, 16);
             // vec4[6] = (blasMin.xyz, uintBitsToFloat(blasNodeOff))
             dst[24] = gi.blasMinX; dst[25] = gi.blasMinY; dst[26] = gi.blasMinZ;
-            memcpy(&dst[27], &gi.blasNodeOff, 4);  // raw uint32 bits as float
-            // vec4[7] = (blasMax.xyz, uintBitsToFloat(blasTriOff))
+            dst[27] = (float)gi.blasNodeOff;  // ConvertFToS in SPIR-V reads as float→int
+            // vec4[7] = (blasMax.xyz, float(blasTriOff))
             dst[28] = gi.blasMaxX; dst[29] = gi.blasMaxY; dst[30] = gi.blasMaxZ;
-            memcpy(&dst[31], &gi.blasTriOff, 4);   // raw uint32 bits as float
+            dst[31] = (float)gi.blasTriOff;   // ConvertFToS in SPIR-V reads as float→int
         }
         if (!createBufferWithData(disp, instPacked.data(), instancesSize,
                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.instancesBuf, g_bvh2.instancesMem)) {
@@ -3037,9 +3059,9 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
         memcpy(dst + 16, gi.invTransform + 4, 16);
         memcpy(dst + 20, gi.invTransform + 8, 16);
         dst[24] = gi.blasMinX; dst[25] = gi.blasMinY; dst[26] = gi.blasMinZ;
-        memcpy(&dst[27], &gi.blasNodeOff, 4);  // raw uint32 bits as float
+        dst[27] = (float)gi.blasNodeOff;  // ConvertFToS in SPIR-V reads as float→int
         dst[28] = gi.blasMaxX; dst[29] = gi.blasMaxY; dst[30] = gi.blasMaxZ;
-        memcpy(&dst[31], &gi.blasTriOff, 4);   // raw uint32 bits as float
+        dst[31] = (float)gi.blasTriOff;   // ConvertFToS in SPIR-V reads as float→int
     }
     if (!createBufferHostVisible(disp, instPacked.data(), instancesSize,
                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.instancesBuf, g_bvh2.instancesMem)) {
@@ -4893,8 +4915,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
                     double gapMs = 0;
                     if (i > 0) {
                         auto& prev = g_profile.passes[i-1];
-                        gapMs = (timestamps[pt.startQuery] - timestamps[prev.endQuery])
-                                * g_timestampPeriod / 1e6;
+                        int64_t gapTicks = (int64_t)(timestamps[pt.startQuery] - timestamps[prev.endQuery]);
+                        if (gapTicks > 0)
+                            gapMs = gapTicks * g_timestampPeriod / 1e6;
                         totalGapMs += gapMs;
                     }
                     if (i == 0)
