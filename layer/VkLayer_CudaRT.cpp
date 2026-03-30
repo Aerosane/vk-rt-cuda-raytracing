@@ -2787,7 +2787,7 @@ static bool setupBVH2Descriptors(DeviceDispatch& disp) {
             writes[i].pBufferInfo = &bufs[i];
         }
         disp.UpdateDescriptorSets(disp.device, 4, writes, 0, nullptr);
-        g_bvh2.descSetIdx = 4; // must match SPIR-V rewriter's bvhDescSet
+        g_bvh2.descSetIdx = 4; // initial default — overridden by per-pipeline bvhDescSet at bind time
         // NOTE: g_bvh2.ready remains false until uploadBVH2Data uploads real data
         LOG("[BVH2] Null-safe BVH buffers initialized (huge AABB + skip=-1)");
     }
@@ -3002,7 +3002,7 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
     g_bvh2.numTriVec4s = totalTriVec4s;
     g_bvh2.numTlasNodes = numTlasNodes;
     g_bvh2.numInstances = numInst;
-    g_bvh2.descSetIdx = 4; // matches SPIR-V rewriter's bvhDescSet
+    g_bvh2.descSetIdx = 4; // default — actual bind index comes from per-pipeline bvhDescSet
     g_bvh2.tlasGen = g_tlasGeneration;
     g_bvh2.ready = true;
     LOG("[BVH2] Uploaded: %d BLAS nodes (%.1f KB), %d tri-vec4s (%.1f KB), %d TLAS nodes, %d instances → descriptor set %u",
@@ -3099,7 +3099,8 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
     g_bvh2.tlasGen = g_tlasGeneration;
 
     static int reuploadCount = 0;
-    if (reuploadCount < 5) {
+    reuploadCount++;
+    if (reuploadCount <= 3 || (reuploadCount % 300 == 0)) {
         LOG("[BVH2] TLAS reupload #%d: %d nodes, %d instances (gen=%lu)",
             reuploadCount, numTlasNodes, numInst, g_tlasGeneration);
         // Dump root TLAS node AABB (node 0)
@@ -3140,9 +3141,9 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
         }
     }
 
-    // ── CPU-side TLAS traversal test ──
+    // ── CPU-side TLAS traversal test (first 3 rebuilds only) ──
     // Mimics the GPU shader's BVH2 stackless traversal to verify correctness
-    if (reuploadCount < 3 && tlasNodeData && numTlasNodes > 0) {
+    if (reuploadCount <= 3 && tlasNodeData && numTlasNodes > 0) {
         // Root AABB
         float rmin[3], rmax[3];
         memcpy(rmin, &tlasNodeData[0], 12);
@@ -3207,7 +3208,6 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
         }
     }
 
-    reuploadCount++;
     return true;
 }
 
@@ -4853,37 +4853,42 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
             (unsigned long long)g_pendingTLAS.instanceAddr);
     }
 
-    // One-time TLAS build on first eligible present
-    static bool tlasBuildDone = false;
-    if (!tlasBuildDone && g_bvh2.ready && g_tlasGeneration == 0 && g_pendingTLAS.instanceAddr != 0) {
-        tlasBuildDone = true;
-        LOG("[PRESENT] Building TLAS at present #%u (ready=%d addr=0x%llx)...",
-            presentCount, (int)g_bvh2.ready, (unsigned long long)g_pendingTLAS.instanceAddr);
+    // Per-frame TLAS rebuild: re-read instance transforms, rebuild TLAS BVH, re-upload SSBOs.
+    // Q2RTX rebuilds TLAS every frame with new instance positions — we must track those.
+    static int tlasEveryN = -1;
+    if (tlasEveryN < 0) {
+        const char* env = getenv("CUDA_RT_TLAS_EVERY_N");
+        tlasEveryN = env ? atoi(env) : 1;  // default: every frame
+        if (tlasEveryN < 1) tlasEveryN = 1;
+    }
+
+    bool tlasEligible = g_bvh2.ready && g_pendingTLAS.instanceAddr != 0;
+    bool tlasThrottleOk = (presentCount % tlasEveryN) == 0;
+
+    if (tlasEligible && tlasThrottleOk) {
+        uint64_t prevGen = g_tlasGeneration;
         if (pDisp->QueueWaitIdle) pDisp->QueueWaitIdle(queue);
-        {
-            std::lock_guard<std::mutex> lock(g_lock);
-            g_pendingTLAS.pending = true;
-        }
-        bool hasNewBLAS = processLateBLAS();  // Build any dynamic BLASes before TLAS rebuild
+
+        // Build any late BLASes (dynamic geometry) before TLAS
+        bool hasNewBLAS = processLateBLAS();
         if (hasNewBLAS) {
             LOG("[PRESENT] Late BLASes added, re-uploading BLAS SSBOs...");
             uploadBVH2Data(*pDisp, g_lastBLAS);
         }
-        processPendingTLAS();
+
+        // Force pending so processPendingTLAS re-reads instance data
         {
             std::lock_guard<std::mutex> lock(g_lock);
-            g_pendingTLAS.pending = false;
+            g_pendingTLAS.pending = true;
         }
-        if (g_tlasGeneration > 0) {
-            LOG("[PRESENT] TLAS built (gen=%u), reuploading to SSBOs...", g_tlasGeneration);
+        processPendingTLAS();
+
+        // Re-upload TLAS nodes + instances if generation advanced
+        if (g_tlasGeneration > prevGen) {
             reuploadTLASData(*pDisp);
+            if (g_tlasGeneration <= 5 || g_tlasGeneration % 300 == 0)
+                LOG("[PRESENT] TLAS rebuilt (gen=%lu) at present #%u", g_tlasGeneration, presentCount);
         }
-    }
-    // Log diagnostic for first 20 presents to debug timing
-    if (presentCount <= 20 && presentCount > 5) {
-        LOG("[PRESENT] #%u: ready=%d gen=%u addr=0x%llx tlasDone=%d",
-            presentCount, (int)g_bvh2.ready, g_tlasGeneration,
-            (unsigned long long)g_pendingTLAS.instanceAddr, (int)tlasBuildDone);
     }
 
     // ── Read GPU timestamps from previous frame's render passes ──
@@ -5013,10 +5018,11 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
             if (it != g_rqPipelines.end()) {
                 isRQDispatch = true;
                 VkPipelineLayout layout = it->second.layout;
+                uint32_t bvhSetIdx = (uint32_t)it->second.bvhDescSet;
                 if (layout && g_bvh2.descSet) {
-                    // Bind BVH2 descriptor set at set=4 — single Vulkan call, no CPU overhead
+                    // Bind BVH2 descriptor set at the rewriter's chosen set index
                     disp.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                                layout, g_bvh2.descSetIdx, 1,
+                                                layout, bvhSetIdx, 1,
                                                 &g_bvh2.descSet, 0, nullptr);
                 }
             }

@@ -1960,6 +1960,21 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             spvEmit(out, SpvOpCopyObject, {tBool, code[pos+2], cTrue});
             skip = true;
         }
+        // Obj2World / World2Obj — return identity matrix (stub)
+        // Full implementation would load from instance SSBO using hitInstID.
+        // Result type is mat4x3 declared by the shader; we emit a CompositeConstruct.
+        if ((op == SpvOpRQGetObj2World || op == SpvOpRQGetWorld2Obj) && wc >= 5) {
+            uint32_t resType = code[pos+1];
+            uint32_t resId   = code[pos+2];
+            // Construct 4 vec3 columns forming identity: col0=(1,0,0) col1=(0,1,0) col2=(0,0,1) col3=(0,0,0)
+            uint32_t v0 = newId(), v1 = newId(), v2 = newId(), v3 = newId();
+            spvEmit(out, SpvOpCompositeConstruct, {tVec3, v0, cf1, cf0, cf0});
+            spvEmit(out, SpvOpCompositeConstruct, {tVec3, v1, cf0, cf1, cf0});
+            spvEmit(out, SpvOpCompositeConstruct, {tVec3, v2, cf0, cf0, cf1});
+            spvEmit(out, SpvOpCompositeConstruct, {tVec3, v3, cf0, cf0, cf0});
+            spvEmit(out, SpvOpCompositeConstruct, {resType, resId, v0, v1, v2, v3});
+            skip = true;
+        }
         } // end of RQ operations rewrite block
 #endif // !SPIRV_RQ_MINIMAL (end of full-rewrite RQ ops)
 
