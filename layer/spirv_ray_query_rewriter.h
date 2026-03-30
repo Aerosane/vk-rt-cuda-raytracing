@@ -366,6 +366,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
     uint32_t cf0 = newId(), cf_huge = newId();
     // Additional constants for traversal
     uint32_t cu0 = newId(), cu1 = newId(), cu2 = newId(), cu3 = newId(), cu7 = newId();
+    uint32_t cu16 = newId(), cu32 = newId(); // CullBackFace=16, CullFrontFace=32
     uint32_t cf1 = newId(), cfn1 = newId(); // float 1.0, float -1.0
     float tiny = 1e-8f; uint32_t cf_tiny = newId();
     // Traversal local variables — allocated PER-FUNCTION at each OpLabel
@@ -379,6 +380,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
     uint32_t tvLocalRo = 0, tvLocalRd = 0;
     uint32_t tvHitInst = 0;
     uint32_t tvBlasNodeOff = 0, tvBlasTriOff = 0;
+    uint32_t tvRayFlags = 0;
     uint32_t cMaxTlasIter = newId(); // constant: shared across functions
     uint32_t glslExtId = 0; // will find existing GLSL.std.450 import
 
@@ -391,6 +393,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
         tvLocalRo = newId(); tvLocalRd = newId();
         tvHitInst = newId();
         tvBlasNodeOff = newId(); tvBlasTriOff = newId();
+        tvRayFlags = newId();
     };
 
     // Build output
@@ -1008,6 +1011,8 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             E(SpvOpConstant, {tUint, cu2, 2});
             E(SpvOpConstant, {tUint, cu3, 3});
             E(SpvOpConstant, {tUint, cu7, 7});
+            E(SpvOpConstant, {tUint, cu16, 16}); // CullBackFace flag
+            E(SpvOpConstant, {tUint, cu32, 32}); // CullFrontFace flag
             if (needTrue)  E(SpvOpConstantTrue,  {tBool, cTrue});
             if (needFalse) E(SpvOpConstantFalse, {tBool, cFalse});
 
@@ -1123,6 +1128,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 spvEmit(out, SpvOpVariable, {pInt,   tvHitInst,   (uint32_t)SCFunction});
                 spvEmit(out, SpvOpVariable, {pInt,   tvBlasNodeOff, (uint32_t)SCFunction});
                 spvEmit(out, SpvOpVariable, {pInt,   tvBlasTriOff,  (uint32_t)SCFunction});
+                spvEmit(out, SpvOpVariable, {pUint,  tvRayFlags,    (uint32_t)SCFunction});
             }
             skip = true; // already copied OpLabel
         }
@@ -1145,7 +1151,8 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
         if (op == SpvOpRQInitialize && wc >= 9) {
             uint32_t rqVar   = code[pos+1];
             // pos+2 = accel struct (ignored)
-            // pos+3 = flags, pos+4 = mask
+            uint32_t flagsId = code[pos+3]; // ray flags (uint)
+            // pos+4 = mask
             uint32_t origin  = code[pos+5];
             uint32_t tMinId  = code[pos+6];
             uint32_t dirId   = code[pos+7];
@@ -1211,6 +1218,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             E(SpvOpStore, {tvHitPrim, cn1});
             E(SpvOpStore, {tvHitType, cu0});
             E(SpvOpStore, {tvIter, c0});
+            E(SpvOpStore, {tvRayFlags, flagsId}); // store ray flags for culling
             // TLAS traversal init
             E(SpvOpStore, {tvTlasNi, c0});
             E(SpvOpStore, {tvTlasIter, c0});
@@ -1625,6 +1633,47 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                     spvEmit(out, (uint16_t)SpvOpLogicalAnd, {tBool, cd, cc, c_ttMin});
                     spvEmit(out, (uint16_t)SpvOpLogicalAnd, {tBool, hitCond, cd, c_ttMax});
 
+                    // Face culling based on ray flags
+                    // det > 0 = front-face, det < 0 = back-face
+                    // CullBackFace (bit 4=16): skip if det < 0
+                    // CullFrontFace (bit 5=32): skip if det > 0
+                    uint32_t SpvOpLogicalNot = 168;
+                    uint32_t SpvOpBitwiseAnd = 199;
+                    uint32_t SpvOpINotEqual = 171;
+                    {
+                        uint32_t rflags = newId();
+                        E(SpvOpLoad, {tUint, rflags, tvRayFlags});
+                        // Check CullBackFace
+                        uint32_t cbfBits = newId(), cbfSet = newId();
+                        spvEmit(out, (uint16_t)SpvOpBitwiseAnd, {tUint, cbfBits, rflags, cu16});
+                        spvEmit(out, (uint16_t)SpvOpINotEqual, {tBool, cbfSet, cbfBits, cu0});
+                        // det < 0 means back-face
+                        uint32_t isBack = newId();
+                        E(SpvOpFOrdLessThan, {tBool, isBack, det, cf0});
+                        // cullBack = cbfSet && isBack
+                        uint32_t cullBack = newId();
+                        spvEmit(out, (uint16_t)SpvOpLogicalAnd, {tBool, cullBack, cbfSet, isBack});
+                        // Check CullFrontFace
+                        uint32_t cffBits = newId(), cffSet = newId();
+                        spvEmit(out, (uint16_t)SpvOpBitwiseAnd, {tUint, cffBits, rflags, cu32});
+                        spvEmit(out, (uint16_t)SpvOpINotEqual, {tBool, cffSet, cffBits, cu0});
+                        // det > 0 means front-face
+                        uint32_t isFront = newId();
+                        E(SpvOpFOrdGreaterThan, {tBool, isFront, det, cf0});
+                        // cullFront = cffSet && isFront
+                        uint32_t cullFront = newId();
+                        spvEmit(out, (uint16_t)SpvOpLogicalAnd, {tBool, cullFront, cffSet, isFront});
+                        // culled = cullBack || cullFront
+                        uint32_t SpvOpLogicalOr = 166;
+                        uint32_t culled = newId(), notCulled = newId();
+                        spvEmit(out, (uint16_t)SpvOpLogicalOr, {tBool, culled, cullBack, cullFront});
+                        spvEmit(out, (uint16_t)SpvOpLogicalNot, {tBool, notCulled, culled});
+                        // hitCond = hitCond && !culled
+                        uint32_t hitCondFinal = newId();
+                        spvEmit(out, (uint16_t)SpvOpLogicalAnd, {tBool, hitCondFinal, hitCond, notCulled});
+                        hitCond = hitCondFinal;
+                    }
+
                     // if (hit) update bestT, bary, hitPrim, hitType, hitInst
                     uint32_t lHitYes = newId(), lHitEnd = newId();
                     spvEmit(out, SpvOpSelectionMerge, {lHitEnd, 0});
@@ -1953,6 +2002,8 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             skip = true;
         }
         if (op == SpvOpRQGetFrontFace && wc >= 5) {
+            // Front face = det > 0 in Möller-Trumbore
+            // For now return true (front face) — would need to store det sign per-hit
             spvEmit(out, SpvOpCopyObject, {tBool, code[pos+2], cTrue});
             skip = true;
         }
