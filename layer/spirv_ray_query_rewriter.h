@@ -1633,7 +1633,11 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                     E(SpvOpStore, {tvBestT, tt});
                     E(SpvOpStore, {tvHitU, uu});
                     E(SpvOpStore, {tvHitV, vv});
-                    E(SpvOpStore, {tvHitPrim, tst0}); // BLAS-local primitive index
+                    // Read ORIGINAL primitive index from packed tri p2.y (bitcast float→int)
+                    uint32_t origPrimF = newId(), origPrimI = newId();
+                    E(SpvOpCompositeExtract, {tFloat, origPrimF, p2, 1}); // p2.y
+                    E(SpvOpBitcast, {tInt, origPrimI, origPrimF});
+                    E(SpvOpStore, {tvHitPrim, origPrimI}); // ORIGINAL primitive index
                     E(SpvOpStore, {tvHitType, cu1});
                     E(SpvOpStore, {tvHitInst, instIdx}); // record which instance was hit
                     E(SpvOpBranch, {lHitEnd});

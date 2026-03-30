@@ -201,11 +201,12 @@ struct BVH2Node { AABB box; int left,right,triStart,triCount; };
 struct BVH2Builder {
     std::vector<BVH2Node> nodes;
     std::vector<Tri> ordered;
+    std::vector<int> orderedOrigIdx;  // original primitive index for each ordered tri
     std::vector<AABB> primBB;
     std::vector<float3a> centroids;
     const Tri* src;
     void build(const Tri* t, int n) {
-        src=t;primBB.resize(n);centroids.resize(n);ordered.clear();
+        src=t;primBB.resize(n);centroids.resize(n);ordered.clear();orderedOrigIdx.clear();
         nodes.reserve(n*2);
         for(int i=0;i<n;i++){primBB[i]=triAABB(t[i]);centroids[i]={
             (primBB[i].mn.x+primBB[i].mx.x)*.5f,(primBB[i].mn.y+primBB[i].mx.y)*.5f,(primBB[i].mn.z+primBB[i].mx.z)*.5f};}
@@ -217,7 +218,7 @@ struct BVH2Builder {
         nd.box=primBB[idx[s]];for(int i=s+1;i<e;i++)nd.box=mergeAABB(nd.box,primBB[idx[i]]);
         int cnt=e-s;
         if(cnt<=3){nd.triStart=(int)ordered.size();nd.triCount=cnt;
-            for(int i=s;i<e;i++)ordered.push_back(src[idx[i]]);
+            for(int i=s;i<e;i++){ordered.push_back(src[idx[i]]);orderedOrigIdx.push_back(idx[i]);}
             nodes.push_back(nd);return(int)nodes.size()-1;}
         float bestCost=1e30f;int bestAxis=0,bestSplit=s+cnt/2;float pA=saArea(nd.box);
         for(int ax=0;ax<3;ax++){
@@ -643,8 +644,12 @@ CudaBVH_t cudaBVH_build(const CudaTri* tris, int numTris) {
         // p1 = {v1.y, v1.z, v2.x, v2.y}
         p[4] = h->h_triCopy[4][i]; p[5] = h->h_triCopy[5][i]; p[6] = h->h_triCopy[6][i];
         p[7] = h->h_triCopy[7][i];
-        // p2 = {v2.z, 0, 0, 0}
-        p[8] = h->h_triCopy[8][i]; p[9] = 0; p[10] = 0; p[11] = 0;
+        // p2 = {v2.z, origPrimIdx_as_float, 0, 0}
+        p[8] = h->h_triCopy[8][i];
+        // Store original (pre-SAH-sort) primitive index as bitcast float
+        int origIdx = (i < (int)bvh2.orderedOrigIdx.size()) ? bvh2.orderedOrigIdx[i] : i;
+        memcpy(&p[9], &origIdx, 4);
+        p[10] = 0; p[11] = 0;
     }
     fprintf(stderr, "[CudaBVH] Packed %d tris → %d vec4s (%.1f KB)\n",
             numOrd, h->numTriPacked, h->numTriPacked * 16 / 1024.f);
