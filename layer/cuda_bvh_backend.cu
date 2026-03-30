@@ -349,7 +349,10 @@ struct LBVHBuilder {
         nd.box.mx = {-1e30f, -1e30f, -1e30f};
 
         int cnt = e - s;
-        if (cnt <= 3) {
+        // TLAS leaves MUST be single-instance: SPIR-V rewriter only processes
+        // instIdx=triStart from each leaf (no instance loop). cnt<=3 caused
+        // 2-3 instance leaves where 1-2 instances were silently skipped.
+        if (cnt <= 1) {
             nd.triStart = s;
             nd.triCount = cnt;
             // Compute leaf AABB

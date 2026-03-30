@@ -995,7 +995,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             E(SpvOpConstant, {tInt, c8, 8});
             E(SpvOpConstant, {tInt, c9, 9});
             E(SpvOpConstant, {tInt, c10, 10});
-            E(SpvOpConstant, {tInt, cMaxIter, 30}); // max BLAS traversal iterations (30 = safe for TDR)
+            E(SpvOpConstant, {tInt, cMaxIter, 4096}); // max BLAS traversal iterations (world BLAS has 17K+ nodes)
             E(SpvOpConstant, {tInt, cMaxTlasIter, 512}); // max TLAS traversal iterations (137K+ nodes)
             E(SpvOpConstant, {tFloat, cf0, zb});
             E(SpvOpConstant, {tFloat, cf_huge, hb});
@@ -1377,7 +1377,9 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 E(SpvOpAccessChain, {pVec4SB, pIr2, vInst, c0, ir2Idx});
                 E(SpvOpLoad, {tVec4, ir2, pIr2});
 
-                // Load per-instance BLAS offsets from instances[instBase+6].w and [instBase+7].w
+                // Load per-instance BLAS offsets from packed buffer:
+                // vec4[6] = (blasMin.xyz, float(blasNodeOff))
+                // vec4[7] = (blasMax.xyz, float(blasTriOff))
                 uint32_t ib6Idx = newId(), pIb6 = newId(), ib6 = newId();
                 E(SpvOpIAdd, {tInt, ib6Idx, instBase, c6});
                 E(SpvOpAccessChain, {pVec4SB, pIb6, vInst, c0, ib6Idx});
@@ -1387,7 +1389,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 E(SpvOpAccessChain, {pVec4SB, pIb7, vInst, c0, ib7Idx});
                 E(SpvOpLoad, {tVec4, ib7, pIb7});
                 // blasNodeOff = int(ib6.w), blasTriOff = int(ib7.w)
-                // Values stored as actual floats (not bit-punned) to avoid denormal flush
+                // Stored as float(uint) in C++, read back via ConvertFToS (exact for offsets < 2^24)
                 uint32_t ib6wF = newId(), ib7wF = newId();
                 uint32_t blasNOff = newId(), blasTOff = newId();
                 E(SpvOpCompositeExtract, {tFloat, ib6wF, ib6, 3});
@@ -1930,7 +1932,9 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
         // Return 0 for inst custom idx, geom idx, SBT offset, ray flags
         if ((op == SpvOpRQGetInstCustomIdx || op == SpvOpRQGetGeomIdx ||
              op == SpvOpRQGetSBTOffset || op == SpvOpRQGetRayFlags) && wc >= 4) {
-            spvEmit(out, SpvOpCopyObject, {tInt, code[pos+2], c0});
+            uint32_t resType = code[pos+1];
+            uint32_t zeroVal = (resType == tUint) ? cu0 : c0;
+            spvEmit(out, SpvOpCopyObject, {resType, code[pos+2], zeroVal});
             skip = true;
         }
         // Object-space ray = world-space ray (no transforms for V1)
