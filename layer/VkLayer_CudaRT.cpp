@@ -242,6 +242,11 @@ struct InstanceGPU {
     float blasMaxX, blasMaxY, blasMaxZ;
     uint32_t blasNodeOff;    // node offset into concatenated BVH2 nodes array
     uint32_t blasTriOff;     // tri offset into concatenated packed tris array
+    // Per-instance metadata from VkAccelerationStructureInstanceKHR
+    uint32_t customIdx;      // instanceCustomIndex (24-bit)
+    uint32_t sbtOffset;      // instanceShaderBindingTableRecordOffset (24-bit)
+    uint32_t instanceMask;   // instance mask (8-bit)
+    uint32_t instanceFlags;  // instance flags (8-bit)
 };
 static std::vector<InstanceGPU> g_instances;
 static CudaBVH_t g_tlasBVH = nullptr;  // TLAS BVH over instance AABBs (first build only)
@@ -2364,7 +2369,14 @@ have_data:
         uint32_t customIdxMask;
         memcpy(&customIdxMask, inst + 48, 4);
         uint8_t instanceMask = (customIdxMask >> 24) & 0xFF;
+        uint32_t customIdx = customIdxMask & 0x00FFFFFF;
         maskCounts[instanceMask]++;
+
+        // Extract SBT offset and flags (offset 52)
+        uint32_t sbtFlags;
+        memcpy(&sbtFlags, inst + 52, 4);
+        uint32_t sbtOffset = sbtFlags & 0x00FFFFFF;
+        uint32_t instFlags = (sbtFlags >> 24) & 0xFF;
 
         // Resolve per-instance BLAS
         uint64_t blasRef = 0;
@@ -2408,6 +2420,10 @@ have_data:
         gi.blasMaxX = bMaxX; gi.blasMaxY = bMaxY; gi.blasMaxZ = bMaxZ;
         gi.blasNodeOff = nodeOff;
         gi.blasTriOff = triOff;
+        gi.customIdx = customIdx;
+        gi.sbtOffset = sbtOffset;
+        gi.instanceMask = instanceMask;
+        gi.instanceFlags = instFlags;
 
         // Store world AABB for TLAS BVH
         worldAABBs[i*6+0] = wMinX; worldAABBs[i*6+1] = wMinY; worldAABBs[i*6+2] = wMinZ;
@@ -2415,8 +2431,9 @@ have_data:
 
         // Log sampled instances on first rebuild only
         if (verbose && (i < 3 || i == numInst/4 || i == numInst/2 || i == numInst*3/4 || i == numInst-1)) {
-            LOG("[TLAS] Instance %u: T=[%.1f,%.1f,%.1f] mask=0x%02x BLAS#%d (nOff=%u,tOff=%u) wAABB=(%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f)",
-                i, xform[3], xform[7], xform[11], instanceMask, blasIdx, nodeOff, triOff,
+            LOG("[TLAS] Instance %u: T=[%.1f,%.1f,%.1f] mask=0x%02x customIdx=%u sbt=%u flags=%u BLAS#%d (nOff=%u,tOff=%u) wAABB=(%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f)",
+                i, xform[3], xform[7], xform[11], instanceMask, customIdx, sbtOffset, instFlags,
+                blasIdx, nodeOff, triOff,
                 wMinX, wMinY, wMinZ, wMaxX, wMaxY, wMaxZ);
         }
     }
@@ -2912,12 +2929,14 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
             LOG("[BVH2] TLAS nodes: %d (%.1f KB)", numTlasNodes, tlasNodesSize/1024.f);
         }
 
-        // Pack InstanceGPU into vec4 array: 8 vec4s per instance = 32 floats = 128 bytes
-        instancesSize = (VkDeviceSize)numInst * 8 * 4 * sizeof(float);
-        std::vector<float> instPacked(numInst * 32);
+        // Pack InstanceGPU into vec4 array: 9 vec4s per instance = 36 floats = 144 bytes
+        instancesSize = (VkDeviceSize)numInst * 9 * 4 * sizeof(float);
+        std::vector<float> instPacked(numInst * 36);
         for (int i = 0; i < numInst; i++) {
-            const InstanceGPU& gi = g_instances[i];
-            float* dst = instPacked.data() + i * 32;
+            // Use TLAS ordering if available (must match TLAS leaf indices)
+            int origIdx = (g_fastTLASOrdered && i < numInst) ? g_fastTLASOrdered[i] : i;
+            const InstanceGPU& gi = g_instances[origIdx];
+            float* dst = instPacked.data() + i * 36;
             // vec4[0..2] = transform rows (3 × vec4)
             memcpy(dst + 0, gi.transform + 0, 16);
             memcpy(dst + 4, gi.transform + 4, 16);
@@ -2926,12 +2945,17 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
             memcpy(dst + 12, gi.invTransform + 0, 16);
             memcpy(dst + 16, gi.invTransform + 4, 16);
             memcpy(dst + 20, gi.invTransform + 8, 16);
-            // vec4[6] = (blasMin.xyz, uintBitsToFloat(blasNodeOff))
+            // vec4[6] = (blasMin.xyz, float(blasNodeOff))
             dst[24] = gi.blasMinX; dst[25] = gi.blasMinY; dst[26] = gi.blasMinZ;
-            dst[27] = (float)gi.blasNodeOff;  // ConvertFToS in SPIR-V reads as float→int
+            dst[27] = (float)gi.blasNodeOff;
             // vec4[7] = (blasMax.xyz, float(blasTriOff))
             dst[28] = gi.blasMaxX; dst[29] = gi.blasMaxY; dst[30] = gi.blasMaxZ;
-            dst[31] = (float)gi.blasTriOff;   // ConvertFToS in SPIR-V reads as float→int
+            dst[31] = (float)gi.blasTriOff;
+            // vec4[8] = (float(customIdx), float(sbtOffset), float(origInstIdx), float(instanceFlags))
+            dst[32] = (float)gi.customIdx;
+            dst[33] = (float)gi.sbtOffset;
+            dst[34] = (float)origIdx;  // original build-order instance index (for InstanceId)
+            dst[35] = (float)gi.instanceFlags;
         }
         if (!createBufferWithData(disp, instPacked.data(), instancesSize,
                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.instancesBuf, g_bvh2.instancesMem)) {
@@ -2962,7 +2986,7 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
         }
     }
     if (!g_bvh2.instancesBuf) {
-        float dummy[32] = {0};
+        float dummy[36] = {0};  // 9 vec4s per instance
         instancesSize = sizeof(dummy);
         if (!createBufferWithData(disp, dummy, instancesSize,
                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.instancesBuf, g_bvh2.instancesMem)) {
@@ -3045,13 +3069,13 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
     // The LBVH builder sorts instances by Morton code; TLAS leaf triStart indexes
     // into the sorted order. Instance SSBO must match this order so the shader can
     // directly use the decoded triStart as the instance index.
-    VkDeviceSize instancesSize = (VkDeviceSize)numInst * 8 * 4 * sizeof(float);
-    std::vector<float> instPacked(numInst * 32);
+    VkDeviceSize instancesSize = (VkDeviceSize)numInst * 9 * 4 * sizeof(float);
+    std::vector<float> instPacked(numInst * 36);
     for (int i = 0; i < numInst; i++) {
         // Map sorted position → original instance index
         int origIdx = (g_fastTLASOrdered && i < numInst) ? g_fastTLASOrdered[i] : i;
         const InstanceGPU& gi = g_instances[origIdx];
-        float* dst = instPacked.data() + i * 32;
+        float* dst = instPacked.data() + i * 36;
         memcpy(dst + 0, gi.transform + 0, 16);
         memcpy(dst + 4, gi.transform + 4, 16);
         memcpy(dst + 8, gi.transform + 8, 16);
@@ -3059,9 +3083,14 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
         memcpy(dst + 16, gi.invTransform + 4, 16);
         memcpy(dst + 20, gi.invTransform + 8, 16);
         dst[24] = gi.blasMinX; dst[25] = gi.blasMinY; dst[26] = gi.blasMinZ;
-        dst[27] = (float)gi.blasNodeOff;  // ConvertFToS in SPIR-V reads as float→int
+        dst[27] = (float)gi.blasNodeOff;
         dst[28] = gi.blasMaxX; dst[29] = gi.blasMaxY; dst[30] = gi.blasMaxZ;
-        dst[31] = (float)gi.blasTriOff;   // ConvertFToS in SPIR-V reads as float→int
+        dst[31] = (float)gi.blasTriOff;
+        // vec4[8] = instance metadata
+        dst[32] = (float)gi.customIdx;
+        dst[33] = (float)gi.sbtOffset;
+        dst[34] = (float)origIdx;  // original build-order instance index (for InstanceId)
+        dst[35] = (float)gi.instanceFlags;
     }
     if (!createBufferHostVisible(disp, instPacked.data(), instancesSize,
                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.instancesBuf, g_bvh2.instancesMem)) {

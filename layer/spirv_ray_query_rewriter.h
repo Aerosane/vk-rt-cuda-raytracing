@@ -104,6 +104,7 @@ enum SpvRQ : uint16_t {
     SpvOpBitcast                = 124,
     SpvOpConvertSToF            = 111,
     SpvOpConvertFToS            = 110,
+    SpvOpConvertFToU            = 109,
     SpvOpSelect                 = 169,
     SpvOpPhi                    = 245,
     SpvOpLoopMerge              = 246,
@@ -1347,8 +1348,8 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 E(SpvOpISub, {tInt, tlEnc, c0, tlEncP2});
                 E(SpvOpShiftRightArithmetic, {tInt, instIdx, tlEnc, c3});
 
-                // Load inverse transform rows from instances[instIdx*8 + 3..5]
-                // base = instIdx * 8
+                // Load inverse transform rows from instances[instIdx*9 + 3..5]
+                // base = instIdx * 9 (9 vec4s per instance: transform, invTransform, BLAS bounds, metadata)
 #if SPIRV_RQ_TLAS_ONLY
                 // TLAS-ONLY SHADOW MODE: Skip BLAS traversal entirely.
                 // Report a committed hit as soon as any TLAS leaf (instance AABB) is reached.
@@ -1360,7 +1361,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 }
 #else
                 uint32_t instBase = newId();
-                E(SpvOpIMul, {tInt, instBase, instIdx, c8});
+                E(SpvOpIMul, {tInt, instBase, instIdx, c9});
                 // ir0 = instances[instBase + 3]
                 uint32_t ir0Idx = newId(), pIr0 = newId(), ir0 = newId();
                 E(SpvOpIAdd, {tInt, ir0Idx, instBase, c3});
@@ -1899,7 +1900,29 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             getField(code[pos+2], code[pos+3], 6, tInt, pInt); skip = true;
         }
         if (op == SpvOpRQGetInstId && wc >= 5) {
-            getField(code[pos+2], code[pos+3], 7, tInt, pInt); skip = true;
+            // Return ORIGINAL instance index from SSBO vec4[instBase+8].z
+            // (hitInstID is Morton-sorted; Q2RTX needs build-order index)
+            uint32_t resType = code[pos+1];
+            uint32_t resId   = code[pos+2];
+            uint32_t rqVar = code[pos+3];
+            uint32_t sv = rqMap.count(rqVar) ? rqMap[rqVar] : rqVar;
+            // Load hitInstID from RQ struct member 7 (sorted TLAS index)
+            uint32_t acHI = newId(), hitI = newId();
+            spvEmit(out, SpvOpAccessChain, {pInt, acHI, sv, c7});
+            spvEmit(out, SpvOpLoad, {tInt, hitI, acHI});
+            // instBase = hitInstID * 9 + 8
+            uint32_t ibase = newId(), metaIdx = newId();
+            spvEmit(out, SpvOpIMul, {tInt, ibase, hitI, c9});
+            spvEmit(out, SpvOpIAdd, {tInt, metaIdx, ibase, c8});
+            // Load vec4 from instance SSBO
+            uint32_t pM = newId(), metaV = newId();
+            spvEmit(out, SpvOpAccessChain, {pVec4SB, pM, vInst, c0, metaIdx});
+            spvEmit(out, SpvOpLoad, {tVec4, metaV, pM});
+            // Extract .z = originalInstIdx, convert float→int
+            uint32_t valF = newId();
+            spvEmit(out, SpvOpCompositeExtract, {tFloat, valF, metaV, (uint32_t)2});
+            spvEmit(out, SpvOpConvertFToS, {tInt, resId, valF});
+            skip = true;
         }
         if (op == SpvOpRQGetIntersectionType && wc >= 5) {
             getField(code[pos+2], code[pos+3], 8, tUint, pUint); skip = true;
@@ -1929,9 +1952,43 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             spvEmit(out, SpvOpCopyObject, {tBool, code[pos+2], cTrue});
             skip = true;
         }
-        // Return 0 for inst custom idx, geom idx, SBT offset, ray flags
-        if ((op == SpvOpRQGetInstCustomIdx || op == SpvOpRQGetGeomIdx ||
-             op == SpvOpRQGetSBTOffset || op == SpvOpRQGetRayFlags) && wc >= 4) {
+        // Instance metadata: load from instance SSBO vec4[8] = (customIdx, sbtOffset, mask, flags)
+        // instBase = hitInstID * 9 + 8
+        if ((op == SpvOpRQGetInstCustomIdx || op == SpvOpRQGetSBTOffset ||
+             op == SpvOpRQGetRayFlags) && wc >= 4) {
+            uint32_t resType = code[pos+1];
+            uint32_t resId   = code[pos+2];
+            // Determine which RQ variable (wc varies: 4 for no-committed, 5 for committed)
+            uint32_t rqVar = (wc >= 5) ? code[pos+3] : code[pos+3];
+            uint32_t sv = rqMap.count(rqVar) ? rqMap[rqVar] : rqVar;
+            // Load hitInstID from RQ struct member 7
+            uint32_t acHI = newId(), hitI = newId();
+            spvEmit(out, SpvOpAccessChain, {pInt, acHI, sv, c7});
+            spvEmit(out, SpvOpLoad, {tInt, hitI, acHI});
+            // instBase = hitInstID * 9 + 8
+            uint32_t ibase = newId(), metaIdx = newId();
+            spvEmit(out, SpvOpIMul, {tInt, ibase, hitI, c9});
+            spvEmit(out, SpvOpIAdd, {tInt, metaIdx, ibase, c8});
+            // Load vec4 from instance SSBO
+            uint32_t pM = newId(), metaV = newId();
+            spvEmit(out, SpvOpAccessChain, {pVec4SB, pM, vInst, c0, metaIdx});
+            spvEmit(out, SpvOpLoad, {tVec4, metaV, pM});
+            // Extract component: .x=customIdx, .y=sbtOffset, .z=mask (used as flags)
+            int comp = 0;
+            if (op == SpvOpRQGetSBTOffset) comp = 1;
+            else if (op == SpvOpRQGetRayFlags) comp = 3; // flags
+            uint32_t valF = newId();
+            spvEmit(out, SpvOpCompositeExtract, {tFloat, valF, metaV, (uint32_t)comp});
+            // Convert float→int/uint
+            if (resType == tUint) {
+                spvEmit(out, SpvOpConvertFToU, {tUint, resId, valF});
+            } else {
+                spvEmit(out, SpvOpConvertFToS, {tInt, resId, valF});
+            }
+            skip = true;
+        }
+        // GeomIndex: always 0 (each BLAS has 1 geometry in Q2RTX)
+        if (op == SpvOpRQGetGeomIdx && wc >= 4) {
             uint32_t resType = code[pos+1];
             uint32_t zeroVal = (resType == tUint) ? cu0 : c0;
             spvEmit(out, SpvOpCopyObject, {resType, code[pos+2], zeroVal});
