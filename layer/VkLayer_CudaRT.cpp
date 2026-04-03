@@ -79,6 +79,10 @@ extern "C" {
 struct float4;
 extern "C" {
     int    ir_exec_init(uint32_t width, uint32_t height);
+    void   ir_exec_set_scene(const void* blasNodes, int numBlasNodes,
+                              const void* blasTris,
+                              const void* tlasNodes, int numTlasNodes,
+                              const void* instances, int numInstances);
     float  ir_exec_run(const void* hostProgram, float4* hostOutput);
     float4* ir_exec_output_ptr();
     void   ir_exec_shutdown();
