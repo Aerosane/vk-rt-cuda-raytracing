@@ -45,6 +45,17 @@ extern "C" {
     int  rasterboost_upscale_has_trt();
 }
 
+// RasterBoost compute post-FX (rasterboost_postfx.cu)
+extern "C" {
+    void rasterboost_postfx_init();
+    int  rasterboost_postfx_bloom(void* colorRGBA8, void* tempBuffer,
+                                   int width, int height, float intensity);
+    int  rasterboost_postfx_motion_blur(void* colorRGBA8, const void* motionR16G16,
+                                         int width, int height, int numSamples);
+    void rasterboost_postfx_sync();
+    void rasterboost_postfx_destroy();
+}
+
 // ═══════════════════════════════════════════
 // Dispatch table — stores the next layer's function pointers
 // ═══════════════════════════════════════════
