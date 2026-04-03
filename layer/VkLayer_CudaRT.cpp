@@ -415,6 +415,7 @@ struct BVH2Interop {
 static BVH2Interop g_bvh2 = {};
 
 static int g_verbose = 1;
+uint32_t g_rqDispatchPerFrame = 0; // reset per frame in QueuePresent
 static int g_trackVerbose = 0;
 #define LOG(fmt, ...) do { if (g_verbose) fprintf(stderr, "[CudaRT] " fmt "\n", ##__VA_ARGS__); } while(0)
 
@@ -615,17 +616,23 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_EnumerateDeviceExtensionProperties(
         return VK_SUCCESS;
     }
 
-    // RT extensions we want to inject
-    static const char* rtExtNames[] = {
+    // Hide VK_KHR_ray_tracing_pipeline so apps fall back to ray_query (our layer path).
+    // V100 driver exposes native software RT pipeline which produces broken rendering.
+    bool hidePipeline = true;
+    if (getenv("CUDA_RT_HIDE_PIPELINE") && atoi(getenv("CUDA_RT_HIDE_PIPELINE")) == 0)
+        hidePipeline = false;
+
+    // RT extensions we want to inject (excluding pipeline if hidden)
+    std::vector<const char*> rtExtNames = {
         "VK_KHR_acceleration_structure",
-        "VK_KHR_ray_tracing_pipeline",
         "VK_KHR_ray_query",
         "VK_KHR_ray_tracing_maintenance1",
         "VK_KHR_deferred_host_operations",
         "VK_KHR_spirv_1_4",
         "VK_KHR_shader_float_controls",
     };
-    constexpr uint32_t numRTExts = sizeof(rtExtNames) / sizeof(rtExtNames[0]);
+    if (!hidePipeline)
+        rtExtNames.push_back("VK_KHR_ray_tracing_pipeline");
 
     // First call: get driver count
     uint32_t driverCount = 0;
@@ -644,8 +651,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_EnumerateDeviceExtensionProperties(
         return false;
     };
 
-    // Build merged list
-    std::vector<VkExtensionProperties> merged(driverExts.begin(), driverExts.end());
+    // Build merged list, stripping pipeline ext if hidden
+    std::vector<VkExtensionProperties> merged;
+    for (auto& ext : driverExts) {
+        if (hidePipeline && strcmp(ext.extensionName, "VK_KHR_ray_tracing_pipeline") == 0) {
+            LOG("  → Hidden extension: %s (forcing ray_query path)", ext.extensionName);
+            continue;
+        }
+        merged.push_back(ext);
+    }
     for (auto& rtName : rtExtNames) {
         if (!hasExt(rtName)) {
             VkExtensionProperties ext{};
@@ -702,14 +716,21 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
     };
 
     // Build extension list (optionally strip RT, always inject external_memory_fd)
+    // Also always strip ray_tracing_pipeline when hidden (force ray_query path)
+    bool hidePipeline2 = true;
+    if (getenv("CUDA_RT_HIDE_PIPELINE") && atoi(getenv("CUDA_RT_HIDE_PIPELINE")) == 0)
+        hidePipeline2 = false;
     std::vector<const char*> filteredExts;
     bool hasExternalMemFd = false;
     for (uint32_t i = 0; i < pCreateInfo->enabledExtensionCount; i++) {
-        if (stripRT && isRTExt(pCreateInfo->ppEnabledExtensionNames[i])) {
-            LOG("  → Stripping RT extension: %s (handled by CudaRT layer)", pCreateInfo->ppEnabledExtensionNames[i]);
+        const char* extName = pCreateInfo->ppEnabledExtensionNames[i];
+        if (stripRT && isRTExt(extName)) {
+            LOG("  → Stripping RT extension: %s (handled by CudaRT layer)", extName);
+        } else if (hidePipeline2 && strcmp(extName, "VK_KHR_ray_tracing_pipeline") == 0) {
+            LOG("  → Stripping %s (forcing ray_query path)", extName);
         } else {
-            filteredExts.push_back(pCreateInfo->ppEnabledExtensionNames[i]);
-            if (!strcmp(pCreateInfo->ppEnabledExtensionNames[i], "VK_KHR_external_memory_fd"))
+            filteredExts.push_back(extName);
+            if (!strcmp(extName, "VK_KHR_external_memory_fd"))
                 hasExternalMemFd = true;
         }
     }
@@ -750,14 +771,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
     modifiedCI.enabledExtensionCount = (uint32_t)filteredExts.size();
     modifiedCI.ppEnabledExtensionNames = filteredExts.data();
 
-    if (stripRT) {
-        // Relink pNext chain, skipping RT feature structs
+    if (stripRT || hidePipeline2) {
+        // Relink pNext chain, skipping RT feature structs (or just pipeline if only hiding)
+        auto shouldStrip = [&](VkStructureType st) {
+            if (stripRT && isRTSType(st)) return true;
+            if (hidePipeline2 && st == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR) return true;
+            return false;
+        };
         VkBaseOutStructure* newHead = nullptr;
         VkBaseOutStructure* newTail = nullptr;
         VkBaseOutStructure* cur = (VkBaseOutStructure*)pCreateInfo->pNext;
         while (cur) {
             VkBaseOutStructure* next = cur->pNext;
-            if (isRTSType(cur->sType)) {
+            if (shouldStrip(cur->sType)) {
                 LOG("  → Stripping pNext sType=%u from device create", cur->sType);
                 cur->pNext = next;
             } else {
@@ -768,11 +794,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
         }
         if (newTail) newTail->pNext = nullptr;
         modifiedCI.pNext = newHead;
-    } else {
-        // Non-strip mode: keep RT feature structs but fix features the driver
-        // doesn't actually support. We force-enable rayQuery in Features2 for the app
-        // (our SPIR-V rewriter handles it), but the driver can't create a device with
-        // rayQuery=VK_TRUE if it doesn't natively support it.
+    }
+
+    // Always clear rayQuery feature — the V100 driver may not support it natively,
+    // our layer handles it via SPIR-V rewrite regardless
+    {
         VkBaseOutStructure* cur = (VkBaseOutStructure*)modifiedCI.pNext;
         while (cur) {
             if (cur->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR) {
@@ -1679,6 +1705,16 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBuildAccelerationStructuresKHR(
     const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
     const VkAccelerationStructureBuildRangeInfoKHR* const* ppBuildRangeInfos)
 {
+    // DEBUG: log every CmdBuildAS call at entry
+    static int buildCallCount = 0;
+    buildCallCount++;
+    for (uint32_t dd = 0; dd < infoCount; dd++) {
+        if (buildCallCount <= 50 || (buildCallCount % 100) == 0)
+            LOG("CmdBuildAS ENTRY #%d: info[%u].type=%d geoCount=%u dst=0x%lx",
+                buildCallCount, dd, (int)pInfos[dd].type, pInfos[dd].geometryCount,
+                (uint64_t)pInfos[dd].dstAccelerationStructure);
+    }
+
     static int tlasCount = 0;
     for (uint32_t i = 0; i < infoCount; i++) {
         auto& info = pInfos[i];
@@ -2429,8 +2465,8 @@ have_data:
         worldAABBs[i*6+0] = wMinX; worldAABBs[i*6+1] = wMinY; worldAABBs[i*6+2] = wMinZ;
         worldAABBs[i*6+3] = wMaxX; worldAABBs[i*6+4] = wMaxY; worldAABBs[i*6+5] = wMaxZ;
 
-        // Log sampled instances on first rebuild only
-        if (verbose && (i < 3 || i == numInst/4 || i == numInst/2 || i == numInst*3/4 || i == numInst-1)) {
+        // Log ALL instances on first rebuild
+        if (verbose) {
             LOG("[TLAS] Instance %u: T=[%.1f,%.1f,%.1f] mask=0x%02x customIdx=%u sbt=%u flags=%u BLAS#%d (nOff=%u,tOff=%u) wAABB=(%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f)",
                 i, xform[3], xform[7], xform[11], instanceMask, customIdx, sbtOffset, instFlags,
                 blasIdx, nodeOff, triOff,
@@ -2839,6 +2875,45 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
         }
         LOG("[BVH2] Multi-BLAS concat: %d BLASes → %d total nodes, %d total triVec4s",
             (int)g_blasEntries.size(), totalNodes, totalTriVec4s);
+
+        // Diagnostic: dump entity BLAS triangle data to verify integrity
+        static int triDumpCount = 0;
+        if (triDumpCount < 2) {
+            for (size_t bi = 1; bi < g_blasEntries.size(); bi++) {
+                // Dump initial BLASes (#1-4) and late entity BLASes (#38-44)
+                if (bi > 4 && bi < 38) continue;
+                if (bi >= 45) break;
+                const auto& be = g_blasEntries[bi];
+                int tOff = be.triOffset; // in triangles
+                int nTri = be.numTris;
+                LOG("[BVH2-DIAG] BLAS#%zu: triOff=%d numTris=%d nodeOff=%d numNodes=%d bounds=(%.2f,%.2f,%.2f)-(%.2f,%.2f,%.2f)",
+                    bi, tOff, nTri, be.nodeOffset, be.numNodes,
+                    be.minX, be.minY, be.minZ, be.maxX, be.maxY, be.maxZ);
+                // Dump first 3 packed triangles from this BLAS
+                for (int t = 0; t < std::min(nTri, 3); t++) {
+                    int baseF = (tOff + t) * 12; // 12 floats per tri (3 vec4s)
+                    if (baseF + 11 < (int)allTris.size()) {
+                        float* p = allTris.data() + baseF;
+                        int origIdx;
+                        memcpy(&origIdx, &p[9], 4);
+                        LOG("[BVH2-DIAG]   tri[%d]: v0=(%.2f,%.2f,%.2f) v1=(%.2f,%.2f,%.2f) v2=(%.2f,%.2f,%.2f) origIdx=%d",
+                            t, p[0],p[1],p[2], p[3],p[4],p[5], p[6],p[7],p[8], origIdx);
+                    }
+                }
+                // Dump root BVH node for this BLAS
+                int nOff = be.nodeOffset * 8; // 8 uint32s per node
+                if (nOff + 7 < (int)allNodes.size()) {
+                    float bmin[3], bmax[3];
+                    memcpy(bmin, allNodes.data() + nOff, 12);
+                    memcpy(&bmax[0], allNodes.data() + nOff + 3, 4);
+                    memcpy(&bmax[1], allNodes.data() + nOff + 4, 4);
+                    memcpy(&bmax[2], allNodes.data() + nOff + 5, 4);
+                    LOG("[BVH2-DIAG]   rootNode: min=(%.2f,%.2f,%.2f) max=(%.2f,%.2f,%.2f)",
+                        bmin[0],bmin[1],bmin[2], bmax[0],bmax[1],bmax[2]);
+                }
+            }
+            triDumpCount++;
+        }
     } else {
         // Fallback: single BLAS (g_lastBLAS)
         uint32_t* nodeData = nullptr;
@@ -2951,11 +3026,35 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
             // vec4[7] = (blasMax.xyz, float(blasTriOff))
             dst[28] = gi.blasMaxX; dst[29] = gi.blasMaxY; dst[30] = gi.blasMaxZ;
             dst[31] = (float)gi.blasTriOff;
-            // vec4[8] = (float(customIdx), float(sbtOffset), float(origInstIdx), float(instanceFlags))
-            dst[32] = (float)gi.customIdx;
-            dst[33] = (float)gi.sbtOffset;
-            dst[34] = (float)origIdx;  // original build-order instance index (for InstanceId)
-            dst[35] = (float)gi.instanceFlags;
+            // vec4[8] = (float(customIdx), float(sbtOffset), float(origInstIdx), float(packed_mask_flags))
+            // packed_mask_flags = instanceMask | (instanceFlags << 8) — both uint8 values
+            static int forceBSP = -1;
+            if (forceBSP < 0) { const char* e = getenv("CUDA_RT_FORCE_BSP"); forceBSP = (e && atoi(e)) ? 1 : 0; }
+            if (forceBSP) {
+                // DEBUG: Find world BSP instance (blasNodeOff=0, blasTriOff=0, customIdx=0)
+                static int worldOrigIdx = -1;
+                if (worldOrigIdx < 0) {
+                    for (int j = 0; j < numInst; j++) {
+                        int oj = (g_fastTLASOrdered && j < numInst) ? g_fastTLASOrdered[j] : j;
+                        const InstanceGPU& gj = g_instances[oj];
+                        if (gj.customIdx == 0 && gj.blasNodeOff == 0 && gj.blasTriOff == 0) {
+                            worldOrigIdx = oj;
+                            fprintf(stderr, "[CudaRT] FORCE_BSP: world BSP at origIdx=%d\n", worldOrigIdx);
+                            break;
+                        }
+                    }
+                    if (worldOrigIdx < 0) worldOrigIdx = 0; // fallback
+                }
+                dst[32] = 0.0f;   // customIdx = 0 (VERTEX_BUFFER_WORLD)
+                dst[33] = 0.0f;   // sbtOffset = 0 (SBTO_OPAQUE)
+                dst[34] = (float)worldOrigIdx;  // origInstIdx = world BSP build-order index
+                dst[35] = (float)(0x01 | (0x04 << 8)); // mask=1 (opaque), flags=FORCE_OPAQUE
+            } else {
+                dst[32] = (float)gi.customIdx;
+                dst[33] = (float)gi.sbtOffset;
+                dst[34] = (float)origIdx;  // original build-order instance index (for InstanceId)
+                dst[35] = (float)(gi.instanceMask | (gi.instanceFlags << 8));
+            }
         }
         if (!createBufferWithData(disp, instPacked.data(), instancesSize,
                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.instancesBuf, g_bvh2.instancesMem)) {
@@ -3087,10 +3186,40 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
         dst[28] = gi.blasMaxX; dst[29] = gi.blasMaxY; dst[30] = gi.blasMaxZ;
         dst[31] = (float)gi.blasTriOff;
         // vec4[8] = instance metadata
-        dst[32] = (float)gi.customIdx;
-        dst[33] = (float)gi.sbtOffset;
-        dst[34] = (float)origIdx;  // original build-order instance index (for InstanceId)
-        dst[35] = (float)gi.instanceFlags;
+        static int forceBSP2 = -1;
+        if (forceBSP2 < 0) { const char* e = getenv("CUDA_RT_FORCE_BSP"); forceBSP2 = (e && atoi(e)) ? 1 : 0; }
+        if (forceBSP2) {
+            static int worldOrigIdx2 = -1;
+            if (worldOrigIdx2 < 0) {
+                for (int j = 0; j < numInst; j++) {
+                    int oj = (g_fastTLASOrdered && j < numInst) ? g_fastTLASOrdered[j] : j;
+                    const InstanceGPU& gj = g_instances[oj];
+                    if (gj.customIdx == 0 && gj.blasNodeOff == 0 && gj.blasTriOff == 0) {
+                        worldOrigIdx2 = oj; break;
+                    }
+                }
+                if (worldOrigIdx2 < 0) worldOrigIdx2 = 0;
+            }
+            dst[32] = 0.0f; dst[33] = 0.0f; dst[34] = (float)worldOrigIdx2;
+            dst[35] = (float)(0x01 | (0x04 << 8));
+        } else {
+            dst[32] = (float)gi.customIdx;
+            dst[33] = (float)gi.sbtOffset;
+            dst[34] = (float)origIdx;
+            dst[35] = (float)(gi.instanceMask | (gi.instanceFlags << 8));
+        }
+    }
+    // One-time diagnostic: dump sorted→original instance mapping
+    static bool dumpedMapping = false;
+    if (!dumpedMapping) {
+        dumpedMapping = true;
+        for (int i = 0; i < numInst; i++) {
+            int origIdx = (g_fastTLASOrdered && i < numInst) ? g_fastTLASOrdered[i] : i;
+            const InstanceGPU& gi = g_instances[origIdx];
+            fprintf(stderr, "[CudaRT] [INST-MAP] sorted[%d] → orig=%d customIdx=%d mask=0x%02x blasNOff=%d blasTOff=%d T=(%.1f,%.1f,%.1f)\n",
+                    i, origIdx, gi.customIdx, gi.instanceMask, gi.blasNodeOff, gi.blasTriOff,
+                    gi.transform[3], gi.transform[7], gi.transform[11]);
+        }
     }
     if (!createBufferHostVisible(disp, instPacked.data(), instancesSize,
                               VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.instancesBuf, g_bvh2.instancesMem)) {
@@ -3167,6 +3296,70 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
             memcpy(&toff, &i0[31], 4);
             LOG("[BVH2] Instance 0 blasBounds: (%.3f,%.3f,%.3f)-(%.3f,%.3f,%.3f) nOff=%u tOff=%u",
                 i0[24], i0[25], i0[26], i0[28], i0[29], i0[30], noff, toff);
+        }
+
+        // ── CPU-side BLAS root AABB test for each instance ──
+        // Mimics the GPU: transform world ray to local space, test against BLAS root node
+        static int blasAabbTestCount = 0;
+        if (blasAabbTestCount < 3 && numInst > 0) {
+            LOG("[BVH2-AABB] CPU-side BLAS root AABB test (%d instances):", numInst);
+            for (int i = 0; i < numInst; i++) {
+                float* d = instPacked.data() + i * 36;
+                float xform[12], invXform[12];
+                memcpy(xform, d, 48);
+                memcpy(invXform, d + 12, 48);
+                int blasNOff = (int)d[27]; // nodeOff stored as float
+                int blasTOff = (int)d[31]; // triOff stored as float
+
+                // BLAS root AABB from instance SSBO (blasBounds)
+                float bmin[3] = {d[24], d[25], d[26]};
+                float bmax[3] = {d[28], d[29], d[30]};
+
+                // Model-space center of BLAS AABB
+                float mcx = (bmin[0]+bmax[0])*0.5f, mcy = (bmin[1]+bmax[1])*0.5f, mcz = (bmin[2]+bmax[2])*0.5f;
+                // Transform to world space: worldCenter = xform * modelCenter + xform_translation
+                float wcx = xform[0]*mcx + xform[1]*mcy + xform[2]*mcz + xform[3];
+                float wcy = xform[4]*mcx + xform[5]*mcy + xform[6]*mcz + xform[7];
+                float wcz = xform[8]*mcx + xform[9]*mcy + xform[10]*mcz + xform[11];
+
+                // Create test ray: from (wcx, wcy, wcz+200) shooting -Z toward entity
+                float rox = wcx, roy = wcy, roz = wcz + 200.0f;
+                float rdx = 0, rdy = 0, rdz = -1.0f;
+
+                // Transform ray to local space using inverse transform (same as GPU)
+                float lox = invXform[0]*rox + invXform[1]*roy + invXform[2]*roz + invXform[3];
+                float loy = invXform[4]*rox + invXform[5]*roy + invXform[6]*roz + invXform[7];
+                float loz = invXform[8]*rox + invXform[9]*roy + invXform[10]*roz + invXform[11];
+                float ldx = invXform[0]*rdx + invXform[1]*rdy + invXform[2]*rdz;
+                float ldy = invXform[4]*rdx + invXform[5]*rdy + invXform[6]*rdz;
+                float ldz = invXform[8]*rdx + invXform[9]*rdy + invXform[10]*rdz;
+
+                // Safe inverse direction
+                auto safeInvF = [](float v) -> float {
+                    return (fabsf(v) > 1e-8f) ? 1.0f/v : (v >= 0 ? 1e8f : -1e8f);
+                };
+                float lInvDx = safeInvF(ldx), lInvDy = safeInvF(ldy), lInvDz = safeInvF(ldz);
+                float lOodx = -lox * lInvDx, lOody = -loy * lInvDy, lOodz = -loz * lInvDz;
+
+                // AABB slab test (same as GPU)
+                float t1x = bmin[0]*lInvDx + lOodx, t2x = bmax[0]*lInvDx + lOodx;
+                float t1y = bmin[1]*lInvDy + lOody, t2y = bmax[1]*lInvDy + lOody;
+                float t1z = bmin[2]*lInvDz + lOodz, t2z = bmax[2]*lInvDz + lOodz;
+                float tNear = fmaxf(fmaxf(fminf(t1x,t2x), fminf(t1y,t2y)), fminf(t1z,t2z));
+                float tFar  = fminf(fminf(fmaxf(t1x,t2x), fmaxf(t1y,t2y)), fmaxf(t1z,t2z));
+                bool hit = (tNear <= tFar) && (tFar > 0.0f) && (tNear < 1e30f);
+
+                LOG("[BVH2-AABB]  inst[%d] nOff=%d tOff=%d",
+                    i, blasNOff, blasTOff);
+                LOG("[BVH2-AABB]    BLAS root AABB: (%.2f,%.2f,%.2f)-(%.2f,%.2f,%.2f)",
+                    bmin[0],bmin[1],bmin[2], bmax[0],bmax[1],bmax[2]);
+                LOG("[BVH2-AABB]    xform T=[%.1f,%.1f,%.1f] worldCenter=(%.1f,%.1f,%.1f)",
+                    xform[3], xform[7], xform[11], wcx, wcy, wcz);
+                LOG("[BVH2-AABB]    localRo=(%.2f,%.2f,%.2f) localRd=(%.4f,%.4f,%.4f)",
+                    lox,loy,loz, ldx,ldy,ldz);
+                LOG("[BVH2-AABB]    tNear=%.4f tFar=%.4f hit=%d", tNear, tFar, hit ? 1 : 0);
+            }
+            blasAabbTestCount++;
         }
     }
 
@@ -4876,6 +5069,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
 
     static uint32_t presentCount = 0;
     presentCount++;
+
+    // Reset per-frame RQ dispatch counter
+    g_rqDispatchPerFrame = 0;
     if (presentCount <= 5 || presentCount % 100 == 0) {
         LOG("[PRESENT] QueuePresent #%u (TLAS gen=%u addr=0x%llx)",
             presentCount, g_tlasGeneration,
@@ -5046,8 +5242,22 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
             auto it = g_rqPipelines.find(pipeHandle);
             if (it != g_rqPipelines.end()) {
                 isRQDispatch = true;
+                g_rqDispatchPerFrame++;
                 VkPipelineLayout layout = it->second.layout;
                 uint32_t bvhSetIdx = (uint32_t)it->second.bvhDescSet;
+
+                // CUDA_RT_MAX_RQ_DISPATCH: Only bind BVH for first N RQ dispatches per frame
+                // 0 = unlimited (default). Dispatches beyond limit are skipped (NOP).
+                static int maxRQDispatch = -1;
+                if (maxRQDispatch < 0) {
+                    const char* e = getenv("CUDA_RT_MAX_RQ_DISPATCH");
+                    maxRQDispatch = e ? atoi(e) : 0;
+                }
+                if (maxRQDispatch > 0 && (int)g_rqDispatchPerFrame > maxRQDispatch) {
+                    // Skip this dispatch entirely (no BVH binding, no execution)
+                    return;
+                }
+
                 if (layout && g_bvh2.descSet) {
                     // Bind BVH2 descriptor set at the rewriter's chosen set index
                     disp.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,

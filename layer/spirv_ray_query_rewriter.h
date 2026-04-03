@@ -24,6 +24,28 @@
 // No type/cap/ext stripping, no RQ op replacement, no entry point modification.
 // Tests whether call stubbing alone vs everything else causes dark frames.
 #define SPIRV_RQ_PASSTHROUGH 0
+// Debug: force PrimitiveIndex to 0 for all hits (isolates material lookup vs traversal)
+#define SPIRV_RQ_FORCE_PRIM0 0
+// Debug: force barycentrics to (0.33, 0.33) for all hits
+#define SPIRV_RQ_FORCE_BARY 0
+// Debug: force instIdx to 0 (first sorted instance) for committed hit
+#define SPIRV_RQ_FORCE_INST0 0
+// Debug: force hitType=1 for ALL rays (even misses) — ALL pixels become "hits"
+#define SPIRV_RQ_FORCE_HITTYPE1 0
+// Debug: force hitT to fixed value (50.0) for all hits
+#define SPIRV_RQ_FORCE_HITT 0
+// Debug: force hit at BLAS LEAF without Moller-Trumbore — tests if BLAS tree traversal works
+#define SPIRV_RQ_FORCE_LEAF_HIT 0
+// Debug: force ALL BLAS internal AABB tests to pass (always descend left child)
+#define SPIRV_RQ_FORCE_BLAS_AABB 0
+// BLAS AABB bestT culling is DISABLED (was the entity darkness bug).
+// bestT is initialized in world-space (tMax) but BLAS AABB tests run in
+// local-space after inverse instance transform. Non-uniform scaling makes
+// t_local != t_world, causing valid BLAS nodes to be culled.
+// The triangle hit test (Moller-Trumbore) handles bestT correctly within
+// local-space, so skipping bestT in AABB is safe — just slightly less
+// efficient (traverses a few extra nodes).
+#define SPIRV_RQ_BLAS_NO_BESTT 1
 // Intercepts shaders containing rayQueryEXT and rewrites them to use
 // our BVH2 stackless traversal via SSBOs. Makes ray query work on ANY
 // GPU without hardware RT cores.
@@ -99,6 +121,7 @@ enum SpvRQ : uint16_t {
     SpvOpFOrdGreaterThan        = 186,
     SpvOpFOrdLessThanEqual      = 188,
     SpvOpFOrdGreaterThanEqual   = 190,
+    SpvOpShiftRightLogical      = 194,
     SpvOpShiftRightArithmetic   = 195,
     SpvOpBitwiseAnd             = 199,
     SpvOpBitcast                = 124,
@@ -366,9 +389,11 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
     uint32_t cf0 = newId(), cf_huge = newId();
     // Additional constants for traversal
     uint32_t cu0 = newId(), cu1 = newId(), cu2 = newId(), cu3 = newId(), cu7 = newId();
-    uint32_t cu16 = newId(), cu32 = newId(); // CullBackFace=16, CullFrontFace=32
+    uint32_t cu8 = newId(), cu16 = newId(), cu32 = newId(), cu255 = newId(); // bit ops + cull flags
     uint32_t cf1 = newId(), cfn1 = newId(); // float 1.0, float -1.0
     float tiny = 1e-8f; uint32_t cf_tiny = newId();
+    uint32_t cf_third = newId(); // float 0.333 for debug barycentrics
+    uint32_t cf_50 = newId(); // float 50.0 for FORCE_HITT
     // Traversal local variables — allocated PER-FUNCTION at each OpLabel
     // (must be unique IDs per function to avoid duplicate definitions)
     uint32_t tvNi = 0, tvBestT = 0, tvHitU = 0, tvHitV = 0;
@@ -381,6 +406,9 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
     uint32_t tvHitInst = 0;
     uint32_t tvBlasNodeOff = 0, tvBlasTriOff = 0;
     uint32_t tvRayFlags = 0;
+    uint32_t tvRayCullMask = 0;  // ray cullMask from rayQueryInitialize
+    uint32_t tvInstFlags = 0;    // per-instance VkGeometryInstanceFlagsKHR
+    uint32_t tvHitFrontFace = 0; // bool: actual front-face for committed hit
     uint32_t cMaxTlasIter = newId(); // constant: shared across functions
     uint32_t glslExtId = 0; // will find existing GLSL.std.450 import
 
@@ -393,7 +421,8 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
         tvLocalRo = newId(); tvLocalRd = newId();
         tvHitInst = newId();
         tvBlasNodeOff = newId(); tvBlasTriOff = newId();
-        tvRayFlags = newId();
+        tvRayFlags = newId(); tvRayCullMask = newId();
+        tvInstFlags = newId(); tvHitFrontFace = newId();
     };
 
     // Build output
@@ -1006,13 +1035,17 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             E(SpvOpConstant, {tFloat, cf1, f1b});
             E(SpvOpConstant, {tFloat, cfn1, fn1b});
             E(SpvOpConstant, {tFloat, cf_tiny, tinyb});
+            { float v = 0.333f; uint32_t b; memcpy(&b, &v, 4); E(SpvOpConstant, {tFloat, cf_third, b}); }
+            { float v = 50.0f; uint32_t b; memcpy(&b, &v, 4); E(SpvOpConstant, {tFloat, cf_50, b}); }
             E(SpvOpConstant, {tUint, cu0, 0});
             E(SpvOpConstant, {tUint, cu1, 1});
             E(SpvOpConstant, {tUint, cu2, 2});
             E(SpvOpConstant, {tUint, cu3, 3});
             E(SpvOpConstant, {tUint, cu7, 7});
+            E(SpvOpConstant, {tUint, cu8, 8});   // shift amount for packed mask/flags
             E(SpvOpConstant, {tUint, cu16, 16}); // CullBackFace flag
             E(SpvOpConstant, {tUint, cu32, 32}); // CullFrontFace flag
+            E(SpvOpConstant, {tUint, cu255, 255}); // 0xFF mask for instance mask extraction
             if (needTrue)  E(SpvOpConstantTrue,  {tBool, cTrue});
             if (needFalse) E(SpvOpConstantFalse, {tBool, cFalse});
 
@@ -1129,6 +1162,9 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 spvEmit(out, SpvOpVariable, {pInt,   tvBlasNodeOff, (uint32_t)SCFunction});
                 spvEmit(out, SpvOpVariable, {pInt,   tvBlasTriOff,  (uint32_t)SCFunction});
                 spvEmit(out, SpvOpVariable, {pUint,  tvRayFlags,    (uint32_t)SCFunction});
+                spvEmit(out, SpvOpVariable, {pUint,  tvRayCullMask, (uint32_t)SCFunction});
+                spvEmit(out, SpvOpVariable, {pUint,  tvInstFlags,   (uint32_t)SCFunction});
+                spvEmit(out, SpvOpVariable, {pUint,  tvHitFrontFace,(uint32_t)SCFunction}); // bool stored as uint
             }
             skip = true; // already copied OpLabel
         }
@@ -1152,7 +1188,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             uint32_t rqVar   = code[pos+1];
             // pos+2 = accel struct (ignored)
             uint32_t flagsId = code[pos+3]; // ray flags (uint)
-            // pos+4 = mask
+            uint32_t maskId  = code[pos+4]; // cull mask (uint)
             uint32_t origin  = code[pos+5];
             uint32_t tMinId  = code[pos+6];
             uint32_t dirId   = code[pos+7];
@@ -1219,6 +1255,9 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             E(SpvOpStore, {tvHitType, cu0});
             E(SpvOpStore, {tvIter, c0});
             E(SpvOpStore, {tvRayFlags, flagsId}); // store ray flags for culling
+            E(SpvOpStore, {tvRayCullMask, maskId}); // store cull mask for instance filtering
+            E(SpvOpStore, {tvInstFlags, cu0});   // init instance flags to 0
+            E(SpvOpStore, {tvHitFrontFace, cu1}); // default: front-facing
             // TLAS traversal init
             E(SpvOpStore, {tvTlasNi, c0});
             E(SpvOpStore, {tvTlasIter, c0});
@@ -1370,6 +1409,39 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
 #else
                 uint32_t instBase = newId();
                 E(SpvOpIMul, {tInt, instBase, instIdx, c9});
+
+                // Load metadata FIRST for mask check:
+                // vec4[8] = (customIdx, sbtOffset, origInstIdx, packed(instanceMask | instanceFlags<<8))
+                uint32_t ib8Idx = newId(), pIb8 = newId(), ib8 = newId();
+                E(SpvOpIAdd, {tInt, ib8Idx, instBase, c8});
+                E(SpvOpAccessChain, {pVec4SB, pIb8, vInst, c0, ib8Idx});
+                E(SpvOpLoad, {tVec4, ib8, pIb8});
+                uint32_t packedF = newId(), packedU = newId();
+                E(SpvOpCompositeExtract, {tFloat, packedF, ib8, 3});
+                E(SpvOpConvertFToU, {tUint, packedU, packedF});
+
+                // instanceMask = packed & 0xFF
+                uint32_t instMaskU = newId();
+                E(SpvOpBitwiseAnd, {tUint, instMaskU, packedU, cu255});
+                // instanceFlags = (packed >> 8) & 0xFF
+                uint32_t iflagsShifted = newId(), iflagsU = newId();
+                E(SpvOpShiftRightLogical, {tUint, iflagsShifted, packedU, cu8});
+                E(SpvOpBitwiseAnd, {tUint, iflagsU, iflagsShifted, cu255});
+                E(SpvOpStore, {tvInstFlags, iflagsU});
+
+                // Check instance mask: (instMask & cullMask) != 0
+                uint32_t cullMaskVal = newId(), maskAnd = newId(), maskPass = newId();
+                E(SpvOpLoad, {tUint, cullMaskVal, tvRayCullMask});
+                E(SpvOpBitwiseAnd, {tUint, maskAnd, instMaskU, cullMaskVal});
+                E(SpvOpINotEqual, {tBool, maskPass, maskAnd, cu0});
+
+                uint32_t maskPassLbl = newId(), maskMergeLbl = newId();
+                spvEmit(out, SpvOpSelectionMerge, {maskMergeLbl, 0});
+                E(SpvOpBranchConditional, {maskPass, maskPassLbl, maskMergeLbl});
+
+                // --- Instance mask passed: proceed with BLAS traversal ---
+                spvEmit(out, SpvOpLabel, {maskPassLbl});
+
                 // ir0 = instances[instBase + 3]
                 uint32_t ir0Idx = newId(), pIr0 = newId(), ir0 = newId();
                 E(SpvOpIAdd, {tInt, ir0Idx, instBase, c3});
@@ -1532,6 +1604,20 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                     E(SpvOpBitwiseAnd, {tInt, tcm, enc, c7});
                     E(SpvOpIAdd, {tInt, tc, tcm, c1});
 
+#if SPIRV_RQ_FORCE_LEAF_HIT
+                    // DEBUG: Force hit when ANY BLAS leaf is reached (skip Moller-Trumbore)
+                    // Tests whether BLAS BVH tree traversal (AABB tests) reaches leaves
+                    E(SpvOpStore, {tvBestT, cf_50});
+                    E(SpvOpStore, {tvHitU, cf_third});
+                    E(SpvOpStore, {tvHitV, cf_third});
+                    E(SpvOpStore, {tvHitPrim, c0});
+                    E(SpvOpStore, {tvHitType, cu1});
+                    E(SpvOpStore, {tvHitInst, instIdx});
+                    E(SpvOpStore, {tvHitFrontFace, cu1});
+                    // Exit BLAS loop immediately (ni = -1)
+                    E(SpvOpStore, {tvNi, cn1});
+                }
+#else
                     E(SpvOpStore, {tvTriIdx, c0});
                     uint32_t triH = newId(), triB = newId(), triM = newId(), triC = newId();
                     E(SpvOpBranch, {triH});
@@ -1633,40 +1719,63 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                     spvEmit(out, (uint16_t)SpvOpLogicalAnd, {tBool, cd, cc, c_ttMin});
                     spvEmit(out, (uint16_t)SpvOpLogicalAnd, {tBool, hitCond, cd, c_ttMax});
 
-                    // Face culling based on ray flags
+                    // Face culling based on ray flags AND per-instance flags
                     // det > 0 = front-face, det < 0 = back-face
-                    // CullBackFace (bit 4=16): skip if det < 0
-                    // CullFrontFace (bit 5=32): skip if det > 0
+                    // Instance flag bit 0 (=1): TRIANGLE_FACING_CULL_DISABLE → skip culling
+                    // Instance flag bit 1 (=2): TRIANGLE_FLIP_FACING → reverse front/back
+                    // Ray flag bit 4 (=16): CullBackFace → skip if back-face
+                    // Ray flag bit 5 (=32): CullFrontFace → skip if front-face
                     uint32_t SpvOpLogicalNot = 168;
                     uint32_t SpvOpBitwiseAnd = 199;
                     uint32_t SpvOpINotEqual = 171;
+                    uint32_t SpvOpLogicalOr = 166;
+                    uint32_t effDet = 0; // effective determinant (with FLIP_FACING applied)
                     {
+                        // Load instance flags and check FLIP_FACING (bit 1)
+                        uint32_t iflags = newId();
+                        E(SpvOpLoad, {tUint, iflags, tvInstFlags});
+                        uint32_t flipBits = newId(), flipSet = newId();
+                        spvEmit(out, (uint16_t)SpvOpBitwiseAnd, {tUint, flipBits, iflags, cu2});
+                        spvEmit(out, (uint16_t)SpvOpINotEqual, {tBool, flipSet, flipBits, cu0});
+
+                        // Compute effective determinant sign:
+                        // If FLIP_FACING → negate det for face determination
+                        // effectiveDet = flipSet ? -det : det
+                        uint32_t negDet = newId();
+                        effDet = newId();
+                        E(SpvOpFNegate, {tFloat, negDet, det});
+                        spvEmit(out, SpvOpSelect, {tFloat, effDet, flipSet, negDet, det});
+
+                        // Check CULL_DISABLE (bit 0)
+                        uint32_t cullDisBits = newId(), cullDisSet = newId();
+                        spvEmit(out, (uint16_t)SpvOpBitwiseAnd, {tUint, cullDisBits, iflags, cu1});
+                        spvEmit(out, (uint16_t)SpvOpINotEqual, {tBool, cullDisSet, cullDisBits, cu0});
+
                         uint32_t rflags = newId();
                         E(SpvOpLoad, {tUint, rflags, tvRayFlags});
-                        // Check CullBackFace
+                        // Check CullBackFace (ray flag bit 4=16)
                         uint32_t cbfBits = newId(), cbfSet = newId();
                         spvEmit(out, (uint16_t)SpvOpBitwiseAnd, {tUint, cbfBits, rflags, cu16});
                         spvEmit(out, (uint16_t)SpvOpINotEqual, {tBool, cbfSet, cbfBits, cu0});
-                        // det < 0 means back-face
+                        // effectiveDet < 0 means back-face (after flip)
                         uint32_t isBack = newId();
-                        E(SpvOpFOrdLessThan, {tBool, isBack, det, cf0});
-                        // cullBack = cbfSet && isBack
+                        E(SpvOpFOrdLessThan, {tBool, isBack, effDet, cf0});
                         uint32_t cullBack = newId();
                         spvEmit(out, (uint16_t)SpvOpLogicalAnd, {tBool, cullBack, cbfSet, isBack});
-                        // Check CullFrontFace
+                        // Check CullFrontFace (ray flag bit 5=32)
                         uint32_t cffBits = newId(), cffSet = newId();
                         spvEmit(out, (uint16_t)SpvOpBitwiseAnd, {tUint, cffBits, rflags, cu32});
                         spvEmit(out, (uint16_t)SpvOpINotEqual, {tBool, cffSet, cffBits, cu0});
-                        // det > 0 means front-face
+                        // effectiveDet > 0 means front-face (after flip)
                         uint32_t isFront = newId();
-                        E(SpvOpFOrdGreaterThan, {tBool, isFront, det, cf0});
-                        // cullFront = cffSet && isFront
+                        E(SpvOpFOrdGreaterThan, {tBool, isFront, effDet, cf0});
                         uint32_t cullFront = newId();
                         spvEmit(out, (uint16_t)SpvOpLogicalAnd, {tBool, cullFront, cffSet, isFront});
-                        // culled = cullBack || cullFront
-                        uint32_t SpvOpLogicalOr = 166;
-                        uint32_t culled = newId(), notCulled = newId();
-                        spvEmit(out, (uint16_t)SpvOpLogicalOr, {tBool, culled, cullBack, cullFront});
+                        // culled = (cullBack || cullFront) && !cullDisSet
+                        uint32_t cullRaw = newId(), notCullDis = newId(), culled = newId(), notCulled = newId();
+                        spvEmit(out, (uint16_t)SpvOpLogicalOr, {tBool, cullRaw, cullBack, cullFront});
+                        spvEmit(out, (uint16_t)SpvOpLogicalNot, {tBool, notCullDis, cullDisSet});
+                        spvEmit(out, (uint16_t)SpvOpLogicalAnd, {tBool, culled, cullRaw, notCullDis});
                         spvEmit(out, (uint16_t)SpvOpLogicalNot, {tBool, notCulled, culled});
                         // hitCond = hitCond && !culled
                         uint32_t hitCondFinal = newId();
@@ -1686,9 +1795,19 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                     uint32_t origPrimF = newId(), origPrimI = newId();
                     E(SpvOpCompositeExtract, {tFloat, origPrimF, p2, 1}); // p2.y
                     E(SpvOpBitcast, {tInt, origPrimI, origPrimF});
+#if SPIRV_RQ_FORCE_PRIM0
+                    E(SpvOpStore, {tvHitPrim, c0}); // DEBUG: force primIdx=0
+#else
                     E(SpvOpStore, {tvHitPrim, origPrimI}); // ORIGINAL primitive index
+#endif
                     E(SpvOpStore, {tvHitType, cu1});
                     E(SpvOpStore, {tvHitInst, instIdx}); // record which instance was hit
+                    // Store actual front-face: effDet > 0 means front-facing
+                    // Store as uint (1=front, 0=back) for OpRayQueryGetFrontFace
+                    uint32_t hitFF = newId(), hitFFu = newId();
+                    E(SpvOpFOrdGreaterThan, {tBool, hitFF, effDet, cf0});
+                    spvEmit(out, SpvOpSelect, {tUint, hitFFu, hitFF, cu1, cu0});
+                    E(SpvOpStore, {tvHitFrontFace, hitFFu});
                     E(SpvOpBranch, {lHitEnd});
                     spvEmit(out, SpvOpLabel, {lHitEnd});
 
@@ -1703,6 +1822,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 }
                 // ni = skip (BLAS)
                 E(SpvOpStore, {tvNi, skipVal});
+#endif // !SPIRV_RQ_FORCE_LEAF_HIT
                 E(SpvOpBranch, {lEndIf});
 
                 // --- BLAS INTERNAL: Ray-AABB test (local-space) ---
@@ -1751,18 +1871,22 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                     E(SpvOpExtInst, {tFloat, tF_xy, glslExtId, (uint32_t)GLSLstd450FMin, mx_x, mx_y});
                     E(SpvOpExtInst, {tFloat, tF,    glslExtId, (uint32_t)GLSLstd450FMin, tF_xy, mx_z});
 
-                    uint32_t curBestI = newId();
-                    E(SpvOpLoad, {tFloat, curBestI, tvBestT});
-                    uint32_t c1_ = newId(), c2_ = newId(), c3_ = newId(), aabbHit = newId(), ah2 = newId();
+                    // BLAS AABB: geometric intersection only (tN <= tF && tF > 0)
+                    // bestT culling omitted — world/local space mismatch under scaling
+                    uint32_t c1_ = newId(), c2_ = newId(), aabbHit = newId(), ah2 = newId();
                     E(SpvOpFOrdLessThanEqual, {tBool, c1_, tN, tF});
                     E(SpvOpFOrdGreaterThan,   {tBool, c2_, tF, cf0});
-                    E(SpvOpFOrdLessThan,      {tBool, c3_, tN, curBestI});
                     spvEmit(out, (uint16_t)167, {tBool, aabbHit, c1_, c2_});
-                    spvEmit(out, (uint16_t)167, {tBool, ah2, aabbHit, c3_});
+                    E(SpvOpCopyObject, {tBool, ah2, aabbHit});
 
                     uint32_t niPlus1 = newId(), newNi = newId();
                     E(SpvOpIAdd, {tInt, niPlus1, niVal, c1});
+#if SPIRV_RQ_FORCE_BLAS_AABB
+                    // DEBUG: Force BLAS AABB test to always pass — always descend to left child
+                    E(SpvOpCopyObject, {tInt, newNi, niPlus1});
+#else
                     E(SpvOpSelect, {tInt, newNi, ah2, niPlus1, skipVal});
+#endif
                     E(SpvOpStore, {tvNi, newNi});
                 }
                 E(SpvOpBranch, {lEndIf});
@@ -1783,7 +1907,11 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 spvEmit(out, SpvOpLabel, {lMerge});
                 // End of BLAS inner loop
 
-                // TLAS leaf done → ni = skip (continue TLAS)
+                // End of mask-pass path → branch to mask merge
+                E(SpvOpBranch, {maskMergeLbl});
+
+                spvEmit(out, SpvOpLabel, {maskMergeLbl});
+                // TLAS leaf done → ni = skip (continue TLAS, regardless of mask result)
                 E(SpvOpStore, {tvTlasNi, tlSkipVal});
 #endif // !SPIRV_RQ_TLAS_ONLY
             }
@@ -1872,6 +2000,10 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             // --- TLAS Loop merge: store results to struct ---
             spvEmit(out, SpvOpLabel, {tlMerge});
             {
+#if SPIRV_RQ_FORCE_HITTYPE1
+                // DEBUG: Force hitType=1 for ALL rays (even misses)
+                E(SpvOpStore, {tvHitType, cu1});
+#endif
                 // Only overwrite struct members if we actually found a hit.
                 // On miss, keep the initial values (hitT=1e30, hitType=0, etc.)
                 uint32_t finalType = newId();
@@ -1885,24 +2017,44 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 {
                     // Store bestT → member 4 (hitT)
                     uint32_t finalT = newId(), pa4 = newId();
+#if SPIRV_RQ_FORCE_HITT
+                    // DEBUG: force hitT to 50.0
+                    spvEmit(out, SpvOpCopyObject, {tFloat, finalT, cf_50});
+#else
                     E(SpvOpLoad, {tFloat, finalT, tvBestT});
+#endif
                     E(SpvOpAccessChain, {pFloat, pa4, sv, c4});
                     E(SpvOpStore, {pa4, finalT});
                     // Store hitU, hitV → member 5 (bary as vec2)
                     uint32_t finalU = newId(), finalV = newId(), bary = newId(), pa5 = newId();
                     E(SpvOpLoad, {tFloat, finalU, tvHitU});
                     E(SpvOpLoad, {tFloat, finalV, tvHitV});
+#if SPIRV_RQ_FORCE_BARY
+                    // DEBUG: force barycentrics to (0.33, 0.33)
+                    E(SpvOpCompositeConstruct, {tVec2, bary, cf_third, cf_third});
+#else
                     E(SpvOpCompositeConstruct, {tVec2, bary, finalU, finalV});
+#endif
                     E(SpvOpAccessChain, {pVec2, pa5, sv, c5});
                     E(SpvOpStore, {pa5, bary});
                     // Store hitPrim → member 6
                     uint32_t finalPrim = newId(), pa6 = newId();
+#if SPIRV_RQ_FORCE_PRIM0
+                    // DEBUG: force primIdx=0 in committed store (regardless of BLAS hit)
+                    spvEmit(out, SpvOpCopyObject, {tInt, finalPrim, c0});
+#else
                     E(SpvOpLoad, {tInt, finalPrim, tvHitPrim});
+#endif
                     E(SpvOpAccessChain, {pInt, pa6, sv, c6});
                     E(SpvOpStore, {pa6, finalPrim});
                     // Store hitInst → member 7
                     uint32_t finalInst = newId(), pa7 = newId();
+#if SPIRV_RQ_FORCE_INST0
+                    // DEBUG: force instIdx to 0 (first sorted instance)
+                    spvEmit(out, SpvOpCopyObject, {tInt, finalInst, c0});
+#else
                     E(SpvOpLoad, {tInt, finalInst, tvHitInst});
+#endif
                     E(SpvOpAccessChain, {pInt, pa7, sv, c7});
                     E(SpvOpStore, {pa7, finalInst});
                     // Store hitType → member 8 (uint)
@@ -2002,15 +2154,16 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             skip = true;
         }
         if (op == SpvOpRQGetFrontFace && wc >= 5) {
-            // Front face = det > 0 in Möller-Trumbore
-            // For now return true (front face) — would need to store det sign per-hit
-            spvEmit(out, SpvOpCopyObject, {tBool, code[pos+2], cTrue});
+            // Return actual front-face stored during traversal (effDet > 0)
+            // tvHitFrontFace stores uint: 1=front, 0=back
+            uint32_t ffVal = newId();
+            spvEmit(out, SpvOpLoad, {tUint, ffVal, tvHitFrontFace});
+            spvEmit(out, (uint16_t)171/*INotEqual*/, {tBool, code[pos+2], ffVal, cu0});
             skip = true;
         }
-        // Instance metadata: load from instance SSBO vec4[8] = (customIdx, sbtOffset, mask, flags)
+        // Instance metadata: load from instance SSBO vec4[8] = (customIdx, sbtOffset, origInstIdx, packed_mask_flags)
         // instBase = hitInstID * 9 + 8
-        if ((op == SpvOpRQGetInstCustomIdx || op == SpvOpRQGetSBTOffset ||
-             op == SpvOpRQGetRayFlags) && wc >= 4) {
+        if ((op == SpvOpRQGetInstCustomIdx || op == SpvOpRQGetSBTOffset) && wc >= 4) {
             uint32_t resType = code[pos+1];
             uint32_t resId   = code[pos+2];
             // Determine which RQ variable (wc varies: 4 for no-committed, 5 for committed)
@@ -2028,10 +2181,8 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             uint32_t pM = newId(), metaV = newId();
             spvEmit(out, SpvOpAccessChain, {pVec4SB, pM, vInst, c0, metaIdx});
             spvEmit(out, SpvOpLoad, {tVec4, metaV, pM});
-            // Extract component: .x=customIdx, .y=sbtOffset, .z=mask (used as flags)
-            int comp = 0;
-            if (op == SpvOpRQGetSBTOffset) comp = 1;
-            else if (op == SpvOpRQGetRayFlags) comp = 3; // flags
+            // Extract component: .x=customIdx, .y=sbtOffset
+            int comp = (op == SpvOpRQGetSBTOffset) ? 1 : 0;
             uint32_t valF = newId();
             spvEmit(out, SpvOpCompositeExtract, {tFloat, valF, metaV, (uint32_t)comp});
             // Convert float→int/uint
@@ -2040,6 +2191,13 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             } else {
                 spvEmit(out, SpvOpConvertFToS, {tInt, resId, valF});
             }
+            skip = true;
+        }
+        // RayFlags: return the ray flags stored during rayQueryInitialize (NOT from instance SSBO)
+        if (op == SpvOpRQGetRayFlags && wc >= 4) {
+            uint32_t resType = code[pos+1];
+            uint32_t resId   = code[pos+2];
+            spvEmit(out, SpvOpLoad, {tUint, resId, tvRayFlags});
             skip = true;
         }
         // GeomIndex: always 0 (each BLAS has 1 geometry in Q2RTX)
@@ -2072,19 +2230,70 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             spvEmit(out, SpvOpCopyObject, {tBool, code[pos+2], cTrue});
             skip = true;
         }
-        // Obj2World / World2Obj — return identity matrix (stub)
-        // Full implementation would load from instance SSBO using hitInstID.
-        // Result type is mat4x3 declared by the shader; we emit a CompositeConstruct.
+        // Obj2World / World2Obj — load actual transform from instance SSBO
+        // SSBO layout per instance (9 vec4s): vec4[0-2]=Obj2World, vec4[3-5]=World2Obj
+        // Result type is mat4x3 (4 columns of vec3). SSBO stores row-major; transpose to columns.
         if ((op == SpvOpRQGetObj2World || op == SpvOpRQGetWorld2Obj) && wc >= 5) {
             uint32_t resType = code[pos+1];
             uint32_t resId   = code[pos+2];
-            // Construct 4 vec3 columns forming identity: col0=(1,0,0) col1=(0,1,0) col2=(0,0,1) col3=(0,0,0)
-            uint32_t v0 = newId(), v1 = newId(), v2 = newId(), v3 = newId();
-            spvEmit(out, SpvOpCompositeConstruct, {tVec3, v0, cf1, cf0, cf0});
-            spvEmit(out, SpvOpCompositeConstruct, {tVec3, v1, cf0, cf1, cf0});
-            spvEmit(out, SpvOpCompositeConstruct, {tVec3, v2, cf0, cf0, cf1});
-            spvEmit(out, SpvOpCompositeConstruct, {tVec3, v3, cf0, cf0, cf0});
-            spvEmit(out, SpvOpCompositeConstruct, {resType, resId, v0, v1, v2, v3});
+            uint32_t rqVar   = code[pos+3];
+            uint32_t sv = rqMap.count(rqVar) ? rqMap[rqVar] : rqVar;
+
+            // Load hitInstID from RQ struct member 7
+            uint32_t acHI = newId(), hitI = newId();
+            spvEmit(out, SpvOpAccessChain, {pInt, acHI, sv, c7});
+            spvEmit(out, SpvOpLoad, {tInt, hitI, acHI});
+
+            // instBase = hitInstID * 9
+            uint32_t instBase = newId();
+            spvEmit(out, SpvOpIMul, {tInt, instBase, hitI, c9});
+
+            // Row offsets: Obj2World=0,1,2  World2Obj=3,4,5
+            uint32_t rOff0 = (op == SpvOpRQGetObj2World) ? c0 : c3;
+            uint32_t rOff1 = (op == SpvOpRQGetObj2World) ? c1 : c4;
+            uint32_t rOff2 = (op == SpvOpRQGetObj2World) ? c2 : c5;
+
+            // Load 3 vec4 rows from instance SSBO
+            uint32_t r0i = newId(), pr0 = newId(), r0 = newId();
+            spvEmit(out, SpvOpIAdd, {tInt, r0i, instBase, rOff0});
+            spvEmit(out, SpvOpAccessChain, {pVec4SB, pr0, vInst, c0, r0i});
+            spvEmit(out, SpvOpLoad, {tVec4, r0, pr0});
+
+            uint32_t r1i = newId(), pr1 = newId(), r1 = newId();
+            spvEmit(out, SpvOpIAdd, {tInt, r1i, instBase, rOff1});
+            spvEmit(out, SpvOpAccessChain, {pVec4SB, pr1, vInst, c0, r1i});
+            spvEmit(out, SpvOpLoad, {tVec4, r1, pr1});
+
+            uint32_t r2i = newId(), pr2 = newId(), r2 = newId();
+            spvEmit(out, SpvOpIAdd, {tInt, r2i, instBase, rOff2});
+            spvEmit(out, SpvOpAccessChain, {pVec4SB, pr2, vInst, c0, r2i});
+            spvEmit(out, SpvOpLoad, {tVec4, r2, pr2});
+
+            // Extract all 12 components
+            uint32_t r0x=newId(), r0y=newId(), r0z=newId(), r0w=newId();
+            spvEmit(out, SpvOpCompositeExtract, {tFloat, r0x, r0, 0});
+            spvEmit(out, SpvOpCompositeExtract, {tFloat, r0y, r0, 1});
+            spvEmit(out, SpvOpCompositeExtract, {tFloat, r0z, r0, 2});
+            spvEmit(out, SpvOpCompositeExtract, {tFloat, r0w, r0, 3});
+            uint32_t r1x=newId(), r1y=newId(), r1z=newId(), r1w=newId();
+            spvEmit(out, SpvOpCompositeExtract, {tFloat, r1x, r1, 0});
+            spvEmit(out, SpvOpCompositeExtract, {tFloat, r1y, r1, 1});
+            spvEmit(out, SpvOpCompositeExtract, {tFloat, r1z, r1, 2});
+            spvEmit(out, SpvOpCompositeExtract, {tFloat, r1w, r1, 3});
+            uint32_t r2x=newId(), r2y=newId(), r2z=newId(), r2w=newId();
+            spvEmit(out, SpvOpCompositeExtract, {tFloat, r2x, r2, 0});
+            spvEmit(out, SpvOpCompositeExtract, {tFloat, r2y, r2, 1});
+            spvEmit(out, SpvOpCompositeExtract, {tFloat, r2z, r2, 2});
+            spvEmit(out, SpvOpCompositeExtract, {tFloat, r2w, r2, 3});
+
+            // Transpose row-major → column-major for mat4x3 (4 columns of vec3)
+            uint32_t col0=newId(), col1=newId(), col2=newId(), col3=newId();
+            spvEmit(out, SpvOpCompositeConstruct, {tVec3, col0, r0x, r1x, r2x});
+            spvEmit(out, SpvOpCompositeConstruct, {tVec3, col1, r0y, r1y, r2y});
+            spvEmit(out, SpvOpCompositeConstruct, {tVec3, col2, r0z, r1z, r2z});
+            spvEmit(out, SpvOpCompositeConstruct, {tVec3, col3, r0w, r1w, r2w});
+
+            spvEmit(out, SpvOpCompositeConstruct, {resType, resId, col0, col1, col2, col3});
             skip = true;
         }
         } // end of RQ operations rewrite block
