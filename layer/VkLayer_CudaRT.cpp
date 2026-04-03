@@ -56,6 +56,15 @@ extern "C" {
     void rasterboost_postfx_destroy();
 }
 
+// RasterBoost SLSS frame generation (rasterboost_framegen.cu)
+extern "C" {
+    int   rasterboost_framegen_init(uint32_t width, uint32_t height);
+    int   rasterboost_framegen_submit(void* frameRGBA8);
+    void* rasterboost_framegen_get_synth();
+    void  rasterboost_framegen_sync();
+    void  rasterboost_framegen_destroy();
+}
+
 // ═══════════════════════════════════════════
 // Dispatch table — stores the next layer's function pointers
 // ═══════════════════════════════════════════

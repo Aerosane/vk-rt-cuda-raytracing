@@ -21,10 +21,15 @@ echo "=== Building RasterBoost post-FX engine ==="
   -Wno-deprecated-gpu-targets \
   rasterboost_postfx.cu -o rasterboost_postfx.o
 
+echo "=== Building RasterBoost frame generation ==="
+/usr/local/cuda/bin/nvcc -c -O3 -arch=sm_70 --compiler-options=-fPIC \
+  -Wno-deprecated-gpu-targets \
+  rasterboost_framegen.cu -o rasterboost_framegen.o
+
 echo "=== Building VkLayer_CudaRT.so ==="
 g++ -shared -fPIC -fvisibility=hidden -O2 -std=c++17 -Wall \
   -I/usr/local/cuda/include \
-  VkLayer_CudaRT.cpp cuda_bvh_backend.o rasterboost_upscale.o rasterboost_postfx.o \
+  VkLayer_CudaRT.cpp cuda_bvh_backend.o rasterboost_upscale.o rasterboost_postfx.o rasterboost_framegen.o \
   -L/usr/local/cuda/lib64 -lcudart \
   -L/usr/lib/x86_64-linux-gnu -lnvinfer \
   -o libVkLayer_CudaRT.so
