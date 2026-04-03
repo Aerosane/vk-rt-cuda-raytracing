@@ -560,6 +560,11 @@ struct BVH2Interop {
     int numTlasNodes;
     int numInstances;
     uint64_t tlasGen;            // which TLAS generation is currently uploaded
+    // CUDA mirror pointers for IR executor
+    void* cudaNodes;
+    void* cudaTris;
+    void* cudaTlasNodes;
+    void* cudaInstances;
 };
 static BVH2Interop g_bvh2 = {};
 
@@ -3244,6 +3249,7 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
     VkDeviceSize instancesSize = 0;
     int numTlasNodes = 0;
     int numInst = (int)g_instances.size();
+    std::vector<float> instPacked; // hoisted for CUDA mirror access
 
     if (g_tlasBVH && numInst > 0) {
         // Get TLAS BVH2 stackless data
@@ -3261,7 +3267,7 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
 
         // Pack InstanceGPU into vec4 array: 9 vec4s per instance = 36 floats = 144 bytes
         instancesSize = (VkDeviceSize)numInst * 9 * 4 * sizeof(float);
-        std::vector<float> instPacked(numInst * 36);
+        instPacked.resize(numInst * 36);
         for (int i = 0; i < numInst; i++) {
             // Use TLAS ordering if available (must match TLAS leaf indices)
             int origIdx = (g_fastTLASOrdered && i < numInst) ? g_fastTLASOrdered[i] : i;
@@ -3383,6 +3389,41 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
     g_bvh2.descSetIdx = 4; // default — actual bind index comes from per-pipeline bvhDescSet
     g_bvh2.tlasGen = g_tlasGeneration;
     g_bvh2.ready = true;
+
+    // CUDA mirror for IR executor (only when CUDA_RT_IR=1)
+    if (g_useIR > 0) {
+        // Free old CUDA buffers
+        if (g_bvh2.cudaNodes)     { cudaFree(g_bvh2.cudaNodes);     g_bvh2.cudaNodes = nullptr; }
+        if (g_bvh2.cudaTris)      { cudaFree(g_bvh2.cudaTris);      g_bvh2.cudaTris = nullptr; }
+        if (g_bvh2.cudaTlasNodes) { cudaFree(g_bvh2.cudaTlasNodes); g_bvh2.cudaTlasNodes = nullptr; }
+        if (g_bvh2.cudaInstances) { cudaFree(g_bvh2.cudaInstances); g_bvh2.cudaInstances = nullptr; }
+
+        // Upload BLAS nodes + tris
+        if (cudaMalloc(&g_bvh2.cudaNodes, nodesSize) == cudaSuccess)
+            cudaMemcpy(g_bvh2.cudaNodes, allNodes.data(), nodesSize, cudaMemcpyHostToDevice);
+        if (cudaMalloc(&g_bvh2.cudaTris, trisSize) == cudaSuccess)
+            cudaMemcpy(g_bvh2.cudaTris, allTris.data(), trisSize, cudaMemcpyHostToDevice);
+
+        // Upload TLAS nodes + instances (if present)
+        if (tlasNodesSize > 0) {
+            uint32_t* tlasNodeData = nullptr;
+            cudaBVH_getStacklessBVH2(g_tlasBVH, &tlasNodeData);
+            if (tlasNodeData && cudaMalloc(&g_bvh2.cudaTlasNodes, tlasNodesSize) == cudaSuccess)
+                cudaMemcpy(g_bvh2.cudaTlasNodes, tlasNodeData, tlasNodesSize, cudaMemcpyHostToDevice);
+        }
+        if (instancesSize > 0 && !instPacked.empty()) {
+            if (cudaMalloc(&g_bvh2.cudaInstances, instancesSize) == cudaSuccess)
+                cudaMemcpy(g_bvh2.cudaInstances, instPacked.data(), instancesSize, cudaMemcpyHostToDevice);
+        }
+
+        // Update IR executor scene pointers
+        ir_exec_set_scene(g_bvh2.cudaNodes, totalNodes,
+                          g_bvh2.cudaTris,
+                          g_bvh2.cudaTlasNodes, numTlasNodes,
+                          g_bvh2.cudaInstances, numInst);
+        LOG("[BVH2] [IR] CUDA mirror: nodes=%p tris=%p tlas=%p inst=%p",
+            g_bvh2.cudaNodes, g_bvh2.cudaTris, g_bvh2.cudaTlasNodes, g_bvh2.cudaInstances);
+    }
     LOG("[BVH2] Uploaded: %d BLAS nodes (%.1f KB), %d tri-vec4s (%.1f KB), %d TLAS nodes, %d instances → descriptor set %u",
         totalNodes, nodesSize/1024.f, totalTriVec4s, trisSize/1024.f, numTlasNodes, numInst, g_bvh2.descSetIdx);
     return true;
