@@ -32,6 +32,7 @@
 #include <mutex>
 #include <chrono>
 #include <algorithm>
+#include <atomic>
 #include <time.h>
 
 // RasterBoost upscale engine (rasterboost_upscale.cu)
@@ -320,6 +321,9 @@ static void rasterBoostInit() {
         }
     }
 }
+
+// Forward declarations for init functions defined after LOG macro
+static void drawBatchInit();
 
 // ═══════════════════════════════════════════
 // Render pass profiling: GPU timestamps per render pass
@@ -988,6 +992,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
     disp.DestroySwapchainKHR = (PFN_vkDestroySwapchainKHR)nextGDPA(*pDevice, "vkDestroySwapchainKHR");
     disp.GetSwapchainImagesKHR = (PFN_vkGetSwapchainImagesKHR)nextGDPA(*pDevice, "vkGetSwapchainImagesKHR");
     rasterBoostInit();  // Read RASTER_BOOST_SCALE env var
+    drawBatchInit();    // Read RASTER_BOOST_BATCH env var
     disp.device = *pDevice;
     disp.physicalDevice = gpu;
     // Query and store memory properties for staging buffer allocation
@@ -4796,6 +4801,65 @@ static thread_local uint32_t g_logRPIdx = 0;
 static uint64_t g_drawCountFrame = 0;
 static uint64_t g_logFrame = 0;
 
+// ═══════════════════════════════════════════
+// RasterBoost Phase 3: Draw call batching state
+// Accumulates consecutive CmdDrawIndexed calls for potential MDI merge
+// ═══════════════════════════════════════════
+struct DrawBatchState {
+    bool     enabled;
+    // VkDrawIndexedIndirectCommand = { indexCount, instanceCount, firstIndex, vertexOffset, firstInstance }
+    struct DrawCmd {
+        uint32_t indexCount;
+        uint32_t instanceCount;
+        uint32_t firstIndex;
+        int32_t  vertexOffset;
+        uint32_t firstInstance;
+    };
+    std::vector<DrawCmd> pending;
+    VkPipeline lastPipeline;      // Pipeline state when draws were recorded
+    uint32_t   batchedDraws;      // Total draws batched this frame
+    uint32_t   savedDraws;        // Total draw calls saved via batching
+    VkBuffer   indirectBuf;       // GPU buffer for indirect draw commands
+    VkDeviceMemory indirectMem;
+    VkDeviceSize indirectBufSize;
+    bool       bufReady;
+};
+static thread_local DrawBatchState g_drawBatch = {};
+static std::atomic<uint64_t> g_totalBatchedDraws{0};
+static std::atomic<uint64_t> g_totalSavedDraws{0};
+
+static void drawBatchInit() {
+    const char* env = getenv("RASTER_BOOST_BATCH");
+    g_drawBatch.enabled = (env && atoi(env) > 0);
+    if (g_drawBatch.enabled) {
+        fprintf(stderr, "[CudaRT] [RasterBoost] Draw call batching enabled\n");
+    }
+}
+
+// Flush accumulated draws as a single MDI call (or individual if only 1)
+static void drawBatchFlush(VkCommandBuffer cmdBuf, DeviceDispatch& disp) {
+    if (g_drawBatch.pending.empty()) return;
+
+    if (g_drawBatch.pending.size() == 1) {
+        // Single draw — emit directly, no batching overhead
+        auto& d = g_drawBatch.pending[0];
+        disp.CmdDrawIndexed(cmdBuf, d.indexCount, d.instanceCount,
+                            d.firstIndex, d.vertexOffset, d.firstInstance);
+    } else if (g_drawBatch.pending.size() >= 2) {
+        // Multiple draws — merge into CmdDrawIndexedIndirect if buffer available
+        // For now, emit individually but track savings potential
+        for (auto& d : g_drawBatch.pending) {
+            disp.CmdDrawIndexed(cmdBuf, d.indexCount, d.instanceCount,
+                                d.firstIndex, d.vertexOffset, d.firstInstance);
+        }
+        // Track statistics
+        g_drawBatch.batchedDraws += (uint32_t)g_drawBatch.pending.size();
+        // When indirect buffer is allocated, this becomes:
+        // Upload pending to indirectBuf, emit single CmdDrawIndexedIndirect
+    }
+    g_drawBatch.pending.clear();
+}
+
 static VKAPI_ATTR void VKAPI_CALL layer_CmdBeginRenderPass(
     VkCommandBuffer cmdBuf,
     const VkRenderPassBeginInfo* pRenderPassBegin,
@@ -4900,6 +4964,13 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndexed(
     static int rpSkip = -1;
     if (rpSkip < 0) { const char* e = getenv("CUDA_RT_SKIP_RP"); rpSkip = e ? atoi(e) : -1; }
     if (rpSkip >= 0 && g_currentRP == (uint32_t)rpSkip) return;
+
+    // RasterBoost: accumulate draws for batching when enabled
+    if (g_drawBatch.enabled && g_currentRP != UINT32_MAX) {
+        g_drawBatch.pending.push_back({indexCount, instanceCount, firstIndex, vertexOffset, firstInstance});
+        return;  // Deferred — will flush at pipeline change, RP end, or batch limit
+    }
+
     disp.CmdDrawIndexed(cmdBuf, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
 }
 
@@ -5077,6 +5148,11 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdEndRenderPass(
         g_profile.queryIdx += 1;
     }
 
+    // RasterBoost: flush pending draw batch before ending render pass
+    if (g_drawBatch.enabled && !g_drawBatch.pending.empty()) {
+        drawBatchFlush(cmdBuf, disp);
+    }
+
     disp.CmdEndRenderPass(cmdBuf);
 
     // Write GPU timestamp after render pass
@@ -5120,6 +5196,14 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindPipeline(
 {
     if (bindPoint == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR) [[unlikely]] {
         return; // Don't forward — we handle RT entirely
+    }
+
+    // RasterBoost: flush pending draw batch on pipeline change
+    if (g_drawBatch.enabled && bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS &&
+        !g_drawBatch.pending.empty()) {
+        void* flushKey = getKey(cmdBuf);
+        auto& flushDisp = g_deviceMap[flushKey];
+        drawBatchFlush(cmdBuf, flushDisp);
     }
     // RP2 diagnostic: log graphics pipeline binds
     static uint64_t rp2BindLog = 0;
