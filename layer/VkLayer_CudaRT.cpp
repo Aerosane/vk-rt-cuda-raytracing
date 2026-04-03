@@ -18,6 +18,7 @@
 #include "cuda_bvh_backend.h"
 #include <cuda_runtime.h>
 #include "spirv_ray_query_rewriter.h"
+#include "rt_ir_lower.h"
 #include "shaders/bvh4_trace_spv.h"
 #include "shaders/bvh2_stackless_spv.h"
 
@@ -1731,6 +1732,11 @@ struct RQShaderInfo {
 static std::unordered_map<uint64_t, RQShaderInfo> g_rqShaders;
 static std::mutex g_rqShaderMutex;
 
+// IR lowered programs: shader module handle → IRProgram (when CUDA_RT_IR=1)
+static std::unordered_map<uint64_t, rt_ir::Program> g_irPrograms;
+static std::mutex g_irProgramMutex;
+static int g_useIR = -1; // -1=unchecked, 0=off, 1=on
+
 // Track pipeline layouts: Key = VkPipelineLayout handle, Value = set layouts used
 struct PipelineLayoutInfo {
     std::vector<VkDescriptorSetLayout> setLayouts;
@@ -1773,6 +1779,21 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateShaderModule(
     // Scan for ray query or ray tracing ops for debugging
     bool hasRayQuery = spirvHasRayQuery(spirvCode, numWords);
     fprintf(stderr, "[CudaRT]   shader %zu words, hasRayQuery=%d\n", numWords, (int)hasRayQuery);
+
+    // IR lowering: analyze SPIR-V and build IR program (parallel to SPIR-V rewrite)
+    if (g_useIR < 0) {
+        const char* e = getenv("CUDA_RT_IR");
+        g_useIR = (e && atoi(e)) ? 1 : 0;
+    }
+    rt_ir::Program irProg;
+    bool hasIR = false;
+    if (g_useIR && hasRayQuery) {
+        hasIR = rt_ir::spirvToIR(spirvCode, numWords, irProg);
+        if (hasIR) {
+            fprintf(stderr, "[CudaRT] [IR] Lowered SPIR-V → %u IR nodes, %u slots\n",
+                    irProg.nodeCount, irProg.slotCount);
+        }
+    }
 
     // Try to rewrite ray query ops
     SpirvRewriteResult rw;
@@ -1822,6 +1843,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateShaderModule(
             uint64_t handle = (uint64_t)*pShaderModule;
             g_rqShaders[handle] = {rw.bvhDescSet, rw.bvhNodesBinding, rw.bvhTrisBinding};
             LOG("  → Registered rewritten shader %lx (set=%d)", handle, rw.bvhDescSet);
+            // Store IR program if lowering succeeded
+            if (hasIR) {
+                std::lock_guard<std::mutex> irLock(g_irProgramMutex);
+                g_irPrograms[handle] = irProg;
+                fprintf(stderr, "[CudaRT] [IR] Stored IR program for shader %lx (%u nodes)\n",
+                        handle, irProg.nodeCount);
+            }
         } else {
             LOG("  → Rewritten shader FAILED to compile (err=%d), falling back to original", res);
             res = disp.CreateShaderModule(device, pCreateInfo, pAllocator, pShaderModule);
