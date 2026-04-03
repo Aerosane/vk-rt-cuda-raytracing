@@ -144,6 +144,9 @@ struct DeviceDispatch {
     PFN_vkQueueSubmit2KHR QueueSubmit2KHR;
     PFN_vkQueueWaitIdle QueueWaitIdle;
     PFN_vkQueuePresentKHR QueuePresentKHR;
+    PFN_vkCreateSwapchainKHR CreateSwapchainKHR;
+    PFN_vkDestroySwapchainKHR DestroySwapchainKHR;
+    PFN_vkGetSwapchainImagesKHR GetSwapchainImagesKHR;
 
     // Stored handles
     VkDevice device;
@@ -282,6 +285,31 @@ struct TrackedImage {
     VkFormat format;
 };
 static std::unordered_map<uint64_t, TrackedImage> g_storageImages;  // key: VkImage
+
+// ═══════════════════════════════════════════
+// RasterBoost: Resolution substitution state
+// Env: RASTER_BOOST_SCALE=0.5 → render at 50% res, upscale at present
+// ═══════════════════════════════════════════
+struct RasterBoostState {
+    float    scale;            // 0.0 = disabled, 0.5 = half res, etc.
+    uint32_t outputW, outputH; // Swapchain (display) resolution
+    uint32_t renderW, renderH; // Internal render resolution
+    bool     active;
+    uint32_t scaledImages;     // count of images we downscaled
+    VkDevice device;
+};
+static RasterBoostState g_rasterBoost = {};
+
+static void rasterBoostInit() {
+    const char* env = getenv("RASTER_BOOST_SCALE");
+    if (env) {
+        g_rasterBoost.scale = atof(env);
+        if (g_rasterBoost.scale > 0.0f && g_rasterBoost.scale < 1.0f) {
+            g_rasterBoost.active = true;
+            fprintf(stderr, "[CudaRT] [RasterBoost] Resolution scale: %.2f\n", g_rasterBoost.scale);
+        }
+    }
+}
 
 // ═══════════════════════════════════════════
 // Render pass profiling: GPU timestamps per render pass
@@ -909,6 +937,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
         disp.QueueSubmit2KHR = (PFN_vkQueueSubmit2KHR)nextGDPA(*pDevice, "vkQueueSubmit2");
     LOAD_DEV(QueueWaitIdle);
     disp.QueuePresentKHR = (PFN_vkQueuePresentKHR)nextGDPA(*pDevice, "vkQueuePresentKHR");
+    disp.CreateSwapchainKHR = (PFN_vkCreateSwapchainKHR)nextGDPA(*pDevice, "vkCreateSwapchainKHR");
+    disp.DestroySwapchainKHR = (PFN_vkDestroySwapchainKHR)nextGDPA(*pDevice, "vkDestroySwapchainKHR");
+    disp.GetSwapchainImagesKHR = (PFN_vkGetSwapchainImagesKHR)nextGDPA(*pDevice, "vkGetSwapchainImagesKHR");
+    rasterBoostInit();  // Read RASTER_BOOST_SCALE env var
     disp.device = *pDevice;
     disp.physicalDevice = gpu;
     // Query and store memory properties for staging buffer allocation
@@ -1243,7 +1275,53 @@ static VKAPI_ATTR VkDeviceAddress VKAPI_CALL layer_GetBufferDeviceAddress(
 }
 
 // ═══════════════════════════════════════════
-// Intercepted: CreateImage — track storage images for CUDA output
+// RasterBoost: Intercept swapchain creation — record output resolution
+// ═══════════════════════════════════════════
+static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateSwapchainKHR(
+    VkDevice device, const VkSwapchainCreateInfoKHR* pCreateInfo,
+    const VkAllocationCallbacks* pAllocator, VkSwapchainKHR* pSwapchain)
+{
+    void* key = getKey(device);
+    auto& disp = g_deviceMap[key];
+
+    if (g_rasterBoost.active && pCreateInfo) {
+        g_rasterBoost.outputW = pCreateInfo->imageExtent.width;
+        g_rasterBoost.outputH = pCreateInfo->imageExtent.height;
+        g_rasterBoost.renderW = (uint32_t)(pCreateInfo->imageExtent.width * g_rasterBoost.scale);
+        g_rasterBoost.renderH = (uint32_t)(pCreateInfo->imageExtent.height * g_rasterBoost.scale);
+        // Align to 8 pixels (encoder/tensor alignment)
+        g_rasterBoost.renderW = (g_rasterBoost.renderW + 7u) & ~7u;
+        g_rasterBoost.renderH = (g_rasterBoost.renderH + 7u) & ~7u;
+        g_rasterBoost.device = device;
+        g_rasterBoost.scaledImages = 0;
+        LOG("[RasterBoost] Swapchain %ux%u → internal render %ux%u (scale=%.2f)",
+            g_rasterBoost.outputW, g_rasterBoost.outputH,
+            g_rasterBoost.renderW, g_rasterBoost.renderH,
+            g_rasterBoost.scale);
+    }
+
+    return disp.CreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);
+}
+
+// Helper: should this image be resolution-scaled?
+// Heuristic: color/depth attachments matching swapchain res, not 1D/3D/cube
+static bool rasterBoostShouldScale(const VkImageCreateInfo* ci) {
+    if (!g_rasterBoost.active || !g_rasterBoost.outputW) return false;
+    if (ci->imageType != VK_IMAGE_TYPE_2D) return false;
+    if (ci->extent.depth != 1) return false;
+    // Must be a render target (color or depth attachment)
+    if (!(ci->usage & (VK_IMAGE_USAGE_COLOR_ATTACHMENT_BIT |
+                       VK_IMAGE_USAGE_DEPTH_STENCIL_ATTACHMENT_BIT))) return false;
+    // Match swapchain dimensions (exact or within 1 pixel for odd resolutions)
+    uint32_t w = ci->extent.width, h = ci->extent.height;
+    if (w != g_rasterBoost.outputW || h != g_rasterBoost.outputH) return false;
+    // Don't scale tiny images, transfer-only, or swapchain images themselves
+    if (w <= 64 || h <= 64) return false;
+    return true;
+}
+
+// ═══════════════════════════════════════════
+// Intercepted: CreateImage — track storage images + RasterBoost resolution sub
 // ═══════════════════════════════════════════
 static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateImage(
     VkDevice device, const VkImageCreateInfo* pCreateInfo,
@@ -1251,6 +1329,24 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateImage(
 {
     void* key = getKey(device);
     auto& disp = g_deviceMap[key];
+
+    // RasterBoost: substitute resolution for render targets
+    if (rasterBoostShouldScale(pCreateInfo)) {
+        VkImageCreateInfo modified = *pCreateInfo;
+        modified.extent.width  = g_rasterBoost.renderW;
+        modified.extent.height = g_rasterBoost.renderH;
+        VkResult res = disp.CreateImage(device, &modified, pAllocator, pImage);
+        if (res == VK_SUCCESS) {
+            g_rasterBoost.scaledImages++;
+            LOG("[RasterBoost] Scaled image #%u: %ux%u → %ux%u fmt=%d img=0x%lx",
+                g_rasterBoost.scaledImages,
+                pCreateInfo->extent.width, pCreateInfo->extent.height,
+                modified.extent.width, modified.extent.height,
+                pCreateInfo->format, (uint64_t)*pImage);
+        }
+        return res;
+    }
+
     VkResult res = disp.CreateImage(device, pCreateInfo, pAllocator, pImage);
     if (res == VK_SUCCESS && (pCreateInfo->usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
         std::lock_guard<std::mutex> lock(g_lock);
@@ -5385,6 +5481,10 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetInstanceProcAddr(VkInst
         return (PFN_vkVoidFunction)layer_QueueSubmit2KHR;
     if (strcmp(pName, "vkQueuePresentKHR") == 0)
         return (PFN_vkVoidFunction)layer_QueuePresentKHR;
+    if (strcmp(pName, "vkCreateSwapchainKHR") == 0)
+        return (PFN_vkVoidFunction)layer_CreateSwapchainKHR;
+    INTERCEPT(CreateImage);
+    INTERCEPT(DestroyImage);
 
     // Debug: log Queue/Submit function lookups
     if (pName && strstr(pName, "Queue"))
@@ -5441,6 +5541,10 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetDeviceProcAddr(VkDevice
     // Image tracking for CUDA→VkImage interop
     INTERCEPT(CreateImage);
     INTERCEPT(DestroyImage);
+
+    // RasterBoost: swapchain intercept for resolution substitution
+    if (strcmp(pName, "vkCreateSwapchainKHR") == 0)
+        return (PFN_vkVoidFunction)layer_CreateSwapchainKHR;
 
     // Shader module interception for ray query rewriting
     INTERCEPT(CreateShaderModule);
