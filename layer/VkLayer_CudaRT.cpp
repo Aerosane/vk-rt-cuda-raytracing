@@ -4785,6 +4785,20 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateFramebuffer(
     auto& disp = g_deviceMap[key];
     auto fn = (PFN_vkCreateFramebuffer)disp.GetDeviceProcAddr(device, "vkCreateFramebuffer");
     if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+
+    // RasterBoost: scale framebuffer dimensions to match scaled images
+    VkFramebufferCreateInfo modCI;
+    bool scaled = false;
+    if (g_rasterBoost.active && g_rasterBoost.outputW &&
+        pCreateInfo->width == g_rasterBoost.outputW &&
+        pCreateInfo->height == g_rasterBoost.outputH) {
+        modCI = *pCreateInfo;
+        modCI.width  = g_rasterBoost.renderW;
+        modCI.height = g_rasterBoost.renderH;
+        pCreateInfo = &modCI;
+        scaled = true;
+    }
+
     VkResult res = fn(device, pCreateInfo, pAllocator, pFramebuffer);
     if (res == VK_SUCCESS && pFramebuffer && pCreateInfo &&
         !(pCreateInfo->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT)) {
@@ -4814,6 +4828,64 @@ static VKAPI_ATTR void VKAPI_CALL layer_DestroyFramebuffer(
     auto fn = (PFN_vkDestroyFramebuffer)g_deviceMap[key].GetDeviceProcAddr(device, "vkDestroyFramebuffer");
     if (fn) fn(device, fb, pAllocator);
 }
+
+// ═══════════════════════════════════════════
+// RasterBoost: Viewport/Scissor scaling — match internal render resolution
+// ═══════════════════════════════════════════
+static VKAPI_ATTR void VKAPI_CALL layer_CmdSetViewport(
+    VkCommandBuffer cmdBuf, uint32_t firstViewport, uint32_t viewportCount,
+    const VkViewport* pViewports)
+{
+    void* key = getKey(cmdBuf);
+    auto fn = (PFN_vkCmdSetViewport)g_deviceMap[key].GetDeviceProcAddr(
+        g_deviceMap[key].device, "vkCmdSetViewport");
+    if (!fn) return;
+
+    if (g_rasterBoost.active && g_rasterBoost.outputW && viewportCount > 0) {
+        std::vector<VkViewport> scaled(pViewports, pViewports + viewportCount);
+        float sx = (float)g_rasterBoost.renderW / g_rasterBoost.outputW;
+        float sy = (float)g_rasterBoost.renderH / g_rasterBoost.outputH;
+        for (auto& vp : scaled) {
+            if ((uint32_t)vp.width == g_rasterBoost.outputW &&
+                (uint32_t)vp.height == g_rasterBoost.outputH) {
+                vp.width  *= sx;
+                vp.height *= sy;
+            }
+        }
+        fn(cmdBuf, firstViewport, viewportCount, scaled.data());
+    } else {
+        fn(cmdBuf, firstViewport, viewportCount, pViewports);
+    }
+}
+
+static VKAPI_ATTR void VKAPI_CALL layer_CmdSetScissor(
+    VkCommandBuffer cmdBuf, uint32_t firstScissor, uint32_t scissorCount,
+    const VkRect2D* pScissors)
+{
+    void* key = getKey(cmdBuf);
+    auto fn = (PFN_vkCmdSetScissor)g_deviceMap[key].GetDeviceProcAddr(
+        g_deviceMap[key].device, "vkCmdSetScissor");
+    if (!fn) return;
+
+    if (g_rasterBoost.active && g_rasterBoost.outputW && scissorCount > 0) {
+        std::vector<VkRect2D> scaled(pScissors, pScissors + scissorCount);
+        float sx = (float)g_rasterBoost.renderW / g_rasterBoost.outputW;
+        float sy = (float)g_rasterBoost.renderH / g_rasterBoost.outputH;
+        for (auto& sc : scaled) {
+            if (sc.extent.width == g_rasterBoost.outputW &&
+                sc.extent.height == g_rasterBoost.outputH) {
+                sc.extent.width  = g_rasterBoost.renderW;
+                sc.extent.height = g_rasterBoost.renderH;
+                sc.offset.x = (int32_t)(sc.offset.x * sx);
+                sc.offset.y = (int32_t)(sc.offset.y * sy);
+            }
+        }
+        fn(cmdBuf, firstScissor, scissorCount, scaled.data());
+    } else {
+        fn(cmdBuf, firstScissor, scissorCount, pScissors);
+    }
+}
+
 // Draw call counting per render pass (diagnostic)
 static thread_local uint32_t g_currentRP = UINT32_MAX;
 static thread_local uint32_t g_drawsInRP[8] = {};
@@ -4952,7 +5024,17 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBeginRenderPass(
         }
     }
 
-    disp.CmdBeginRenderPass(cmdBuf, pRenderPassBegin, contents);
+    // RasterBoost: adjust renderArea to match scaled framebuffer
+    if (g_rasterBoost.active && g_rasterBoost.outputW &&
+        pRenderPassBegin->renderArea.extent.width == g_rasterBoost.outputW &&
+        pRenderPassBegin->renderArea.extent.height == g_rasterBoost.outputH) {
+        VkRenderPassBeginInfo modified = *pRenderPassBegin;
+        modified.renderArea.extent.width  = g_rasterBoost.renderW;
+        modified.renderArea.extent.height = g_rasterBoost.renderH;
+        disp.CmdBeginRenderPass(cmdBuf, &modified, contents);
+    } else {
+        disp.CmdBeginRenderPass(cmdBuf, pRenderPassBegin, contents);
+    }
 
     // Mid-RP timestamp: for RP2, add a BOTTOM_OF_PIPE timestamp right after begin
     // This tells us if the stall is at render pass begin (load/clear) or at end
@@ -5780,6 +5862,8 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetInstanceProcAddr(VkInst
     INTERCEPT(DestroyImageView);
     INTERCEPT(CreateFramebuffer);
     INTERCEPT(DestroyFramebuffer);
+    INTERCEPT(CmdSetViewport);
+    INTERCEPT(CmdSetScissor);
     INTERCEPT(CmdDrawIndexed);
     INTERCEPT(CmdDraw);
     INTERCEPT(CmdDrawIndexedIndirect);
@@ -5897,6 +5981,8 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetDeviceProcAddr(VkDevice
     INTERCEPT(DestroyImageView);
     INTERCEPT(CreateFramebuffer);
     INTERCEPT(DestroyFramebuffer);
+    INTERCEPT(CmdSetViewport);
+    INTERCEPT(CmdSetScissor);
     INTERCEPT(CmdDrawIndexed);
     INTERCEPT(CmdDraw);
     INTERCEPT(CmdDrawIndexedIndirect);
