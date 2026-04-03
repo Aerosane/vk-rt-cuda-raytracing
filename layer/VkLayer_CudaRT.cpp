@@ -65,6 +65,25 @@ extern "C" {
     void  rasterboost_framegen_destroy();
 }
 
+// VK_RT TensorRT denoiser (rt_denoise.cu)
+extern "C" {
+    int      rt_denoise_init(uint32_t width, uint32_t height, const char* plan_path);
+    float    rt_denoise_run(void* srcPtr, uint32_t width, uint32_t height);
+    int      rt_denoise_has_trt();
+    uint64_t rt_denoise_frame_count();
+    float    rt_denoise_last_latency();
+    void     rt_denoise_destroy();
+}
+
+// RT IR executor (rt_ir_exec.cu)
+struct float4;
+extern "C" {
+    int    ir_exec_init(uint32_t width, uint32_t height);
+    float  ir_exec_run(const void* hostProgram, float4* hostOutput);
+    float4* ir_exec_output_ptr();
+    void   ir_exec_shutdown();
+}
+
 // ═══════════════════════════════════════════
 // Dispatch table — stores the next layer's function pointers
 // ═══════════════════════════════════════════
@@ -118,6 +137,7 @@ struct DeviceDispatch {
     PFN_vkDestroyImage DestroyImage;
     PFN_vkBindImageMemory BindImageMemory;
     PFN_vkCmdCopyBufferToImage CmdCopyBufferToImage;
+    PFN_vkCmdCopyImageToBuffer CmdCopyImageToBuffer;
 
     // Compute pipeline (for Vulkan-native BVH4 tracing)
     PFN_vkCreateDescriptorSetLayout CreateDescriptorSetLayout;
@@ -314,8 +334,33 @@ static std::unordered_map<VkDeviceAddress, int> g_blasDevAddrToIdx;
 struct TrackedImage {
     uint32_t width, height;
     VkFormat format;
+    VkDeviceMemory memory;       // bound memory (from BindImageMemory)
+    VkDeviceSize   memOffset;    // offset within the allocation
+    VkDeviceSize   allocSize;    // total allocation size
 };
 static std::unordered_map<uint64_t, TrackedImage> g_storageImages;  // key: VkImage
+
+// RT denoiser: CUDA-imported staging buffer for in-place denoising
+static struct {
+    // CUDA side
+    void*                   cudaPtr;      // CUDA device pointer to staging buffer
+    cudaExternalMemory_t    extMem;       // external memory handle (keep alive)
+
+    // Vulkan staging infrastructure
+    VkBuffer                stagingBuf;
+    VkDeviceMemory          stagingMem;
+    VkDeviceSize            stagingSize;  // buffer size in bytes
+    VkCommandPool           cmdPool;
+    VkCommandBuffer         cmdBuf;
+    VkFence                 fence;
+    VkQueue                 queue;        // graphics queue for copy commands
+
+    // Target storage image info
+    uint64_t                targetImage;  // VkImage handle
+    uint32_t                width, height;
+    VkFormat                format;
+    bool                    ready;
+} g_denoiseTarget = {};
 
 // ═══════════════════════════════════════════
 // RasterBoost: Resolution substitution state
@@ -953,6 +998,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
     LOAD_DEV(DestroyImage);
     LOAD_DEV(BindImageMemory);
     LOAD_DEV(CmdCopyBufferToImage);
+    LOAD_DEV(CmdCopyImageToBuffer);
     // Compute pipeline (for Vulkan-native BVH4 tracing)
     LOAD_DEV(CreateDescriptorSetLayout);
     LOAD_DEV(DestroyDescriptorSetLayout);
@@ -1431,7 +1477,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateImage(
     if (res == VK_SUCCESS && (pCreateInfo->usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
         std::lock_guard<std::mutex> lock(g_lock);
         g_storageImages[(uint64_t)*pImage] = {
-            pCreateInfo->extent.width, pCreateInfo->extent.height, pCreateInfo->format
+            pCreateInfo->extent.width, pCreateInfo->extent.height, pCreateInfo->format,
+            VK_NULL_HANDLE, 0, 0
         };
         LOG("  [track] Storage image: %ux%u fmt=%d img=0x%lx",
             pCreateInfo->extent.width, pCreateInfo->extent.height,
@@ -5543,12 +5590,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
     static uint32_t presentCount = 0;
     presentCount++;
 
-    // Reset per-frame RQ dispatch counter
+    // Save dispatch count before reset (used by denoiser later)
+    uint32_t rqDispatchThisFrame = g_rqDispatchPerFrame;
     g_rqDispatchPerFrame = 0;
     if (presentCount <= 5 || presentCount % 100 == 0) {
-        LOG("[PRESENT] QueuePresent #%u (TLAS gen=%u addr=0x%llx)",
+        LOG("[PRESENT] QueuePresent #%u (TLAS gen=%u addr=0x%llx dispatches=%u)",
             presentCount, g_tlasGeneration,
-            (unsigned long long)g_pendingTLAS.instanceAddr);
+            (unsigned long long)g_pendingTLAS.instanceAddr, rqDispatchThisFrame);
     }
 
     // Per-frame TLAS rebuild: re-read instance transforms, rebuild TLAS BVH, re-upload SSBOs.
@@ -5683,6 +5731,268 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
         // which naturally overlaps with Vulkan graphics work on different HW queues.
         // The V100's 8 compute queues handle this without explicit Vulkan queue sync.
     }
+
+    // VK_RT: Neural denoiser — run TRT on RT storage images after GPU work completes
+    // Activated by CUDA_RT_DENOISE=1 env var
+    // Flow: copy storage image → staging buffer → CUDA denoise → staging buffer → copy back
+    {
+        static int denoiseMode = -1;
+        if (denoiseMode < 0) {
+            const char* e = getenv("CUDA_RT_DENOISE");
+            denoiseMode = (e && atoi(e) > 0) ? 1 : 0;
+        }
+        if (denoiseMode && g_bvh2.ready && rqDispatchThisFrame > 0) {
+            // Find the largest storage image (likely the RT output)
+            uint64_t bestImg = 0;
+            uint32_t bestArea = 0;
+            TrackedImage bestInfo = {};
+            {
+                // Count images per resolution to find the RT output set
+                // RT outputs come in sets (color, normals, depth, motion) at the same resolution
+                // Weight by area×count to prefer large render targets over small texture sets
+                std::unordered_map<uint64_t, uint32_t> resCounts;
+                std::lock_guard<std::mutex> lock(g_lock);
+                for (auto& [handle, info] : g_storageImages) {
+                    if (info.width < 128 || info.height < 128) continue;
+                    if (info.width == info.height) continue;
+                    uint32_t area = info.width * info.height;
+                    if (area < 307200) continue;  // min ~640×480
+                    uint64_t resKey = ((uint64_t)info.width << 32) | info.height;
+                    resCounts[resKey]++;
+                }
+                // Pick resolution with highest area × count score
+                uint64_t bestResKey = 0;
+                uint64_t bestScore = 0;
+                for (auto& [rk, cnt] : resCounts) {
+                    uint32_t w = (uint32_t)(rk >> 32), h = (uint32_t)(rk & 0xFFFFFFFF);
+                    uint64_t score = (uint64_t)w * h * cnt;
+                    if (score > bestScore) { bestScore = score; bestResKey = rk; }
+                }
+                if (bestResKey) {
+                    uint32_t targetW = (uint32_t)(bestResKey >> 32);
+                    uint32_t targetH = (uint32_t)(bestResKey & 0xFFFFFFFF);
+                    for (auto& [handle, info] : g_storageImages) {
+                        if (info.width == targetW && info.height == targetH) {
+                            bestImg = handle;
+                            bestInfo = info;
+                            bestArea = info.width * info.height;
+                            break;
+                        }
+                    }
+                }
+            }
+            if (bestImg && bestArea > 0) {
+                // Lazy init: create staging buffer, fd-export to CUDA, init TRT denoiser
+                if (!g_denoiseTarget.ready && !g_denoiseTarget.stagingBuf) {
+                    uint32_t w = bestInfo.width, h = bestInfo.height;
+                    // float4 per pixel = 16 bytes/pixel
+                    VkDeviceSize bufSize = (VkDeviceSize)w * h * 16;
+
+                    // 1) Create staging buffer with external memory support
+                    VkExternalMemoryBufferCreateInfo extBufInfo = {VK_STRUCTURE_TYPE_EXTERNAL_MEMORY_BUFFER_CREATE_INFO};
+                    extBufInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+                    VkBufferCreateInfo bufCI = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+                    bufCI.pNext = &extBufInfo;
+                    bufCI.size = bufSize;
+                    bufCI.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+
+                    if (pDisp->CreateBuffer(pDisp->device, &bufCI, nullptr, &g_denoiseTarget.stagingBuf) != VK_SUCCESS) {
+                        LOG("[VK_RT:Denoise] ERROR: CreateBuffer failed");
+                        g_denoiseTarget.stagingBuf = VK_NULL_HANDLE;
+                        goto denoise_done;
+                    }
+
+                    VkMemoryRequirements memReq;
+                    pDisp->GetBufferMemoryRequirements(pDisp->device, g_denoiseTarget.stagingBuf, &memReq);
+
+                    // Find device-local memory type
+                    uint32_t memTypeIdx = 0;
+                    {
+                        for (uint32_t i = 0; i < pDisp->memProps.memoryTypeCount; i++) {
+                            if ((memReq.memoryTypeBits & (1 << i)) &&
+                                (pDisp->memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                                memTypeIdx = i;
+                                break;
+                            }
+                        }
+                    }
+
+                    // Allocate with export flag
+                    VkExportMemoryAllocateInfo exportInfo = {VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
+                    exportInfo.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+                    VkMemoryAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+                    allocInfo.pNext = &exportInfo;
+                    allocInfo.allocationSize = memReq.size;
+                    allocInfo.memoryTypeIndex = memTypeIdx;
+
+                    if (pDisp->AllocateMemory(pDisp->device, &allocInfo, nullptr, &g_denoiseTarget.stagingMem) != VK_SUCCESS) {
+                        LOG("[VK_RT:Denoise] ERROR: AllocateMemory failed");
+                        goto denoise_done;
+                    }
+                    pDisp->BindBufferMemory(pDisp->device, g_denoiseTarget.stagingBuf, g_denoiseTarget.stagingMem, 0);
+                    g_denoiseTarget.stagingSize = memReq.size;
+
+                    // Fd-export to CUDA
+                    int fd = -1;
+                    VkMemoryGetFdInfoKHR fdGetInfo = {VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
+                    fdGetInfo.memory = g_denoiseTarget.stagingMem;
+                    fdGetInfo.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+                    if (pDisp->GetMemoryFdKHR && pDisp->GetMemoryFdKHR(pDisp->device, &fdGetInfo, &fd) == VK_SUCCESS && fd >= 0) {
+                        cudaExternalMemoryHandleDesc extDesc = {};
+                        extDesc.type = cudaExternalMemoryHandleTypeOpaqueFd;
+                        extDesc.handle.fd = fd;
+                        extDesc.size = memReq.size;
+                        if (cudaImportExternalMemory(&g_denoiseTarget.extMem, &extDesc) == cudaSuccess) {
+                            cudaExternalMemoryBufferDesc mapDesc = {};
+                            mapDesc.offset = 0;
+                            mapDesc.size = bufSize;
+                            if (cudaExternalMemoryGetMappedBuffer(&g_denoiseTarget.cudaPtr, g_denoiseTarget.extMem, &mapDesc) != cudaSuccess)
+                                g_denoiseTarget.cudaPtr = nullptr;
+                        }
+                    }
+
+                    // Create command pool + command buffer
+                    VkCommandPoolCreateInfo poolCI = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+                    poolCI.flags = VK_COMMAND_POOL_CREATE_RESET_COMMAND_BUFFER_BIT;
+                    poolCI.queueFamilyIndex = 0;
+                    pDisp->CreateCommandPool(pDisp->device, &poolCI, nullptr, &g_denoiseTarget.cmdPool);
+
+                    VkCommandBufferAllocateInfo cbAlloc = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+                    cbAlloc.commandPool = g_denoiseTarget.cmdPool;
+                    cbAlloc.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+                    cbAlloc.commandBufferCount = 1;
+                    pDisp->AllocateCommandBuffers(pDisp->device, &cbAlloc, &g_denoiseTarget.cmdBuf);
+
+                    // Create fence
+                    VkFenceCreateInfo fenceCI = {VK_STRUCTURE_TYPE_FENCE_CREATE_INFO};
+                    pDisp->CreateFence(pDisp->device, &fenceCI, nullptr, &g_denoiseTarget.fence);
+
+                    // Get graphics queue
+                    pDisp->GetDeviceQueue(pDisp->device, 0, 0, &g_denoiseTarget.queue);
+
+                    g_denoiseTarget.targetImage = bestImg;
+                    g_denoiseTarget.width = w;
+                    g_denoiseTarget.height = h;
+                    g_denoiseTarget.format = bestInfo.format;
+                    g_denoiseTarget.ready = (g_denoiseTarget.cudaPtr != nullptr);
+
+                    // Init TRT denoiser engine
+                    const char* planPath = getenv("CUDA_RT_DENOISE_PLAN");
+                    if (!planPath) planPath = "/workspaces/codespace/VK_RT/vit_ray_reconstruct_lite_540p.plan";
+                    rt_denoise_init(w, h, planPath);
+
+                    LOG("[VK_RT:Denoise] Staging buffer: %ux%u (%zu bytes) CUDA=%p ready=%d",
+                        w, h, (size_t)bufSize, g_denoiseTarget.cudaPtr, g_denoiseTarget.ready);
+                }
+
+                // Run denoise each frame if staging is ready
+                if (g_denoiseTarget.ready && g_denoiseTarget.targetImage == bestImg) {
+                    VkImage img = (VkImage)g_denoiseTarget.targetImage;
+                    uint32_t w = g_denoiseTarget.width, h = g_denoiseTarget.height;
+
+                    // Wait for any GPU work to complete
+                    pDisp->QueueWaitIdle(queue);
+
+                    // Step 1: Copy storage image → staging buffer
+                    pDisp->ResetCommandBuffer(g_denoiseTarget.cmdBuf, 0);
+                    VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+                    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+                    pDisp->BeginCommandBuffer(g_denoiseTarget.cmdBuf, &beginInfo);
+
+                    // Barrier: storage image GENERAL → TRANSFER_SRC
+                    VkImageMemoryBarrier toSrc = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                    toSrc.srcAccessMask = VK_ACCESS_SHADER_WRITE_BIT;
+                    toSrc.dstAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    toSrc.oldLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    toSrc.newLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    toSrc.image = img;
+                    toSrc.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                    pDisp->CmdPipelineBarrier(g_denoiseTarget.cmdBuf,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        0, 0, nullptr, 0, nullptr, 1, &toSrc);
+
+                    VkBufferImageCopy copyRegion = {};
+                    copyRegion.bufferOffset = 0;
+                    copyRegion.imageSubresource = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
+                    copyRegion.imageExtent = {w, h, 1};
+                    pDisp->CmdCopyImageToBuffer(g_denoiseTarget.cmdBuf, img,
+                        VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, g_denoiseTarget.stagingBuf, 1, &copyRegion);
+
+                    // Barrier: buffer ready for host/CUDA read
+                    VkBufferMemoryBarrier bufBarrier = {VK_STRUCTURE_TYPE_BUFFER_MEMORY_BARRIER};
+                    bufBarrier.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                    bufBarrier.dstAccessMask = VK_ACCESS_HOST_READ_BIT;
+                    bufBarrier.buffer = g_denoiseTarget.stagingBuf;
+                    bufBarrier.size = VK_WHOLE_SIZE;
+                    pDisp->CmdPipelineBarrier(g_denoiseTarget.cmdBuf,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_HOST_BIT,
+                        0, 0, nullptr, 1, &bufBarrier, 0, nullptr);
+
+                    pDisp->EndCommandBuffer(g_denoiseTarget.cmdBuf);
+
+                    // Submit and wait
+                    pDisp->ResetFences(pDisp->device, 1, &g_denoiseTarget.fence);
+                    VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+                    submitInfo.commandBufferCount = 1;
+                    submitInfo.pCommandBuffers = &g_denoiseTarget.cmdBuf;
+                    pDisp->QueueSubmit(g_denoiseTarget.queue, 1, &submitInfo, g_denoiseTarget.fence);
+                    pDisp->WaitForFences(pDisp->device, 1, &g_denoiseTarget.fence, VK_TRUE, UINT64_MAX);
+
+                    // Step 2: CUDA denoise on staging buffer
+                    float ms = rt_denoise_run(g_denoiseTarget.cudaPtr, w, h);
+
+                    // Step 3: Copy staging buffer → storage image
+                    pDisp->ResetCommandBuffer(g_denoiseTarget.cmdBuf, 0);
+                    pDisp->BeginCommandBuffer(g_denoiseTarget.cmdBuf, &beginInfo);
+
+                    // Barrier: image → TRANSFER_DST
+                    VkImageMemoryBarrier toDst = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                    toDst.srcAccessMask = VK_ACCESS_TRANSFER_READ_BIT;
+                    toDst.dstAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                    toDst.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL;
+                    toDst.newLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                    toDst.image = img;
+                    toDst.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                    pDisp->CmdPipelineBarrier(g_denoiseTarget.cmdBuf,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT, VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        0, 0, nullptr, 0, nullptr, 1, &toDst);
+
+                    pDisp->CmdCopyBufferToImage(g_denoiseTarget.cmdBuf, g_denoiseTarget.stagingBuf, img,
+                        VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, 1, &copyRegion);
+
+                    // Barrier: image back to GENERAL for shader access
+                    VkImageMemoryBarrier toGeneral = {VK_STRUCTURE_TYPE_IMAGE_MEMORY_BARRIER};
+                    toGeneral.srcAccessMask = VK_ACCESS_TRANSFER_WRITE_BIT;
+                    toGeneral.dstAccessMask = VK_ACCESS_SHADER_READ_BIT | VK_ACCESS_SHADER_WRITE_BIT;
+                    toGeneral.oldLayout = VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL;
+                    toGeneral.newLayout = VK_IMAGE_LAYOUT_GENERAL;
+                    toGeneral.image = img;
+                    toGeneral.subresourceRange = {VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
+                    pDisp->CmdPipelineBarrier(g_denoiseTarget.cmdBuf,
+                        VK_PIPELINE_STAGE_TRANSFER_BIT,
+                        VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT | VK_PIPELINE_STAGE_FRAGMENT_SHADER_BIT,
+                        0, 0, nullptr, 0, nullptr, 1, &toGeneral);
+
+                    pDisp->EndCommandBuffer(g_denoiseTarget.cmdBuf);
+
+                    pDisp->ResetFences(pDisp->device, 1, &g_denoiseTarget.fence);
+                    pDisp->QueueSubmit(g_denoiseTarget.queue, 1, &submitInfo, g_denoiseTarget.fence);
+                    pDisp->WaitForFences(pDisp->device, 1, &g_denoiseTarget.fence, VK_TRUE, UINT64_MAX);
+
+                    // Log periodically
+                    uint64_t fc = rt_denoise_frame_count();
+                    if (fc <= 3 || fc % 500 == 0) {
+                        LOG("[VK_RT:Denoise] Frame %lu: %.2f ms (%s)",
+                            (unsigned long)fc, ms,
+                            rt_denoise_has_trt() ? "TRT neural" : "spatial");
+                    }
+                }
+            }
+        }
+    }
+    denoise_done:
 
     // Reset G-buffer capture for next frame
     g_gbuffer.captured = false;
