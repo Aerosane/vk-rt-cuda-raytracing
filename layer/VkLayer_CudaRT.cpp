@@ -34,6 +34,16 @@
 #include <algorithm>
 #include <time.h>
 
+// RasterBoost upscale engine (rasterboost_upscale.cu)
+extern "C" {
+    int  rasterboost_upscale_init(uint32_t renderW, uint32_t renderH,
+                                  uint32_t outputW, uint32_t outputH,
+                                  const char* plan_path);
+    int  rasterboost_upscale_run(void* srcPtr, void* dstPtr);
+    void rasterboost_upscale_destroy();
+    int  rasterboost_upscale_has_trt();
+}
+
 // ═══════════════════════════════════════════
 // Dispatch table — stores the next layer's function pointers
 // ═══════════════════════════════════════════
@@ -1298,6 +1308,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateSwapchainKHR(
             g_rasterBoost.outputW, g_rasterBoost.outputH,
             g_rasterBoost.renderW, g_rasterBoost.renderH,
             g_rasterBoost.scale);
+
+        // Initialize TRT upscale engine (lazy, on first swapchain)
+        const char* planPath = getenv("RASTER_BOOST_PLAN");
+        if (!planPath) planPath = "/workspaces/codespace/VK_RT/vit_ray_reconstruct_lite_540p.plan";
+        rasterboost_upscale_init(
+            g_rasterBoost.renderW, g_rasterBoost.renderH,
+            g_rasterBoost.outputW, g_rasterBoost.outputH,
+            planPath);
     }
 
     return disp.CreateSwapchainKHR(device, pCreateInfo, pAllocator, pSwapchain);

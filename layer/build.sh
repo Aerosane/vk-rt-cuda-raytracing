@@ -10,11 +10,18 @@ echo "=== Building CUDA BVH backend ==="
   -Wno-deprecated-gpu-targets \
   cuda_bvh_backend.cu -o cuda_bvh_backend.o
 
+echo "=== Building RasterBoost upscale engine ==="
+/usr/local/cuda/bin/nvcc -c -O3 -arch=sm_70 --compiler-options=-fPIC \
+  -Wno-deprecated-gpu-targets \
+  -I/usr/include/x86_64-linux-gnu \
+  rasterboost_upscale.cu -o rasterboost_upscale.o
+
 echo "=== Building VkLayer_CudaRT.so ==="
 g++ -shared -fPIC -fvisibility=hidden -O2 -std=c++17 -Wall \
   -I/usr/local/cuda/include \
-  VkLayer_CudaRT.cpp cuda_bvh_backend.o \
+  VkLayer_CudaRT.cpp cuda_bvh_backend.o rasterboost_upscale.o \
   -L/usr/local/cuda/lib64 -lcudart \
+  -L/usr/lib/x86_64-linux-gnu -lnvinfer \
   -o libVkLayer_CudaRT.so
 
 echo "=== Installing layer manifest ==="
