@@ -49,10 +49,10 @@ static std::mutex    g_upscaleLock;
 // CUDA kernels: format conversion
 // ═══════════════════════════════════════════
 
-// RGBA8 → FP16 NCHW (3 channels, normalized 0-1)
+// RGBA8 → FP16 NCHW (10 channels: RGB + 7 zero-padded for TRT plan compatibility)
 __global__ void rgba8_to_fp16_nchw(
     const unsigned char* __restrict__ src,  // RGBA8 [H][W][4]
-    half* __restrict__ dst,                 // FP16  [1][3][H][W]
+    half* __restrict__ dst,                 // FP16  [1][10][H][W]
     int width, int height)
 {
     int x = blockIdx.x * blockDim.x + threadIdx.x;
@@ -70,6 +70,9 @@ __global__ void rgba8_to_fp16_nchw(
     dst[0 * planeSize + pixIdx] = __float2half(r);  // R plane
     dst[1 * planeSize + pixIdx] = __float2half(g);  // G plane
     dst[2 * planeSize + pixIdx] = __float2half(b);  // B plane
+    // Channels 3-9: zero (depth, normals, motion, albedo — to be filled by G-buffer)
+    for (int c = 3; c < 10; c++)
+        dst[c * planeSize + pixIdx] = __float2half(0.0f);
 }
 
 // FP16 NCHW → RGBA8 (denormalize, clamp, alpha=255)
@@ -166,13 +169,13 @@ int rasterboost_upscale_init(
                         g_upscale.context = g_upscale.engine->createExecutionContext();
                         if (g_upscale.context) {
                             // Allocate FP16 buffers
-                            size_t inSize  = 1 * 3 * renderH * renderW * sizeof(half);
+                            size_t inSize  = 1 * 10 * renderH * renderW * sizeof(half);
                             size_t outSize = 1 * 3 * outputH * outputW * sizeof(half);
                             if (cudaMalloc(&g_upscale.d_input, inSize) == cudaSuccess &&
                                 cudaMalloc(&g_upscale.d_output, outSize) == cudaSuccess) {
                                 // Set input shape for dynamic profile
                                 g_upscale.context->setInputShape("input",
-                                    Dims4{1, 3, (int)renderH, (int)renderW});
+                                    Dims4{1, 10, (int)renderH, (int)renderW});
                                 g_upscale.ready = true;
                                 fprintf(stderr, "[RasterBoost] TRT engine loaded: %s (%.1f KB)\n",
                                         plan_path, size / 1024.0f);

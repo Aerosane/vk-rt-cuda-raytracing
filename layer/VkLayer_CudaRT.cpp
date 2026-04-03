@@ -1361,9 +1361,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateSwapchainKHR(
         g_rasterBoost.outputH = pCreateInfo->imageExtent.height;
         g_rasterBoost.renderW = (uint32_t)(pCreateInfo->imageExtent.width * g_rasterBoost.scale);
         g_rasterBoost.renderH = (uint32_t)(pCreateInfo->imageExtent.height * g_rasterBoost.scale);
-        // Align to 8 pixels (encoder/tensor alignment)
-        g_rasterBoost.renderW = (g_rasterBoost.renderW + 7u) & ~7u;
-        g_rasterBoost.renderH = (g_rasterBoost.renderH + 7u) & ~7u;
+        // Align to 2 pixels (minimum for chroma subsampling / tensor ops)
+        g_rasterBoost.renderW = (g_rasterBoost.renderW + 1u) & ~1u;
+        g_rasterBoost.renderH = (g_rasterBoost.renderH + 1u) & ~1u;
         g_rasterBoost.device = device;
         g_rasterBoost.scaledImages = 0;
         LOG("[RasterBoost] Swapchain %ux%u → internal render %ux%u (scale=%.2f)",
