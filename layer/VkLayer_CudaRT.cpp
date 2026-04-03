@@ -328,8 +328,45 @@ struct RenderPassInfo {
     uint32_t colorAttachments;
     uint32_t depthAttachment;   // 0 or 1
     uint32_t subpassCount;
+    VkFormat depthFormat;       // G-Buffer: depth attachment format
+    uint32_t depthAttachIdx;    // G-Buffer: index in pAttachments (UINT32_MAX if none)
+    // Track color formats for motion vector detection (R16G16_SFLOAT = common MV format)
+    VkFormat colorFormats[8];
+    int      motionVectorIdx;   // Index of likely MV attachment (-1 if none)
 };
 static std::unordered_map<uint64_t, RenderPassInfo> g_renderPassInfo;
+
+// ═══════════════════════════════════════════
+// G-Buffer: Framebuffer → image view tracking
+// ═══════════════════════════════════════════
+struct FramebufferInfo {
+    std::vector<VkImageView> attachments;
+    uint32_t width, height;
+    VkRenderPass renderPass;
+};
+static std::unordered_map<uint64_t, FramebufferInfo> g_framebufferInfo;
+
+// ImageView → VkImage mapping (needed to get actual images from framebuffers)
+struct ImageViewInfo {
+    VkImage  image;
+    VkFormat format;
+    uint32_t baseMip;
+    uint32_t baseLayer;
+};
+static std::unordered_map<uint64_t, ImageViewInfo> g_imageViewInfo;
+
+// G-Buffer capture state: depth + motion vectors for TRT upscaler
+struct GBufferCapture {
+    VkImage  depthImage;        // Current frame's depth image
+    VkImage  motionImage;       // Current frame's motion vector image
+    VkFormat depthFormat;
+    VkFormat motionFormat;
+    uint32_t width, height;
+    bool     captured;          // Set after successful capture
+    void*    cudaDepthPtr;      // CUDA device pointer to imported depth
+    void*    cudaMotionPtr;     // CUDA device pointer to imported motion
+};
+static GBufferCapture g_gbuffer = {};
 
 struct FrameProfile {
     VkQueryPool queryPool;
@@ -4617,15 +4654,27 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateRenderPass(
     VkResult res = disp.CreateRenderPass(device, pCreateInfo, pAllocator, pRenderPass);
     if (res == VK_SUCCESS && pRenderPass) {
         RenderPassInfo info = {};
-        // Count color vs depth attachments
+        info.depthAttachIdx = UINT32_MAX;
+        info.motionVectorIdx = -1;
+        memset(info.colorFormats, 0, sizeof(info.colorFormats));
+        uint32_t colorIdx = 0;
+        // Count color vs depth attachments, track formats for G-buffer
         for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++) {
             VkFormat fmt = pCreateInfo->pAttachments[i].format;
             if (fmt == VK_FORMAT_D16_UNORM || fmt == VK_FORMAT_D32_SFLOAT ||
                 fmt == VK_FORMAT_D16_UNORM_S8_UINT || fmt == VK_FORMAT_D24_UNORM_S8_UINT ||
                 fmt == VK_FORMAT_D32_SFLOAT_S8_UINT) {
                 info.depthAttachment = 1;
+                info.depthFormat = fmt;
+                info.depthAttachIdx = i;
             } else {
+                if (colorIdx < 8) info.colorFormats[colorIdx] = fmt;
+                // Detect motion vectors: R16G16_SFLOAT or R16G16_SNORM
+                if (fmt == VK_FORMAT_R16G16_SFLOAT || fmt == VK_FORMAT_R16G16_SNORM) {
+                    info.motionVectorIdx = (int)i;
+                }
                 info.colorAttachments++;
+                colorIdx++;
             }
         }
         info.subpassCount = pCreateInfo->subpassCount;
@@ -4664,8 +4713,82 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateRenderPass(
 }
 
 // ═══════════════════════════════════════════
-// Intercepted: CmdBeginRenderPass — GPU timestamp + tracking
+// G-Buffer: Intercept CreateImageView — track VkImageView → VkImage mapping
 // ═══════════════════════════════════════════
+static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateImageView(
+    VkDevice device, const VkImageViewCreateInfo* pCreateInfo,
+    const VkAllocationCallbacks* pAllocator, VkImageView* pView)
+{
+    void* key = getKey(device);
+    auto& disp = g_deviceMap[key];
+    // No dedicated CreateImageView in dispatch — use GetDeviceProcAddr
+    auto fn = (PFN_vkCreateImageView)disp.GetDeviceProcAddr(device, "vkCreateImageView");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    VkResult res = fn(device, pCreateInfo, pAllocator, pView);
+    if (res == VK_SUCCESS && pView && pCreateInfo) {
+        std::lock_guard<std::mutex> lock(g_lock);
+        g_imageViewInfo[(uint64_t)*pView] = {
+            pCreateInfo->image,
+            pCreateInfo->format,
+            pCreateInfo->subresourceRange.baseMipLevel,
+            pCreateInfo->subresourceRange.baseArrayLayer
+        };
+    }
+    return res;
+}
+
+static VKAPI_ATTR void VKAPI_CALL layer_DestroyImageView(
+    VkDevice device, VkImageView view, const VkAllocationCallbacks* pAllocator)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        g_imageViewInfo.erase((uint64_t)view);
+    }
+    void* key = getKey(device);
+    auto fn = (PFN_vkDestroyImageView)g_deviceMap[key].GetDeviceProcAddr(device, "vkDestroyImageView");
+    if (fn) fn(device, view, pAllocator);
+}
+
+// ═══════════════════════════════════════════
+// G-Buffer: Intercept CreateFramebuffer — track attachment image views
+// ═══════════════════════════════════════════
+static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateFramebuffer(
+    VkDevice device, const VkFramebufferCreateInfo* pCreateInfo,
+    const VkAllocationCallbacks* pAllocator, VkFramebuffer* pFramebuffer)
+{
+    void* key = getKey(device);
+    auto& disp = g_deviceMap[key];
+    auto fn = (PFN_vkCreateFramebuffer)disp.GetDeviceProcAddr(device, "vkCreateFramebuffer");
+    if (!fn) return VK_ERROR_INITIALIZATION_FAILED;
+    VkResult res = fn(device, pCreateInfo, pAllocator, pFramebuffer);
+    if (res == VK_SUCCESS && pFramebuffer && pCreateInfo &&
+        !(pCreateInfo->flags & VK_FRAMEBUFFER_CREATE_IMAGELESS_BIT)) {
+        std::lock_guard<std::mutex> lock(g_lock);
+        FramebufferInfo fb;
+        fb.width = pCreateInfo->width;
+        fb.height = pCreateInfo->height;
+        fb.renderPass = pCreateInfo->renderPass;
+        for (uint32_t i = 0; i < pCreateInfo->attachmentCount; i++) {
+            fb.attachments.push_back(pCreateInfo->pAttachments[i]);
+        }
+        g_framebufferInfo[(uint64_t)*pFramebuffer] = std::move(fb);
+        LOG("[G-Buffer] Framebuffer 0x%lx: %ux%u, %u attachments",
+            (uint64_t)*pFramebuffer, fb.width, fb.height, pCreateInfo->attachmentCount);
+    }
+    return res;
+}
+
+static VKAPI_ATTR void VKAPI_CALL layer_DestroyFramebuffer(
+    VkDevice device, VkFramebuffer fb, const VkAllocationCallbacks* pAllocator)
+{
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        g_framebufferInfo.erase((uint64_t)fb);
+    }
+    void* key = getKey(device);
+    auto fn = (PFN_vkDestroyFramebuffer)g_deviceMap[key].GetDeviceProcAddr(device, "vkDestroyFramebuffer");
+    if (fn) fn(device, fb, pAllocator);
+}
 // Draw call counting per render pass (diagnostic)
 static thread_local uint32_t g_currentRP = UINT32_MAX;
 static thread_local uint32_t g_drawsInRP[8] = {};
@@ -4715,6 +4838,35 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBeginRenderPass(
                 (unsigned long)g_logFrame, g_logRPIdx, cstr);
     }
     g_logRPIdx++;
+
+    // G-Buffer: identify depth/MV images from framebuffer for this render pass
+    if (g_rasterBoost.active && pRenderPassBegin) {
+        std::lock_guard<std::mutex> lock(g_lock);
+        auto rpIt = g_renderPassInfo.find((uint64_t)pRenderPassBegin->renderPass);
+        auto fbIt = g_framebufferInfo.find((uint64_t)pRenderPassBegin->framebuffer);
+        if (rpIt != g_renderPassInfo.end() && fbIt != g_framebufferInfo.end()) {
+            auto& rp = rpIt->second;
+            auto& fb = fbIt->second;
+            // Capture depth image
+            if (rp.depthAttachIdx != UINT32_MAX && rp.depthAttachIdx < fb.attachments.size()) {
+                auto viewIt = g_imageViewInfo.find((uint64_t)fb.attachments[rp.depthAttachIdx]);
+                if (viewIt != g_imageViewInfo.end()) {
+                    g_gbuffer.depthImage  = viewIt->second.image;
+                    g_gbuffer.depthFormat = rp.depthFormat;
+                    g_gbuffer.width  = pRenderPassBegin->renderArea.extent.width;
+                    g_gbuffer.height = pRenderPassBegin->renderArea.extent.height;
+                }
+            }
+            // Capture motion vector image
+            if (rp.motionVectorIdx >= 0 && (uint32_t)rp.motionVectorIdx < fb.attachments.size()) {
+                auto viewIt = g_imageViewInfo.find((uint64_t)fb.attachments[rp.motionVectorIdx]);
+                if (viewIt != g_imageViewInfo.end()) {
+                    g_gbuffer.motionImage  = viewIt->second.image;
+                    g_gbuffer.motionFormat = rp.colorFormats[rp.motionVectorIdx];
+                }
+            }
+        }
+    }
 
     disp.CmdBeginRenderPass(cmdBuf, pRenderPassBegin, contents);
 
@@ -5480,6 +5632,10 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetInstanceProcAddr(VkInst
     INTERCEPT(CmdBeginRenderPass);
     INTERCEPT(CmdEndRenderPass);
     INTERCEPT(CreateRenderPass);
+    INTERCEPT(CreateImageView);
+    INTERCEPT(DestroyImageView);
+    INTERCEPT(CreateFramebuffer);
+    INTERCEPT(DestroyFramebuffer);
     INTERCEPT(CmdDrawIndexed);
     INTERCEPT(CmdDraw);
     INTERCEPT(CmdDrawIndexedIndirect);
@@ -5593,6 +5749,10 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetDeviceProcAddr(VkDevice
     INTERCEPT(CmdBeginRenderPass);
     INTERCEPT(CmdEndRenderPass);
     INTERCEPT(CreateRenderPass);
+    INTERCEPT(CreateImageView);
+    INTERCEPT(DestroyImageView);
+    INTERCEPT(CreateFramebuffer);
+    INTERCEPT(DestroyFramebuffer);
     INTERCEPT(CmdDrawIndexed);
     INTERCEPT(CmdDraw);
     INTERCEPT(CmdDrawIndexedIndirect);
