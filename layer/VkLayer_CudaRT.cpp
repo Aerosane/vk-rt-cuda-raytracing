@@ -571,6 +571,11 @@ static BVH2Interop g_bvh2 = {};
 static int g_verbose = 1;
 uint32_t g_rqDispatchPerFrame = 0; // reset per frame in QueuePresent
 static int g_trackVerbose = 0;
+
+// Neural Radiance Cache — tensor core accelerated indirect lighting
+#include "nrc.h"
+static NRCState* g_nrc = nullptr;
+static bool g_nrcEnabled = false;  // controlled by CUDA_RT_NRC=1 env var
 #define LOG(fmt, ...) do { if (g_verbose) fprintf(stderr, "[CudaRT] " fmt "\n", ##__VA_ARGS__); } while(0)
 
 // ═══════════════════════════════════════════
@@ -5663,6 +5668,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
     static uint32_t presentCount = 0;
     presentCount++;
 
+    // Initialize NRC on first frame (lazy init — needs CUDA context to be ready)
+    if (!g_nrc && presentCount == 1) {
+        const char* nrcEnv = getenv("CUDA_RT_NRC");
+        g_nrcEnabled = nrcEnv && atoi(nrcEnv) > 0;
+        if (g_nrcEnabled) {
+            g_nrc = nrc_create(1920 * 1080, 65536);
+            LOG("[NRC] Neural Radiance Cache initialized (tensor core WMMA)");
+        }
+    }
+
     // Save dispatch count before reset (used by denoiser later)
     uint32_t rqDispatchThisFrame = g_rqDispatchPerFrame;
     g_rqDispatchPerFrame = 0;
@@ -6071,6 +6086,23 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
     g_gbuffer.captured = false;
     g_gbuffer.depthImage = VK_NULL_HANDLE;
     g_gbuffer.motionImage = VK_NULL_HANDLE;
+
+    // NRC: Per-frame training step (runs on CUDA async stream, overlaps with next frame)
+    if (g_nrc && g_nrcEnabled && rqDispatchThisFrame > 0) {
+        static uint64_t nrcTrainCount = 0;
+        nrcTrainCount++;
+        // Train on collected samples from IR executor
+        // For now, train on random samples to keep the network warm
+        // Real samples will come from rt_ir_exec.cu OP_NRC_TRAIN_SAMPLE
+        if (g_nrc->numTrainSamples > 0) {
+            float loss = nrc_train_step(g_nrc, g_nrc->numTrainSamples, 0.001f, nullptr);
+            if (nrcTrainCount <= 5 || nrcTrainCount % 300 == 0) {
+                LOG("[NRC] Train step #%lu: %u samples, loss=%.4f",
+                    nrcTrainCount, g_nrc->numTrainSamples, loss);
+            }
+            g_nrc->numTrainSamples = 0;
+        }
+    }
 
     return pDisp->QueuePresentKHR(queue, pPresentInfo);
 }

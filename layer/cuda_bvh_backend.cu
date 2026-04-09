@@ -521,6 +521,83 @@ static void buildDFSBVH2(const BVH2Builder& b2, int root,
             numDFS, numDFS * 32 / 1024.f);
 }
 
+// ======================== BVH4 Diffuse Traversal (arbitrary rays) ========================
+#if !BVH_LAYER_MODE
+__global__ void __launch_bounds__(256, 5) bk_traceDiffuseArbitrary(
+    const int4* __restrict__ bvh, int n4,
+    const float* __restrict__ tv0x, const float* __restrict__ tv0y, const float* __restrict__ tv0z,
+    const float* __restrict__ tv1x, const float* __restrict__ tv1y, const float* __restrict__ tv1z,
+    const float* __restrict__ tv2x, const float* __restrict__ tv2y, const float* __restrict__ tv2z,
+    const float* __restrict__ d_ox, const float* __restrict__ d_oy, const float* __restrict__ d_oz,
+    const float* __restrict__ d_dx, const float* __restrict__ d_dy, const float* __restrict__ d_dz,
+    float* __restrict__ hitT, int numRays)
+{
+    const unsigned lane = threadIdx.x & 31;
+    while (true) {
+        int bs;
+        if (lane == 0) bs = atomicAdd(&g_bvhRayCounter2, 32);
+        bs = __shfl_sync(0xFFFFFFFF, bs, 0);
+        if (bs >= numRays) break;
+        int ri = bs + lane;
+        bool alive = (ri < numRays);
+        float ox=0,oy=0,oz=0,dx=0,dy=0,dz=1,ix=0,iy=0,iz=1;
+        if (alive) {
+            ox = d_ox[ri]; oy = d_oy[ri]; oz = d_oz[ri];
+            dx = d_dx[ri]; dy = d_dy[ri]; dz = d_dz[ri];
+            ix = 1.f/(fabsf(dx)>1e-8f ? dx : copysignf(1e-8f,dx));
+            iy = 1.f/(fabsf(dy)>1e-8f ? dy : copysignf(1e-8f,dy));
+            iz = 1.f/(fabsf(dz)>1e-8f ? dz : copysignf(1e-8f,dz));
+        }
+        float tHit = 1e30f;
+        int stk[STACK_DEPTH]; int sp = 0;
+        if (alive) stk[sp++] = 0;
+        while (sp > 0 && alive) {
+            int ni = stk[--sp];
+            if (ni < 0) {
+                int enc = -(ni+2); int ts = enc>>3, tc = (enc&7)+1;
+                for (int t = 0; t < tc; t++) {
+                    int ti = ts + t;
+                    float e1x=__ldg(&tv1x[ti])-__ldg(&tv0x[ti]),e1y=__ldg(&tv1y[ti])-__ldg(&tv0y[ti]),e1z=__ldg(&tv1z[ti])-__ldg(&tv0z[ti]);
+                    float e2x=__ldg(&tv2x[ti])-__ldg(&tv0x[ti]),e2y=__ldg(&tv2y[ti])-__ldg(&tv0y[ti]),e2z=__ldg(&tv2z[ti])-__ldg(&tv0z[ti]);
+                    float ppx=dy*e2z-dz*e2y,ppy=dz*e2x-dx*e2z,ppz=dx*e2y-dy*e2x;
+                    float det=e1x*ppx+e1y*ppy+e1z*ppz;
+                    if (fabsf(det) < 1e-12f) continue;
+                    float inv = 1.f/det;
+                    float tx=ox-__ldg(&tv0x[ti]),ty=oy-__ldg(&tv0y[ti]),tz=oz-__ldg(&tv0z[ti]);
+                    float uu=inv*(tx*ppx+ty*ppy+tz*ppz); if(uu<0.f||uu>1.f) continue;
+                    float qx=ty*e1z-tz*e1y,qy=tz*e1x-tx*e1z,qz=tx*e1y-ty*e1x;
+                    float vv=inv*(dx*qx+dy*qy+dz*qz); if(vv<0.f||uu+vv>1.f) continue;
+                    float tt=inv*(e2x*qx+e2y*qy+e2z*qz);
+                    if (tt > 0.f && tt < tHit) tHit = tt;
+                }
+                continue;
+            }
+            int4 n0,n1,n2,n3;
+            loadBVH4Node_bk(bvh,ni,n0,n1,n2,n3);
+            const __half* bx=(const __half*)&n0,*by=(const __half*)&n1,*bz=(const __half*)&n2;
+            const int* ch=(const int*)&n3;
+            float dist[4]; int child[4];
+            for (int c = 0; c < 4; c++) {
+                child[c] = ch[c];
+                if (ch[c] == -1) { dist[c] = 1e30f; continue; }
+                float t1x=(__half2float(bx[c])-ox)*ix,t2x=(__half2float(bx[4+c])-ox)*ix;
+                float t1y=(__half2float(by[c])-oy)*iy,t2y=(__half2float(by[4+c])-oy)*iy;
+                float t1z=(__half2float(bz[c])-oz)*iz,t2z=(__half2float(bz[4+c])-oz)*iz;
+                float tN=fmaxf(fmaxf(fminf(t1x,t2x),fminf(t1y,t2y)),fminf(t1z,t2z));
+                float tF=fminf(fminf(fmaxf(t1x,t2x),fmaxf(t1y,t2y)),fmaxf(t1z,t2z));
+                dist[c]=(tN<=tF&&tF>0.f&&tN<tHit)?tN:1e30f;
+            }
+            #define CSWAP(a,b) do{float da=dist[a],db=dist[b];int ca=child[a],cb=child[b];\
+                bool s=(da>db);dist[a]=s?db:da;dist[b]=s?da:db;child[a]=s?cb:ca;child[b]=s?ca:cb;}while(0)
+            CSWAP(0,1);CSWAP(2,3);CSWAP(0,2);CSWAP(1,3);CSWAP(1,2);
+            #undef CSWAP
+            for (int c = 3; c >= 0; c--) if (dist[c] < 1e30f && sp < STACK_DEPTH) stk[sp++] = child[c];
+        }
+        if (alive) hitT[ri] = tHit;
+    }
+}
+#endif
+
 // ======================== API Implementation ========================
 extern "C" {
 
@@ -1298,9 +1375,120 @@ float cudaBVH_traceDiffuse(CudaBVH_t bvh, int numRays,
                            const float* rayOx, const float* rayOy, const float* rayOz,
                            const float* rayDx, const float* rayDy, const float* rayDz,
                            float* outHitT) {
-    // TODO: implement CWBVH diffuse trace
-    fprintf(stderr, "[CudaBVH] Diffuse trace not yet implemented\n");
+#if !BVH_LAYER_MODE
+    CudaBVHHandle* h = (CudaBVHHandle*)bvh;
+    if (!h || numRays <= 0) return 0;
+
+    // --- Morton sort ray origins for spatial coherence ---
+    float omin[3] = {1e30f, 1e30f, 1e30f}, omax[3] = {-1e30f, -1e30f, -1e30f};
+    for (int i = 0; i < numRays; i++) {
+        omin[0] = fminf(omin[0], rayOx[i]); omax[0] = fmaxf(omax[0], rayOx[i]);
+        omin[1] = fminf(omin[1], rayOy[i]); omax[1] = fmaxf(omax[1], rayOy[i]);
+        omin[2] = fminf(omin[2], rayOz[i]); omax[2] = fmaxf(omax[2], rayOz[i]);
+    }
+    float oinv[3];
+    for (int a = 0; a < 3; a++)
+        oinv[a] = (omax[a] - omin[a] > 1e-8f) ? 1.0f / (omax[a] - omin[a]) : 0.0f;
+
+    struct MortonRay { uint32_t code; int idx; };
+    std::vector<MortonRay> mr(numRays);
+    for (int i = 0; i < numRays; i++) {
+        mr[i].code = morton3D((rayOx[i] - omin[0]) * oinv[0],
+                               (rayOy[i] - omin[1]) * oinv[1],
+                               (rayOz[i] - omin[2]) * oinv[2]);
+        mr[i].idx = i;
+    }
+
+    // Radix sort (4 passes, 8-bit radix)
+    {
+        std::vector<MortonRay> tmp(numRays);
+        for (int pass = 0; pass < 4; pass++) {
+            int shift = pass * 8;
+            int count[256] = {};
+            for (int i = 0; i < numRays; i++) count[(mr[i].code >> shift) & 0xFF]++;
+            int prefix[256]; prefix[0] = 0;
+            for (int i = 1; i < 256; i++) prefix[i] = prefix[i-1] + count[i-1];
+            for (int i = 0; i < numRays; i++) {
+                int b = (mr[i].code >> shift) & 0xFF;
+                tmp[prefix[b]++] = mr[i];
+            }
+            mr.swap(tmp);
+        }
+    }
+
+    // Reorder ray arrays into sorted order
+    std::vector<float> sOx(numRays), sOy(numRays), sOz(numRays);
+    std::vector<float> sDx(numRays), sDy(numRays), sDz(numRays);
+    std::vector<int> origIdx(numRays);
+    for (int i = 0; i < numRays; i++) {
+        int j = mr[i].idx;
+        origIdx[i] = j;
+        sOx[i] = rayOx[j]; sOy[i] = rayOy[j]; sOz[i] = rayOz[j];
+        sDx[i] = rayDx[j]; sDy[i] = rayDy[j]; sDz[i] = rayDz[j];
+    }
+
+    // Allocate temp GPU buffers for ray data + output
+    size_t sz = numRays * sizeof(float);
+    float *d_ox, *d_oy, *d_oz, *d_dx, *d_dy, *d_dz, *d_ht;
+    CK(cudaMalloc(&d_ox, sz)); CK(cudaMalloc(&d_oy, sz)); CK(cudaMalloc(&d_oz, sz));
+    CK(cudaMalloc(&d_dx, sz)); CK(cudaMalloc(&d_dy, sz)); CK(cudaMalloc(&d_dz, sz));
+    CK(cudaMalloc(&d_ht, sz));
+
+    CK(cudaMemcpy(d_ox, sOx.data(), sz, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_oy, sOy.data(), sz, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_oz, sOz.data(), sz, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_dx, sDx.data(), sz, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_dy, sDy.data(), sz, cudaMemcpyHostToDevice));
+    CK(cudaMemcpy(d_dz, sDz.data(), sz, cudaMemcpyHostToDevice));
+    CK(cudaMemset(d_ht, 0x7f, sz));
+
+    int zero = 0;
+    CK(cudaMemcpyToSymbol(g_bvhRayCounter2, &zero, 4));
+
+    cudaEvent_t t0, t1;
+    CK(cudaEventCreate(&t0)); CK(cudaEventCreate(&t1));
+    CK(cudaEventRecord(t0));
+
+    bk_traceDiffuseArbitrary<<<320, 256>>>(
+        h->d_bvh4, h->numB4Nodes * 4,
+        h->d_tv0x, h->d_tv0y, h->d_tv0z,
+        h->d_tv1x, h->d_tv1y, h->d_tv1z,
+        h->d_tv2x, h->d_tv2y, h->d_tv2z,
+        d_ox, d_oy, d_oz, d_dx, d_dy, d_dz,
+        d_ht, numRays);
+
+    CK(cudaEventRecord(t1));
+    CK(cudaEventSynchronize(t1));
+    float ms;
+    CK(cudaEventElapsedTime(&ms, t0, t1));
+    CK(cudaEventDestroy(t0));
+    CK(cudaEventDestroy(t1));
+
+    // Download sorted results and scatter back to original order
+    std::vector<float> sortedHitT(numRays);
+    CK(cudaMemcpy(sortedHitT.data(), d_ht, sz, cudaMemcpyDeviceToHost));
+
+    if (outHitT) {
+        for (int i = 0; i < numRays; i++)
+            outHitT[origIdx[i]] = sortedHitT[i];
+    }
+
+    CK(cudaFree(d_ox)); CK(cudaFree(d_oy)); CK(cudaFree(d_oz));
+    CK(cudaFree(d_dx)); CK(cudaFree(d_dy)); CK(cudaFree(d_dz));
+    CK(cudaFree(d_ht));
+
+    float mrs = (float)numRays / (ms * 1000.f);
+    fprintf(stderr, "[CudaBVH] Diffuse trace: %d rays in %.2fms → %.0f MR/s\n",
+            numRays, ms, mrs);
+    return mrs;
+#else
+    (void)bvh; (void)numRays;
+    (void)rayOx; (void)rayOy; (void)rayOz;
+    (void)rayDx; (void)rayDy; (void)rayDz;
+    (void)outHitT;
+    fprintf(stderr, "[CudaBVH] Diffuse trace not available in layer mode\n");
     return 0;
+#endif
 }
 
 int cudaBVH_getNumTris(CudaBVH_t bvh) {
@@ -1310,7 +1498,7 @@ int cudaBVH_getNumBVH4Nodes(CudaBVH_t bvh) {
     return bvh ? ((CudaBVHHandle*)bvh)->numB4Nodes : 0;
 }
 int cudaBVH_getNumCWBVHNodes(CudaBVH_t bvh) {
-    return 0; // TODO
+    return bvh ? ((CudaBVHHandle*)bvh)->numB4Nodes : 0;
 }
 
 int cudaBVH_readGPUMemoryFd(int fd, uint64_t allocationSize,

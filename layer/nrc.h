@@ -14,6 +14,7 @@
 
 #include <cuda_runtime.h>
 #include <cuda_fp16.h>
+#include <cstdint>
 
 // ═══════════════════════════════════════════════════════════════
 // Network architecture constants
@@ -67,6 +68,11 @@ struct NRCState {
     int maxTrainSamples; // max training batch (e.g. 65536)
     int frameCount;      // for training schedule
     bool initialized;
+
+    // Per-frame sample collection (filled by IR executor, consumed by train)
+    float* d_trainPositions;  // [maxTrainSamples][3] — world positions
+    float* d_trainTargets;    // [maxTrainSamples][4] — ground truth RGBA
+    uint32_t numTrainSamples; // current count (reset each frame after training)
 };
 
 // ═══════════════════════════════════════════════════════════════
@@ -96,6 +102,12 @@ void nrc_inference(NRCState* nrc,
 float nrc_train_step(NRCState* nrc,
                      const float* d_positions_xyz,
                      const float* d_target_rgba,
+                     int numSamples,
+                     float learningRate = 0.001f,
+                     cudaStream_t stream = 0);
+
+// Training step using internally collected samples (d_trainPositions/d_trainTargets)
+float nrc_train_step(NRCState* nrc,
                      int numSamples,
                      float learningRate = 0.001f,
                      cudaStream_t stream = 0);

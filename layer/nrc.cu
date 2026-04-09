@@ -404,6 +404,11 @@ NRCState* nrc_create(int maxQueries, int maxTrainSamples) {
     NRC_CK(cudaMalloc(&nrc->d_dW3_fp32, W3_n * sizeof(float)));
     NRC_CK(cudaMalloc(&nrc->d_loss, sizeof(float)));
 
+    // Per-frame sample collection buffers
+    NRC_CK(cudaMalloc(&nrc->d_trainPositions, maxTrainSamples * 3 * sizeof(float)));
+    NRC_CK(cudaMalloc(&nrc->d_trainTargets, maxTrainSamples * 4 * sizeof(float)));
+    nrc->numTrainSamples = 0;
+
     NRC_CK(cudaDeviceSynchronize());
 
     delete[] h_hash; delete[] h_W1; delete[] h_b1;
@@ -431,6 +436,7 @@ void nrc_destroy(NRCState* nrc) {
     cudaFree(nrc->d_dOut); cudaFree(nrc->d_dH2); cudaFree(nrc->d_dH1);
     cudaFree(nrc->d_dW1_fp32); cudaFree(nrc->d_dW2_fp32); cudaFree(nrc->d_dW3_fp32);
     cudaFree(nrc->d_loss);
+    cudaFree(nrc->d_trainPositions); cudaFree(nrc->d_trainTargets);
     delete nrc;
 }
 
