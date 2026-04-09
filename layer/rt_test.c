@@ -151,10 +151,13 @@ int main(int argc, char** argv) {
     printf("[INFO] RT extensions: AS=%d RTPipeline=%d RayQuery=%d DeferredOp=%d SPIRV14=%d\n",
            hasAS, hasRTPipe, hasRayQuery, hasDeferredOp, hasSPIRV14);
 
-    if (!hasAS || !hasRTPipe) {
-        printf("[FAIL] Missing required RT extensions\n");
+    if (!hasAS || (!hasRTPipe && !hasRayQuery)) {
+        printf("[FAIL] Missing required RT extensions (need AS + pipeline or ray_query)\n");
         vkDestroyInstance(instance, NULL);
         return 1;
+    }
+    if (!hasRTPipe && hasRayQuery) {
+        printf("[INFO] Using ray_query path (VK_RT layer software RT mode)\n");
     }
 
     // ── Device ──
@@ -164,7 +167,7 @@ int main(int argc, char** argv) {
     qci.queueCount = 1;
     qci.pQueuePriorities = &queuePri;
 
-    const char* devExts[] = {
+    const char* devExts_pipeline[] = {
         VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
         VK_KHR_RAY_TRACING_PIPELINE_EXTENSION_NAME,
         VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
@@ -172,6 +175,18 @@ int main(int argc, char** argv) {
         VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME,
         VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
     };
+    const char* devExts_rayquery[] = {
+        VK_KHR_ACCELERATION_STRUCTURE_EXTENSION_NAME,
+        VK_KHR_RAY_QUERY_EXTENSION_NAME,
+        VK_KHR_DEFERRED_HOST_OPERATIONS_EXTENSION_NAME,
+        VK_KHR_SPIRV_1_4_EXTENSION_NAME,
+        VK_KHR_SHADER_FLOAT_CONTROLS_EXTENSION_NAME,
+        VK_KHR_BUFFER_DEVICE_ADDRESS_EXTENSION_NAME,
+    };
+    int useRayQuery = !hasRTPipe && hasRayQuery;
+    const char** devExts = useRayQuery ? devExts_rayquery : devExts_pipeline;
+    uint32_t devExtCount = useRayQuery ? (sizeof(devExts_rayquery)/sizeof(devExts_rayquery[0]))
+                                       : (sizeof(devExts_pipeline)/sizeof(devExts_pipeline[0]));
 
     // Feature chain
     VkPhysicalDeviceBufferDeviceAddressFeatures bdaFeatures = {
@@ -183,16 +198,26 @@ int main(int argc, char** argv) {
     asFeatures.pNext = &bdaFeatures;
     asFeatures.accelerationStructure = VK_TRUE;
 
+    VkPhysicalDeviceRayQueryFeaturesKHR rqFeatures = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR};
+    rqFeatures.rayQuery = VK_TRUE;
+
     VkPhysicalDeviceRayTracingPipelineFeaturesKHR rtFeatures = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR};
-    rtFeatures.pNext = &asFeatures;
     rtFeatures.rayTracingPipeline = VK_TRUE;
 
+    // Chain: use ray_query features if in RQ mode, else pipeline features
+    if (useRayQuery) {
+        rqFeatures.pNext = &asFeatures;
+    } else {
+        rtFeatures.pNext = &asFeatures;
+    }
+
     VkDeviceCreateInfo dci = {VK_STRUCTURE_TYPE_DEVICE_CREATE_INFO};
-    dci.pNext = &rtFeatures;
+    dci.pNext = useRayQuery ? (void*)&rqFeatures : (void*)&rtFeatures;
     dci.queueCreateInfoCount = 1;
     dci.pQueueCreateInfos = &qci;
-    dci.enabledExtensionCount = sizeof(devExts) / sizeof(devExts[0]);
+    dci.enabledExtensionCount = devExtCount;
     dci.ppEnabledExtensionNames = devExts;
 
     VkDevice device;
