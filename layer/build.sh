@@ -37,10 +37,15 @@ echo "=== Building RT IR executor ==="
   -Wno-deprecated-gpu-targets \
   rt_ir_exec.cu -o rt_ir_exec.o
 
+echo "=== Building Neural Radiance Cache (WMMA) ==="
+/usr/local/cuda/bin/nvcc -c -O3 -arch=sm_70 --compiler-options=-fPIC \
+  -Wno-deprecated-gpu-targets -diag-suppress=177 \
+  nrc.cu -o nrc.o
+
 echo "=== Building VkLayer_CudaRT.so ==="
 g++ -shared -fPIC -fvisibility=hidden -O2 -std=c++17 -Wall \
   -I/usr/local/cuda/include \
-  VkLayer_CudaRT.cpp cuda_bvh_backend.o rasterboost_upscale.o rasterboost_postfx.o rasterboost_framegen.o rt_denoise.o rt_ir_exec.o \
+  VkLayer_CudaRT.cpp cuda_bvh_backend.o rasterboost_upscale.o rasterboost_postfx.o rasterboost_framegen.o rt_denoise.o rt_ir_exec.o nrc.o \
   -L/usr/local/cuda/lib64 -lcudart \
   -L/usr/lib/x86_64-linux-gnu -lnvinfer \
   -o libVkLayer_CudaRT.so

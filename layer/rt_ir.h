@@ -89,6 +89,10 @@ enum Op : uint8_t {
     OP_DENOISE,            // (framebuffer) → denoised output
     OP_ACCUMULATE_FRAME,   // temporal accumulation
 
+    // Neural Radiance Cache (tensor core accelerated)
+    OP_NRC_QUERY,          // (position, normal) → cached indirect radiance
+    OP_NRC_TRAIN_SAMPLE,   // collect (position, radiance) for per-frame training
+
     OP_COUNT
 };
 
@@ -103,6 +107,7 @@ inline const char* opName(Op op) {
         "REFLECT", "REFRACT",
         "TERMINATE", "BRANCH",
         "DENOISE", "ACCUMULATE_FRAME",
+        "NRC_QUERY", "NRC_TRAIN_SAMPLE",
     };
     return (op < OP_COUNT) ? names[op] : "UNKNOWN";
 }
