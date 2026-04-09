@@ -576,6 +576,13 @@ static int g_trackVerbose = 0;
 #include "nrc.h"
 static NRCState* g_nrc = nullptr;
 static bool g_nrcEnabled = false;  // controlled by CUDA_RT_NRC=1 env var
+
+// Deferred CUDA trace — executed after BLAS is built in QueueSubmit
+static struct {
+    uint32_t width, height;
+    bool pending;
+} g_deferredTrace = {0, 0, false};
+
 #define LOG(fmt, ...) do { if (g_verbose) fprintf(stderr, "[CudaRT] " fmt "\n", ##__VA_ARGS__); } while(0)
 
 // ═══════════════════════════════════════════
@@ -955,15 +962,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
         modifiedCI.pNext = newHead;
     }
 
-    // Always clear rayQuery feature — the V100 driver may not support it natively,
-    // our layer handles it via SPIR-V rewrite regardless
+    // V100 driver reports rayQuery=true but CreateDevice fails when rayQuery=1
+    // is combined with some feature chains. Clear it and handle via AS interception.
     {
         VkBaseOutStructure* cur = (VkBaseOutStructure*)modifiedCI.pNext;
         while (cur) {
             if (cur->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR) {
                 auto* f = (VkPhysicalDeviceRayQueryFeaturesKHR*)cur;
                 if (f->rayQuery) {
-                    LOG("  → Clearing rayQuery=1→0 in CreateDevice (layer handles via SPIR-V rewrite)");
+                    LOG("  → Clearing rayQuery=1→0 (layer handles RT via CUDA BVH4 interception)");
                     f->rayQuery = VK_FALSE;
                 }
             }
@@ -2143,6 +2150,14 @@ static void processPendingBLAS() {
                 float* v0 = (float*)((char*)vertHost + i0 * pg.vertexStride);
                 float* v1 = (float*)((char*)vertHost + i1 * pg.vertexStride);
                 float* v2 = (float*)((char*)vertHost + i2 * pg.vertexStride);
+                static int idxDbg = 0;
+                if (idxDbg < 3) {
+                    LOG("  idx[%u]: i0=%u i1=%u i2=%u stride=%u vertBufSz=%zu",
+                        p, i0, i1, i2, pg.vertexStride, (size_t)pg.vertDataSize);
+                    LOG("  v0=(%.4f,%.4f,%.4f) v1=(%.4f,%.4f,%.4f) v2=(%.4f,%.4f,%.4f)",
+                        v0[0],v0[1],v0[2], v1[0],v1[1],v1[2], v2[0],v2[1],v2[2]);
+                    idxDbg++;
+                }
                 tri.v0[0]=v0[0]; tri.v0[1]=v0[1]; tri.v0[2]=v0[2];
                 tri.v1[0]=v1[0]; tri.v1[1]=v1[1]; tri.v1[2]=v1[2];
                 tri.v2[0]=v2[0]; tri.v2[1]=v2[1]; tri.v2[2]=v2[2];
@@ -2160,7 +2175,7 @@ static void processPendingBLAS() {
                 LOG("[BLAS-Val] asKey=0x%lx: %d tris, dumping %d:", (uint64_t)pb.asKey, (int)capturedTris.size(), n);
                 for (int t = 0; t < n; t++) {
                     auto& tri = capturedTris[t];
-                    LOG("  tri[%d]: (%.1f,%.1f,%.1f) (%.1f,%.1f,%.1f) (%.1f,%.1f,%.1f)",
+                    LOG("  tri[%d]: (%.4f,%.4f,%.4f) (%.4f,%.4f,%.4f) (%.4f,%.4f,%.4f)",
                         t, tri.v0[0],tri.v0[1],tri.v0[2], tri.v1[0],tri.v1[1],tri.v1[2], tri.v2[0],tri.v2[1],tri.v2[2]);
                 }
                 triDump++;
@@ -4261,6 +4276,12 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdTraceRaysKHR(
             float mrs = cudaBVH_tracePrimary(g_lastBLAS, side, cx, cy, cz - extent, nullptr);
             LOG("  → CUDA BVH4: %dx%d → %.0f MR/s (%.1f GR/s)", side, side, mrs, mrs/1000.f);
         }
+    } else if (replaceMode) {
+        // BLAS not yet built — defer the trace to QueueSubmit
+        g_deferredTrace.width = width;
+        g_deferredTrace.height = height;
+        g_deferredTrace.pending = true;
+        LOG("  → BLAS not ready, deferring CUDA trace to QueueSubmit");
     }
 
     // Forward to driver — SKIP in replace mode (the 1×1 dispatch still causes 65ms stall
@@ -4407,8 +4428,8 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdTraceRaysKHR(
             }
         }
 
-        // Save PPM on frame 3 for debugging
-        if (frameN == 3) {
+        // Save PPM on frame 1 for debugging
+        if (frameN == 1) {
             uint32_t* rgba = (uint32_t*)malloc(width * height * 4);
             if (rgba && cudaBVH_traceToRGBA(g_lastBLAS, width, height, camX, camY, camZ, rgba) == 0) {
                 FILE* fp = fopen("/tmp/cuda_rt_frame.ppm", "wb");
@@ -5580,6 +5601,35 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
         // Wait for this submission to complete so GPU buffers are filled
         disp.QueueWaitIdle(queue);
         processPendingBLAS();
+
+        // Execute deferred CUDA trace now that BLAS is ready
+        if (g_deferredTrace.pending && g_lastBLAS) {
+            g_deferredTrace.pending = false;
+            uint32_t w = g_deferredTrace.width, h = g_deferredTrace.height;
+            float cx, cy, cz, extent;
+            cudaBVH_getBounds(g_lastBLAS, &cx, &cy, &cz, &extent);
+
+            int side = (w > h) ? w : h;
+            float mrs = cudaBVH_tracePrimary(g_lastBLAS, side, cx, cy, cz + extent*1.2f, nullptr);
+            LOG("[Deferred] CUDA BVH4 trace: %dx%d → %.0f MR/s (%.2f ms/frame)",
+                side, side, mrs, (float)(side*side) / (mrs * 1000.f));
+
+            // Save PPM for visual verification
+            uint32_t* rgba = (uint32_t*)malloc(w * h * 4);
+            if (rgba && cudaBVH_traceToRGBA(g_lastBLAS, w, h, cx, cy, cz + extent*1.2f, rgba) == 0) {
+                FILE* fp = fopen("/tmp/cuda_rt_frame.ppm", "wb");
+                if (fp) {
+                    fprintf(fp, "P6\n%d %d\n255\n", w, h);
+                    for (uint32_t i = 0; i < w * h; i++) {
+                        uint8_t r = rgba[i] & 0xFF, g = (rgba[i]>>8) & 0xFF, b = (rgba[i]>>16) & 0xFF;
+                        fwrite(&r,1,1,fp); fwrite(&g,1,1,fp); fwrite(&b,1,1,fp);
+                    }
+                    fclose(fp);
+                    LOG("[Deferred] Saved frame to /tmp/cuda_rt_frame.ppm (%dx%d)", w, h);
+                }
+            }
+            free(rgba);
+        }
     }
     // Clear TLAS pending without stalling — will be processed from QueuePresent
     if (hasTLAS) {
