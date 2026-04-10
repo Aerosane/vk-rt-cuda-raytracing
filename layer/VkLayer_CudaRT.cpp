@@ -3194,6 +3194,47 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
             }
             triDumpCount++;
         }
+
+        // Validate origPrimI for BLAS#0 (BSP world)
+        static int origValidCount = 0;
+        if (origValidCount < 1 && !g_blasEntries.empty()) {
+            const auto& be0 = g_blasEntries[0];
+            int nTri = be0.numTris;
+            int tOff = be0.triOffset; // should be 0 for first BLAS
+            std::vector<int> seen(nTri, 0);
+            int badCount = 0, dupCount = 0;
+            int minOrig = INT_MAX, maxOrig = INT_MIN;
+            for (int t = 0; t < nTri; t++) {
+                int baseF = (tOff + t) * 12;
+                if (baseF + 11 >= (int)allTris.size()) break;
+                int origIdx;
+                memcpy(&origIdx, &allTris[baseF + 9], 4);
+                if (origIdx < 0 || origIdx >= nTri) {
+                    if (badCount < 5)
+                        LOG("[ORIG-VAL] BLAS#0 tri[%d]: origIdx=%d OUT OF RANGE [0,%d)", t, origIdx, nTri);
+                    badCount++;
+                } else {
+                    if (seen[origIdx]) dupCount++;
+                    seen[origIdx]++;
+                }
+                if (origIdx < minOrig) minOrig = origIdx;
+                if (origIdx > maxOrig) maxOrig = origIdx;
+            }
+            int missing = 0;
+            for (int i = 0; i < nTri; i++) if (!seen[i]) missing++;
+            LOG("[ORIG-VAL] BLAS#0: %d tris, origIdx range=[%d,%d], bad=%d, dup=%d, missing=%d",
+                nTri, minOrig, maxOrig, badCount, dupCount, missing);
+            // Also dump first 5 tris of BLAS#0
+            for (int t = 0; t < std::min(nTri, 5); t++) {
+                int baseF = (tOff + t) * 12;
+                if (baseF + 11 >= (int)allTris.size()) break;
+                float* p = allTris.data() + baseF;
+                int origIdx;
+                memcpy(&origIdx, &p[9], 4);
+                LOG("[ORIG-VAL] BLAS#0 tri[%d]: v0=(%.1f,%.1f,%.1f) origIdx=%d", t, p[0], p[1], p[2], origIdx);
+            }
+            origValidCount++;
+        }
     } else {
         // Fallback: single BLAS (g_lastBLAS)
         uint32_t* nodeData = nullptr;
@@ -6200,6 +6241,15 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
             if (it != g_rqPipelines.end()) {
                 isRQDispatch = true;
                 g_rqDispatchPerFrame++;
+                // Log dispatch size for first few RQ dispatches
+                static int rqDispLogCount = 0;
+                if (rqDispLogCount < 20) {
+                    fprintf(stderr, "[CudaRT] [RQ-DISP] #%d grid=(%u,%u,%u) pipe=0x%lx bvhSet=%d bvh2ready=%d tlasNodes=%d instances=%d\n",
+                            rqDispLogCount, groupCountX, groupCountY, groupCountZ,
+                            (uint64_t)pipeHandle, it->second.bvhDescSet,
+                            (int)g_bvh2.ready, g_bvh2.numTlasNodes, g_bvh2.numInstances);
+                    rqDispLogCount++;
+                }
                 VkPipelineLayout layout = it->second.layout;
                 uint32_t bvhSetIdx = (uint32_t)it->second.bvhDescSet;
 

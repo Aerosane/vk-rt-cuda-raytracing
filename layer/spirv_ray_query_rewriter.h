@@ -1794,7 +1794,9 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                     // Read ORIGINAL primitive index from packed tri p2.y (bitcast float→int)
                     uint32_t origPrimF = newId(), origPrimI = newId();
                     E(SpvOpCompositeExtract, {tFloat, origPrimF, p2, 1}); // p2.y
-                    E(SpvOpBitcast, {tInt, origPrimI, origPrimF});
+                    // Convert float→int (not bitcast — bitcast of small ints produces denormals
+                    // which GPU FTZ flushes to 0, corrupting all primitiveIDs)
+                    E(SpvOpConvertFToS, {tInt, origPrimI, origPrimF});
 #if SPIRV_RQ_FORCE_PRIM0
                     E(SpvOpStore, {tvHitPrim, c0}); // DEBUG: force primIdx=0
 #else

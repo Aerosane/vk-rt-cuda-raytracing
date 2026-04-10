@@ -718,9 +718,11 @@ CudaBVH_t cudaBVH_build(const CudaTri* tris, int numTris) {
         p[7] = h->h_triCopy[7][i];
         // p2 = {v2.z, origPrimIdx_as_float, 0, 0}
         p[8] = h->h_triCopy[8][i];
-        // Store original (pre-SAH-sort) primitive index as bitcast float
+        // Store original primitive index as proper float (not bitcast).
+        // Bitcast of small ints → denormal floats → GPU FTZ corrupts to 0.
+        // float32 has 23-bit mantissa → exact for integers up to 8M.
         int origIdx = (i < (int)bvh2.orderedOrigIdx.size()) ? bvh2.orderedOrigIdx[i] : i;
-        memcpy(&p[9], &origIdx, 4);
+        p[9] = (float)origIdx;
         p[10] = 0; p[11] = 0;
     }
     fprintf(stderr, "[CudaBVH] Packed %d tris → %d vec4s (%.1f KB)\n",
