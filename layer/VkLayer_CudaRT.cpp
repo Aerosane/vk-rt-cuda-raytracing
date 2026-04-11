@@ -6098,9 +6098,18 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
     void* key = getKey(queue);
     auto& disp = g_deviceMap[key];
 
-    // Fast path: after BLAS builds are done, pass through with zero overhead
+    // Fast path: after BLAS builds are done, pass through with minimal overhead
     if (g_blasBuildsDone) {
-        return disp.QueueSubmit(queue, submitCount, pSubmits, fence);
+        VkResult r = disp.QueueSubmit(queue, submitCount, pSubmits, fence);
+        // CUDA_RT_SYNC_SUBMIT: force GPU idle after every submit to prevent
+        // pushbuffer overflow and driver race conditions
+        static int syncSubmit = -1;
+        if (syncSubmit < 0) {
+            const char* e = getenv("CUDA_RT_SYNC_SUBMIT");
+            syncSubmit = (e && atoi(e)) ? 1 : 0;
+        }
+        if (syncSubmit && r == VK_SUCCESS) disp.QueueWaitIdle(queue);
+        return r;
     }
 
     // Call real submit first
@@ -6261,6 +6270,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
     static uint32_t presentCount = 0;
     presentCount++;
 
+    // CUDA_RT_FRAME_SYNC: DeviceWaitIdle every N frames to flush driver state
+    // and prevent UAF from accumulating in-flight resources
+    static int frameSyncInterval = -1;
+    if (frameSyncInterval < 0) {
+        const char* e = getenv("CUDA_RT_FRAME_SYNC");
+        frameSyncInterval = e ? atoi(e) : 0; // 0 = disabled
+        if (frameSyncInterval > 0)
+            LOG("[SYNC] Frame sync enabled: DeviceWaitIdle every %d frames", frameSyncInterval);
+    }
+    if (frameSyncInterval > 0 && (presentCount % frameSyncInterval) == 0) {
+        auto waitFn = (PFN_vkDeviceWaitIdle)pDisp->GetDeviceProcAddr(pDisp->device, "vkDeviceWaitIdle");
+        if (waitFn) waitFn(pDisp->device);
+    }
     // Initialize NRC on first frame (lazy init — needs CUDA context to be ready)
     if (!g_nrc && presentCount == 1) {
         const char* nrcEnv = getenv("CUDA_RT_NRC");
@@ -7066,31 +7088,33 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetDeviceProcAddr(VkDevice
         return nullptr;
     }
 
+    // CUDA_RT_LEAN=1: Minimal interception — only shader rewrite + extension/descriptor
+    // remapping. Skips draw/render/barrier/pipeline tracking for maximum driver stability.
+    static int leanMode = -1;
+    if (leanMode < 0) {
+        const char* env = getenv("CUDA_RT_LEAN");
+        leanMode = (env && atoi(env)) ? 1 : 0;
+        if (leanMode) LOG("LEAN MODE: Minimal interception (no draw/render/barrier hooks)");
+    }
+
+    // Pipeline creation + layout (needed for ext layout and RQ pipeline tracking)
     INTERCEPT(CreatePipelineLayout);
     INTERCEPT(CreateComputePipelines);
     INTERCEPT(CreateGraphicsPipelines);
-    INTERCEPT(CmdDispatch);
-    INTERCEPT(CmdDispatchIndirect);
-    INTERCEPT(QueueSubmit);
-    // QueueSubmit2 for Vulkan 1.3+ apps (GravityMark uses this for per-frame rendering)
-    if (strcmp(pName, "vkQueueSubmit2KHR") == 0 || strcmp(pName, "vkQueueSubmit2") == 0) {
-        void* key = getKey(device);
-        auto it = g_deviceMap.find(key);
-        if (it != g_deviceMap.end() && it->second.QueueSubmit2KHR) {
-            return (PFN_vkVoidFunction)layer_QueueSubmit2KHR;
-        }
-    }
-    // QueuePresentKHR: per-frame WSI present hook
-    if (strcmp(pName, "vkQueuePresentKHR") == 0) {
-        return (PFN_vkVoidFunction)layer_QueuePresentKHR;
-    }
-    // Debug: log ALL Queue and Submit function lookups
-    if (pName && (strstr(pName, "Queue") || strstr(pName, "Submit"))) {
-        fprintf(stderr, "[CudaRT] GetDeviceProcAddr: %s\n", pName);
+
+    if (!leanMode) {
+        // Draw/render tracking — only in full mode for profiling/debugging
+        INTERCEPT(CmdDrawIndexed);
+        INTERCEPT(CmdDraw);
+        INTERCEPT(CmdDrawIndexedIndirect);
+        INTERCEPT(CmdDrawIndirect);
+        INTERCEPT(CmdDrawIndexedIndirectCount);
+        INTERCEPT(CmdDrawIndirectCount);
+        if (!strcmp(pName, "vkCmdDrawIndexedIndirectCountKHR")) return (PFN_vkVoidFunction)layer_CmdDrawIndexedIndirectCount;
+        if (!strcmp(pName, "vkCmdDrawIndirectCountKHR")) return (PFN_vkVoidFunction)layer_CmdDrawIndirectCount;
     }
 
-    // RT interceptions — only intercept what's needed
-    // CmdBindPipeline: track compute pipeline binding (needed for BVH desc set)
+    // All other Cmd interceptions — needed for barrier remapping, pipeline tracking, etc.
     INTERCEPT(CmdBindPipeline);
     INTERCEPT(CmdBeginRenderPass);
     INTERCEPT(CmdEndRenderPass);
@@ -7101,26 +7125,33 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetDeviceProcAddr(VkDevice
     INTERCEPT(DestroyFramebuffer);
     INTERCEPT(CmdSetViewport);
     INTERCEPT(CmdSetScissor);
-    INTERCEPT(CmdDrawIndexed);
-    INTERCEPT(CmdDraw);
-    INTERCEPT(CmdDrawIndexedIndirect);
-    INTERCEPT(CmdDrawIndirect);
-    INTERCEPT(CmdDrawIndexedIndirectCount);
-    INTERCEPT(CmdDrawIndirectCount);
-    if (!strcmp(pName, "vkCmdDrawIndexedIndirectCountKHR")) return (PFN_vkVoidFunction)layer_CmdDrawIndexedIndirectCount;
-    if (!strcmp(pName, "vkCmdDrawIndirectCountKHR")) return (PFN_vkVoidFunction)layer_CmdDrawIndirectCount;
     INTERCEPT(CmdExecuteCommands);
+    INTERCEPT(QueueSubmit);
+    if (strcmp(pName, "vkQueueSubmit2KHR") == 0 || strcmp(pName, "vkQueueSubmit2") == 0) {
+        void* key = getKey(device);
+        auto it = g_deviceMap.find(key);
+        if (it != g_deviceMap.end() && it->second.QueueSubmit2KHR)
+            return (PFN_vkVoidFunction)layer_QueueSubmit2KHR;
+    }
+    if (strcmp(pName, "vkQueuePresentKHR") == 0)
+        return (PFN_vkVoidFunction)layer_QueuePresentKHR;
+
+    // Barrier remapping: MUST intercept even in lean mode to remap RT stage/access bits
     INTERCEPT(CmdPipelineBarrier);
     if (!strcmp(pName, "vkCmdPipelineBarrier2KHR") || !strcmp(pName, "vkCmdPipelineBarrier2"))
         return (PFN_vkVoidFunction)layer_CmdPipelineBarrier2KHR;
     INTERCEPT(CmdWaitEvents);
-    // NOTE: CmdBindDescriptorSets MUST be intercepted to eat RT bind point
-    // when STRIP_EXTENSIONS removes RT from the driver.
+
+    // Essential interceptions — always needed for RT emulation
     INTERCEPT(CmdBindDescriptorSets);
+    INTERCEPT(CmdDispatch);
+    INTERCEPT(CmdDispatchIndirect);
     INTERCEPT(CreateDescriptorPool);
     INTERCEPT(CreateDescriptorSetLayout);
     INTERCEPT(UpdateDescriptorSets);
     INTERCEPT(DestroyPipeline);
+
+    // AS emulation functions (handle with SSBO backend when STRIP_EXTENSIONS)
     INTERCEPT(CreateAccelerationStructureKHR);
     INTERCEPT(DestroyAccelerationStructureKHR);
     INTERCEPT(GetAccelerationStructureBuildSizesKHR);

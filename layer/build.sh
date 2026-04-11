@@ -43,7 +43,7 @@ echo "=== Building Neural Radiance Cache (WMMA) ==="
   nrc.cu -o nrc.o
 
 echo "=== Building VkLayer_CudaRT.so ==="
-g++ -shared -fPIC -fvisibility=hidden -O2 -std=c++17 -Wall \
+g++ -shared -fPIC -fvisibility=hidden -O2 -std=c++20 -Wall \
   -I/usr/local/cuda/include \
   VkLayer_CudaRT.cpp cuda_bvh_backend.o rasterboost_upscale.o rasterboost_postfx.o rasterboost_framegen.o rt_denoise.o rt_ir_exec.o nrc.o \
   -L/usr/local/cuda/lib64 -lcudart \
