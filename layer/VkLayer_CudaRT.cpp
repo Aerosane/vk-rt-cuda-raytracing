@@ -131,6 +131,7 @@ struct DeviceDispatch {
     PFN_vkGetBufferMemoryRequirements GetBufferMemoryRequirements;
     PFN_vkBindBufferMemory BindBufferMemory;
     PFN_vkCmdPipelineBarrier CmdPipelineBarrier;
+    PFN_vkCmdPipelineBarrier2KHR CmdPipelineBarrier2KHR;
     PFN_vkCmdCopyBuffer CmdCopyBuffer;
     PFN_vkCmdBindPipeline CmdBindPipeline;
 
@@ -150,6 +151,7 @@ struct DeviceDispatch {
     PFN_vkCreatePipelineLayout CreatePipelineLayout;
     PFN_vkDestroyPipelineLayout DestroyPipelineLayout;
     PFN_vkCreateComputePipelines CreateComputePipelines;
+    PFN_vkCreateGraphicsPipelines CreateGraphicsPipelines;
     PFN_vkDestroyPipeline DestroyPipeline;
     PFN_vkCreateShaderModule CreateShaderModule;
     PFN_vkDestroyShaderModule DestroyShaderModule;
@@ -160,6 +162,7 @@ struct DeviceDispatch {
     PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
     PFN_vkCmdPushConstants CmdPushConstants;
     PFN_vkCmdDispatch CmdDispatch;
+    PFN_vkCmdDispatchIndirect CmdDispatchIndirect;
     PFN_vkCmdFillBuffer CmdFillBuffer;
     PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
 
@@ -738,7 +741,8 @@ static VKAPI_ATTR void VKAPI_CALL layer_GetPhysicalDeviceFeatures2(
         if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR) {
             auto* f = (VkPhysicalDeviceRayQueryFeaturesKHR*)s;
             LOG("Features2[NV]: RQ: rayQuery=%d", f->rayQuery);
-            f->rayQuery = VK_TRUE;
+            bool hideAll = (getenv("CUDA_RT_HIDE_ALL") && atoi(getenv("CUDA_RT_HIDE_ALL")));
+            f->rayQuery = hideAll ? VK_FALSE : VK_TRUE;
         }
         if (s->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_MAINTENANCE_1_FEATURES_KHR) {
             auto* f = (VkPhysicalDeviceRayTracingMaintenance1FeaturesKHR*)s;
@@ -817,15 +821,26 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_EnumerateDeviceExtensionProperties(
         return false;
     };
 
-    // Build merged list, stripping pipeline ext if hidden
+    // Build merged list, stripping pipeline ext if hidden, optionally hide ALL RT
+    bool hideAllRT = false;
+    if (getenv("CUDA_RT_HIDE_ALL") && atoi(getenv("CUDA_RT_HIDE_ALL")))
+        hideAllRT = true;
+    
     std::vector<VkExtensionProperties> merged;
     for (auto& ext : driverExts) {
         if (hidePipeline && strcmp(ext.extensionName, "VK_KHR_ray_tracing_pipeline") == 0) {
             LOG("  → Hidden extension: %s (forcing ray_query path)", ext.extensionName);
             continue;
         }
+        if (hideAllRT && (strstr(ext.extensionName, "ray_query") ||
+                          strstr(ext.extensionName, "ray_tracing") ||
+                          strstr(ext.extensionName, "acceleration_structure"))) {
+            LOG("  → Hidden ALL RT extension: %s", ext.extensionName);
+            continue;
+        }
         merged.push_back(ext);
     }
+    if (!hideAllRT) {
     for (auto& rtName : rtExtNames) {
         if (!hasExt(rtName)) {
             VkExtensionProperties ext{};
@@ -834,6 +849,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_EnumerateDeviceExtensionProperties(
             merged.push_back(ext);
             LOG("  → Injected extension: %s", rtName);
         }
+    }
     }
 
     uint32_t totalCount = (uint32_t)merged.size();
@@ -1022,6 +1038,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
     LOAD_DEV(GetBufferMemoryRequirements);
     LOAD_DEV(BindBufferMemory);
     LOAD_DEV(CmdPipelineBarrier);
+    disp.CmdPipelineBarrier2KHR = (PFN_vkCmdPipelineBarrier2KHR)nextGDPA(*pDevice, "vkCmdPipelineBarrier2KHR");
+    if (!disp.CmdPipelineBarrier2KHR)
+        disp.CmdPipelineBarrier2KHR = (PFN_vkCmdPipelineBarrier2KHR)nextGDPA(*pDevice, "vkCmdPipelineBarrier2");
     LOAD_DEV(CmdCopyBuffer);
     LOAD_DEV(CmdBindPipeline);
     // External memory fd export for GPU-only buffer capture via CUDA
@@ -1038,6 +1057,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
     LOAD_DEV(CreatePipelineLayout);
     LOAD_DEV(DestroyPipelineLayout);
     LOAD_DEV(CreateComputePipelines);
+    LOAD_DEV(CreateGraphicsPipelines);
     LOAD_DEV(DestroyPipeline);
     LOAD_DEV(CreateShaderModule);
     LOAD_DEV(DestroyShaderModule);
@@ -1048,6 +1068,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
     LOAD_DEV(CmdBindDescriptorSets);
     LOAD_DEV(CmdPushConstants);
     LOAD_DEV(CmdDispatch);
+    LOAD_DEV(CmdDispatchIndirect);
     LOAD_DEV(CmdFillBuffer);
     LOAD_DEV(GetImageMemoryRequirements);
     // Render pass profiling
@@ -1219,8 +1240,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
         qpCI.queryCount = 64;  // 32 render passes × 2 (begin+end)
         disp.CreateQueryPool(*pDevice, &qpCI, nullptr, &g_profile.queryPool);
         g_profile.queryIdx = 0;
-        g_profile.ready = true;
-        LOG("  → Timestamp query pool created (64 slots)");
+        // Disable profiling for multi-threaded apps (Breaking Limit)
+        // Query pool commands from multiple threads can corrupt driver state
+        static bool noProfile = getenv("CUDA_RT_NO_PROFILE") != nullptr;
+        g_profile.ready = !noProfile;
+        LOG("  → Timestamp query pool created (64 slots, profiling=%s)", 
+            g_profile.ready ? "ON" : "OFF");
     }
 
     LOG("Device created — intercepting RT calls (async compute: %s)",
@@ -1784,7 +1809,23 @@ static std::mutex g_rqPipelineMutex;
 
 // Track per-command-buffer: which pipeline is currently bound (compute)
 static std::unordered_map<uint64_t, uint64_t> g_cmdBufBoundPipeline; // cmdBuf → VkPipeline
+static std::mutex g_cmdBufPipelineMutex; // protects g_cmdBufBoundPipeline
 static std::mutex g_cmdBufMutex;
+
+// V100 driver thread-safety workaround: serialize ALL driver vkCmd* calls
+// Enable with CUDA_RT_SERIALIZE_CMDS=1
+static std::mutex g_driverCmdMutex;
+static int g_serializeCmds = -1;
+static inline bool serializeCmds() {
+    if (g_serializeCmds < 0) {
+        const char* e = getenv("CUDA_RT_SERIALIZE_CMDS");
+        g_serializeCmds = (e && atoi(e)) ? 1 : 0;
+    }
+    return g_serializeCmds != 0;
+}
+#define DRIVER_CMD_LOCK() \
+    std::unique_lock<std::mutex> _drvLock(g_driverCmdMutex, std::defer_lock); \
+    if (serializeCmds()) _drvLock.lock()
 
 static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateShaderModule(
     VkDevice device,
@@ -1806,7 +1847,34 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateShaderModule(
 
     // Scan for ray query or ray tracing ops for debugging
     bool hasRayQuery = spirvHasRayQuery(spirvCode, numWords);
-    fprintf(stderr, "[CudaRT]   shader %zu words, hasRayQuery=%d\n", numWords, (int)hasRayQuery);
+    
+    // Also check for RayQueryKHR capability (4472) in shaders that don't have RQ ops
+    bool hasRQCapability = false;
+    {
+        size_t ii = 5;
+        while (ii < numWords) {
+            uint16_t wc = (uint16_t)(spirvCode[ii] >> 16);
+            uint16_t op = (uint16_t)(spirvCode[ii] & 0xFFFF);
+            if (wc == 0 || ii + wc > numWords) break;
+            if (op == 17 /*OpCapability*/ && wc >= 2 && spirvCode[ii+1] == 4472 /*RayQueryKHR*/) {
+                hasRQCapability = true;
+                break;
+            }
+            // Also check OpExtension for SPV_KHR_ray_query
+            if (op == 10 /*OpExtension*/ && wc >= 2) {
+                const char* ext = (const char*)&spirvCode[ii+1];
+                if (strstr(ext, "SPV_KHR_ray_query")) {
+                    hasRQCapability = true;
+                    break;
+                }
+            }
+            ii += wc;
+        }
+    }
+    if (hasRQCapability && !hasRayQuery) {
+        fprintf(stderr, "[CudaRT] WARNING: shader has RayQueryKHR capability but NO RQ ops — will confuse driver!\n");
+    }
+    fprintf(stderr, "[CudaRT]   shader %zu words, hasRayQuery=%d hasRQCap=%d\n", numWords, (int)hasRayQuery, (int)hasRQCapability);
 
     // IR lowering: analyze SPIR-V and build IR program (parallel to SPIR-V rewrite)
     if (g_useIR < 0) {
@@ -1826,13 +1894,54 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateShaderModule(
     // Try to rewrite ray query ops
     SpirvRewriteResult rw;
     static int noRewrite = -1;
+    static int stripOnlyMode = -1;
     if (noRewrite < 0) {
         const char* e = getenv("CUDA_RT_NO_REWRITE");
         noRewrite = (e && atoi(e)) ? 1 : 0;
     }
+    if (stripOnlyMode < 0) {
+        const char* e = getenv("CUDA_RT_STRIP_ONLY");
+        stripOnlyMode = (e && atoi(e)) ? 1 : 0;
+    }
     if (noRewrite) {
         rw.rewritten = false;
         fprintf(stderr, "[CudaRT] CUDA_RT_NO_REWRITE=1: skipping SPIR-V rewrite\n");
+    } else if (stripOnlyMode && hasRayQuery) {        // Strip ray_query capability/extension/type/ops from SPIR-V
+        // Replace with OpNop (word count=1, opcode=0) — no BVH injection
+        rw.code.assign(spirvCode, spirvCode + numWords);
+        rw.rewritten = true;
+        rw.bvhDescSet = -1;  // no BVH set needed
+        size_t ii = 5;
+        int stripped = 0;
+        while (ii < rw.code.size()) {
+            uint16_t wc = (uint16_t)(rw.code[ii] >> 16);
+            uint16_t op = (uint16_t)(rw.code[ii] & 0xFFFF);
+            if (wc == 0 || ii + wc > rw.code.size()) break;
+            bool strip = false;
+            // Strip OpCapability RayQueryKHR (4472)
+            if (op == 17 && wc >= 2 && rw.code[ii+1] == 4472) strip = true;
+            // Strip OpExtension "SPV_KHR_ray_query"
+            if (op == 10 && wc >= 2) {
+                const char* ext = (const char*)&rw.code[ii+1];
+                if (strstr(ext, "SPV_KHR_ray_query")) strip = true;
+            }
+            // Strip all ray_query ops (4472-4480, 4700-4707, 6016-6018)
+            if (op == 4472 || op == 4473 || // OpTypeRayQueryKHR, OpRQInitialize
+                op == 4474 || op == 4475 || // OpRQTerminate, OpRQGenerateIntersection
+                op == 4476 || op == 4477 || // OpRQConfirmIntersection, OpRQProceed
+                op == 4479 ||               // OpRQGetIntersectionType
+                op == 6016 || op == 6017 || op == 6018 ||  // extended RQ ops
+                (op >= 4700 && op <= 4707)) strip = true;  // RQ geometry ops
+            if (strip) {
+                // Replace entire instruction with OpNop words
+                for (size_t k = 0; k < wc; k++)
+                    rw.code[ii + k] = (1u << 16); // OpNop (wc=1, op=0)
+                stripped++;
+            }
+            ii += wc;
+        }
+        fprintf(stderr, "[CudaRT] STRIP_ONLY: stripped %d ray_query instructions from %zu-word shader\n",
+                stripped, numWords);
     } else {
         rw = spirvTryRewriteRayQuery(spirvCode, numWords);
     }
@@ -1844,12 +1953,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateShaderModule(
         // Dump rewritten SPIR-V for offline validation
         static int rqShaderIdx = 0;
         char dumpPath[256];
-        snprintf(dumpPath, sizeof(dumpPath), "/tmp/rq_rewritten_%d.spv", rqShaderIdx);
+        snprintf(dumpPath, sizeof(dumpPath), "/tmp/spirv_rq_dump_%d.spv", rqShaderIdx);
         FILE* dumpFp = fopen(dumpPath, "wb");
         if (dumpFp) {
             fwrite(rw.code.data(), 4, rw.code.size(), dumpFp);
             fclose(dumpFp);
-            LOG("  → Dumped rewritten SPIR-V to %s", dumpPath);
         }
         // Also dump original for comparison
         snprintf(dumpPath, sizeof(dumpPath), "/tmp/rq_original_%d.spv", rqShaderIdx);
@@ -1860,7 +1968,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateShaderModule(
         }
         rqShaderIdx++;
 
-        // Create shader module with rewritten SPIR-V
+        // Create shader module with REWRITTEN SPIR-V (replaces ray_query with BVH traversal).
+        // MUST rewrite ALL shaders (compute AND graphics) because the V100 driver's shader
+        // compiler heap-corrupts when processing native ray_query ops without RT hardware.
         VkShaderModuleCreateInfo modCI = *pCreateInfo;
         modCI.pCode = rw.code.data();
         modCI.codeSize = rw.code.size() * 4;
@@ -1988,6 +2098,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBuildAccelerationStructuresKHR(
     const VkAccelerationStructureBuildGeometryInfoKHR* pInfos,
     const VkAccelerationStructureBuildRangeInfoKHR* const* ppBuildRangeInfos)
 {
+    DRIVER_CMD_LOCK();
     // DEBUG: log every CmdBuildAS call at entry
     static int buildCallCount = 0;
     buildCallCount++;
@@ -3035,7 +3146,7 @@ static bool setupBVH2Descriptors(DeviceDispatch& disp) {
         bindings[i].binding = i;
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1;
-        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT;
+        bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     }
 
     VkDescriptorSetLayoutCreateInfo dsLayoutCI = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
@@ -4279,6 +4390,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdTraceRaysKHR(
     uint32_t height,
     uint32_t depth)
 {
+    DRIVER_CMD_LOCK();
     static int frameN = 0;
     static bool replaceMode = (getenv("CUDA_RT_REPLACE") && atoi(getenv("CUDA_RT_REPLACE")));
     
@@ -4513,6 +4625,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdTraceRaysIndirectKHR(
     const VkStridedDeviceAddressRegionKHR* pCallableSBT,
     VkDeviceAddress indirectDeviceAddress)
 {
+    DRIVER_CMD_LOCK();
     LOG("CmdTraceRaysIndirect: addr=0x%lx → CUDA engine dispatch", (uint64_t)indirectDeviceAddress);
 
     void* key = getKey(cmdBuf);
@@ -4766,8 +4879,126 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateComputePipelines(
 }
 
 // ═══════════════════════════════════════════
-// Intercepted: DestroyPipeline — skip dummy RT pipeline handles
+// Intercepted: CreateGraphicsPipelines — extend layout for RQ fragment/vertex shaders
+// V100 driver heap-corrupts when compiling ray_query SPIR-V, so ALL RQ shaders
+// are rewritten at CreateShaderModule time. Graphics pipelines using those shaders
+// also need extended layouts so the BVH descriptor set is accessible.
 // ═══════════════════════════════════════════
+static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateGraphicsPipelines(
+    VkDevice device,
+    VkPipelineCache pipelineCache,
+    uint32_t createInfoCount,
+    const VkGraphicsPipelineCreateInfo* pCreateInfos,
+    const VkAllocationCallbacks* pAllocator,
+    VkPipeline* pPipelines)
+{
+    fprintf(stderr, "[CudaRT] >>> CreateGraphicsPipelines ENTRY: count=%u\n", createInfoCount);
+    void* key = getKey(device);
+    auto& disp = g_deviceMap[key];
+
+    std::vector<VkGraphicsPipelineCreateInfo> modInfos(pCreateInfos, pCreateInfos + createInfoCount);
+    std::vector<VkPipelineLayout> extLayouts(createInfoCount, VK_NULL_HANDLE);
+    std::vector<int> rqSet(createInfoCount, -1);
+
+    setupBVH2Descriptors(disp);
+
+    for (uint32_t i = 0; i < createInfoCount; i++) {
+        // Scan ALL shader stages in this graphics pipeline for RQ shaders
+        int foundBvhSet = -1;
+        for (uint32_t s = 0; s < modInfos[i].stageCount; s++) {
+            uint64_t shaderHandle = (uint64_t)modInfos[i].pStages[s].module;
+            std::lock_guard<std::mutex> lock(g_rqShaderMutex);
+            auto it = g_rqShaders.find(shaderHandle);
+            if (it != g_rqShaders.end()) {
+                foundBvhSet = it->second.bvhDescSet;
+                LOG("CreateGraphicsPipeline[%u]: stage %u (flags=0x%x) uses RQ shader 0x%lx (bvhSet=%d)",
+                    i, s, modInfos[i].pStages[s].stage, shaderHandle, foundBvhSet);
+                break;  // one RQ stage is enough to trigger layout extension
+            }
+        }
+        // Debug: log first few graphics pipeline shader handles
+        static int gfxLogCount = 0;
+        if (gfxLogCount < 300) {
+            for (uint32_t s = 0; s < modInfos[i].stageCount; s++) {
+                uint64_t sh = (uint64_t)modInfos[i].pStages[s].module;
+                fprintf(stderr, "[CudaRT] GfxPipe[%u] stage[%u] stage=0x%x module=0x%lx inRQ=%d\n",
+                        i, s, modInfos[i].pStages[s].stage, sh,
+                        g_rqShaders.count(sh) ? 1 : 0);
+            }
+            gfxLogCount++;
+        }
+        if (foundBvhSet < 0 || !g_bvh2.dsLayout) continue;
+
+        rqSet[i] = foundBvhSet;
+        uint32_t bvhSet = (uint32_t)foundBvhSet;
+
+        if (!g_emptyDSLayout) {
+            VkDescriptorSetLayoutCreateInfo emptyCI = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            emptyCI.bindingCount = 0;
+            disp.CreateDescriptorSetLayout(device, &emptyCI, nullptr, &g_emptyDSLayout);
+        }
+
+        VkPipelineLayout origLayout = modInfos[i].layout;
+        std::vector<VkDescriptorSetLayout> appSetLayouts;
+        std::vector<VkPushConstantRange> appPushConstants;
+        {
+            std::lock_guard<std::mutex> lock2(g_pipelineLayoutMutex);
+            auto plt = g_pipelineLayouts.find((uint64_t)origLayout);
+            if (plt != g_pipelineLayouts.end()) {
+                appSetLayouts = plt->second.setLayouts;
+                appPushConstants = plt->second.pushConstantRanges;
+            }
+        }
+
+        std::vector<VkDescriptorSetLayout> sets(bvhSet + 1, g_emptyDSLayout);
+        for (uint32_t s = 0; s < appSetLayouts.size() && s < bvhSet; s++) {
+            sets[s] = appSetLayouts[s];
+        }
+        sets[bvhSet] = g_bvh2.dsLayout;
+
+        VkPipelineLayoutCreateInfo plCI = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
+        plCI.setLayoutCount = bvhSet + 1;
+        plCI.pSetLayouts = sets.data();
+        plCI.pushConstantRangeCount = (uint32_t)appPushConstants.size();
+        plCI.pPushConstantRanges = appPushConstants.empty() ? nullptr : appPushConstants.data();
+
+        if (disp.CreatePipelineLayout(device, &plCI, nullptr, &extLayouts[i]) != VK_SUCCESS) {
+            LOG("[BVH2] Failed to create extended layout for graphics RQ pipeline %u", i);
+            extLayouts[i] = VK_NULL_HANDLE;
+        } else {
+            LOG("[BVH2] Graphics pipeline %u: extended layout with %zu app sets + BVH2 at set=%u",
+                i, appSetLayouts.size(), bvhSet);
+        }
+    }
+
+    // Apply extended layouts
+    static int noExtLayout = -1;
+    if (noExtLayout < 0) {
+        const char* e = getenv("CUDA_RT_NO_EXT_LAYOUT");
+        noExtLayout = (e && atoi(e)) ? 1 : 0;
+    }
+    for (uint32_t i = 0; i < createInfoCount; i++) {
+        if (extLayouts[i] && !noExtLayout) {
+            modInfos[i].layout = extLayouts[i];
+        }
+    }
+    VkResult result = disp.CreateGraphicsPipelines(device, pipelineCache, createInfoCount,
+                                                     modInfos.data(), pAllocator, pPipelines);
+
+    if (result == VK_SUCCESS) {
+        for (uint32_t i = 0; i < createInfoCount; i++) {
+            if (rqSet[i] < 0 || !pPipelines[i]) continue;
+            uint64_t pipeHandle = (uint64_t)pPipelines[i];
+            std::lock_guard<std::mutex> lock2(g_rqPipelineMutex);
+            g_rqPipelines[pipeHandle] = {extLayouts[i], rqSet[i]};
+            LOG("CreateGraphicsPipeline: tracked RQ pipeline 0x%lx (extLayout=0x%lx, bvhSet=%d)",
+                pipeHandle, (uint64_t)extLayouts[i], rqSet[i]);
+        }
+    }
+
+    return result;
+}
+
 static VKAPI_ATTR void VKAPI_CALL layer_DestroyPipeline(
     VkDevice device,
     VkPipeline pipeline,
@@ -4794,7 +5025,29 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDescriptorPool(
 {
     void* key = getKey(device);
     auto& disp = g_deviceMap[key];
-    // Pass through — driver handles AS descriptor pools natively (driver 580+ has RT extensions)
+
+    static int stripExts = -1;
+    if (stripExts < 0) {
+        const char* e = getenv("CUDA_RT_STRIP_EXTENSIONS");
+        stripExts = (e && atoi(e)) ? 1 : 0;
+    }
+    if (stripExts && pCreateInfo->poolSizeCount > 0) {
+        // Replace AS pool type with STORAGE_BUFFER (keep count, merge if needed)
+        std::vector<VkDescriptorPoolSize> modified(
+            pCreateInfo->pPoolSizes, pCreateInfo->pPoolSizes + pCreateInfo->poolSizeCount);
+        bool anyChanged = false;
+        for (auto& ps : modified) {
+            if (ps.type == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) {
+                ps.type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                anyChanged = true;
+            }
+        }
+        if (anyChanged) {
+            VkDescriptorPoolCreateInfo modCI = *pCreateInfo;
+            modCI.pPoolSizes = modified.data();
+            return disp.CreateDescriptorPool(device, &modCI, pAllocator, pDescriptorPool);
+        }
+    }
     return disp.CreateDescriptorPool(device, pCreateInfo, pAllocator, pDescriptorPool);
 }
 
@@ -4809,7 +5062,30 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDescriptorSetLayout(
 {
     void* key = getKey(device);
     auto& disp = g_deviceMap[key];
-    // Pass through — driver handles AS bindings natively (driver 580+ has RT extensions)
+
+    static int stripExts = -1;
+    if (stripExts < 0) {
+        const char* e = getenv("CUDA_RT_STRIP_EXTENSIONS");
+        stripExts = (e && atoi(e)) ? 1 : 0;
+    }
+    if (stripExts && pCreateInfo->bindingCount > 0) {
+        // Instead of stripping AS bindings (which breaks pNext alignment),
+        // REPLACE AS descriptor type with STORAGE_BUFFER to keep binding count stable
+        std::vector<VkDescriptorSetLayoutBinding> modified(
+            pCreateInfo->pBindings, pCreateInfo->pBindings + pCreateInfo->bindingCount);
+        bool anyChanged = false;
+        for (auto& b : modified) {
+            if (b.descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) {
+                b.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                anyChanged = true;
+            }
+        }
+        if (anyChanged) {
+            VkDescriptorSetLayoutCreateInfo modCI = *pCreateInfo;
+            modCI.pBindings = modified.data();
+            return disp.CreateDescriptorSetLayout(device, &modCI, pAllocator, pSetLayout);
+        }
+    }
     return disp.CreateDescriptorSetLayout(device, pCreateInfo, pAllocator, pSetLayout);
 }
 
@@ -4825,7 +5101,55 @@ static VKAPI_ATTR void VKAPI_CALL layer_UpdateDescriptorSets(
 {
     void* key = getKey(device);
     auto& disp = g_deviceMap[key];
-    // Pass through - driver handles AS descriptor writes natively (real AS handles from CreateAS)
+
+    // When RT extensions are stripped, filter out AS descriptor writes
+    static int stripExts = -1;
+    if (stripExts < 0) {
+        const char* e = getenv("CUDA_RT_STRIP_EXTENSIONS");
+        stripExts = (e && atoi(e)) ? 1 : 0;
+    }
+    if (stripExts) {
+        // Since we remapped AS layout bindings to STORAGE_BUFFER,
+        // remap AS descriptor writes to STORAGE_BUFFER pointing to a null-safe buffer
+        std::vector<VkWriteDescriptorSet> modified;
+        std::vector<VkDescriptorBufferInfo> dummyBufInfos;
+        modified.reserve(descriptorWriteCount);
+        for (uint32_t i = 0; i < descriptorWriteCount; i++) {
+            VkWriteDescriptorSet w = pDescriptorWrites[i];
+            if (w.descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) {
+                // Remap to STORAGE_BUFFER with null-safe BVH buffer
+                if (g_bvh2.nodesBuf) {
+                    w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                    w.pNext = nullptr; // strip AS pNext
+                    size_t base = dummyBufInfos.size();
+                    for (uint32_t d = 0; d < w.descriptorCount; d++) {
+                        dummyBufInfos.push_back({g_bvh2.nodesBuf, 0, VK_WHOLE_SIZE});
+                    }
+                    w.pBufferInfo = nullptr; // will fix up below
+                    w.pImageInfo = nullptr;
+                    w.pTexelBufferView = nullptr;
+                    modified.push_back(w);
+                }
+                // If no BVH buffer yet, skip the write entirely
+                continue;
+            }
+            modified.push_back(w);
+        }
+        // Fix up buffer info pointers (vector may have reallocated)
+        for (auto& w : modified) {
+            if (w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && !w.pBufferInfo) {
+                // Find the next available dummy buffer info
+                static VkDescriptorBufferInfo fallback = {VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
+                w.pBufferInfo = dummyBufInfos.empty() ? &fallback : dummyBufInfos.data();
+            }
+        }
+        if (!modified.empty() || descriptorCopyCount > 0) {
+            disp.UpdateDescriptorSets(device, (uint32_t)modified.size(), modified.data(),
+                                       descriptorCopyCount, pDescriptorCopies);
+        }
+        return;
+    }
+
     disp.UpdateDescriptorSets(device, descriptorWriteCount, pDescriptorWrites,
                               descriptorCopyCount, pDescriptorCopies);
 }
@@ -5034,6 +5358,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdSetViewport(
     VkCommandBuffer cmdBuf, uint32_t firstViewport, uint32_t viewportCount,
     const VkViewport* pViewports)
 {
+    DRIVER_CMD_LOCK();
     void* key = getKey(cmdBuf);
     auto fn = (PFN_vkCmdSetViewport)g_deviceMap[key].GetDeviceProcAddr(
         g_deviceMap[key].device, "vkCmdSetViewport");
@@ -5060,6 +5385,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdSetScissor(
     VkCommandBuffer cmdBuf, uint32_t firstScissor, uint32_t scissorCount,
     const VkRect2D* pScissors)
 {
+    DRIVER_CMD_LOCK();
     void* key = getKey(cmdBuf);
     auto fn = (PFN_vkCmdSetScissor)g_deviceMap[key].GetDeviceProcAddr(
         g_deviceMap[key].device, "vkCmdSetScissor");
@@ -5155,43 +5481,51 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBeginRenderPass(
     const VkRenderPassBeginInfo* pRenderPassBegin,
     VkSubpassContents contents)
 {
+    DRIVER_CMD_LOCK();
     void* key = getKey(cmdBuf);
     auto& disp = g_deviceMap[key];
 
-    // Write GPU timestamp before render pass
-    if (g_profile.ready && g_profile.queryPool && g_profile.queryIdx < 62) {
-        uint32_t qi = g_profile.queryIdx;
-        disp.CmdResetQueryPool(cmdBuf, g_profile.queryPool, qi, 2);
-        disp.CmdWriteTimestamp(cmdBuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
-                               g_profile.queryPool, qi);
+    // NOTE: CmdBeginRenderPass can be called from multiple threads
+    // (multi-threaded command recording). All shared state must be protected.
+    
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        
+        // Write GPU timestamp before render pass
+        if (g_profile.ready && g_profile.queryPool && g_profile.queryIdx < 62) {
+            uint32_t qi = g_profile.queryIdx;
+            disp.CmdResetQueryPool(cmdBuf, g_profile.queryPool, qi, 2);
+            disp.CmdWriteTimestamp(cmdBuf, VK_PIPELINE_STAGE_TOP_OF_PIPE_BIT,
+                                   g_profile.queryPool, qi);
 
-        FrameProfile::PassTiming pt = {};
-        pt.renderPass = (uint64_t)pRenderPassBegin->renderPass;
-        pt.startQuery = qi;
-        pt.endQuery = qi + 1;
-        pt.width = pRenderPassBegin->renderArea.extent.width;
-        pt.height = pRenderPassBegin->renderArea.extent.height;
+            FrameProfile::PassTiming pt = {};
+            pt.renderPass = (uint64_t)pRenderPassBegin->renderPass;
+            pt.startQuery = qi;
+            pt.endQuery = qi + 1;
+            pt.width = pRenderPassBegin->renderArea.extent.width;
+            pt.height = pRenderPassBegin->renderArea.extent.height;
 
-        auto rpIt = g_renderPassInfo.find((uint64_t)pRenderPassBegin->renderPass);
-        if (rpIt != g_renderPassInfo.end())
-            pt.colorAttachments = rpIt->second.colorAttachments;
+            auto rpIt = g_renderPassInfo.find((uint64_t)pRenderPassBegin->renderPass);
+            if (rpIt != g_renderPassInfo.end())
+                pt.colorAttachments = rpIt->second.colorAttachments;
 
-        g_profile.passes.push_back(pt);
-        g_profile.queryIdx += 2;
-        g_profile.rpCount++;
-    }
+            g_profile.passes.push_back(pt);
+            g_profile.queryIdx += 2;
+            g_profile.rpCount++;
+        }
 
-    // Track current render pass index for draw call counting
-    g_currentRP = g_profile.rpCount > 0 ? g_profile.rpCount - 1 : 0;
-    if (g_currentRP < 8) g_drawsInRP[g_currentRP] = 0;
+        // Track current render pass index for draw call counting
+        g_currentRP = g_profile.rpCount > 0 ? g_profile.rpCount - 1 : 0;
+        if (g_currentRP < 8) g_drawsInRP[g_currentRP] = 0;
 
-    // Log subpass contents type for diagnostic
-    if (g_logFrame < 20) {
-        const char* cstr = (contents == VK_SUBPASS_CONTENTS_INLINE) ? "INLINE" : "SECONDARY_CMD_BUFS";
-        fprintf(stderr, "[CudaRT] Frame %lu RP%u: contents=%s\n",
-                (unsigned long)g_logFrame, g_logRPIdx, cstr);
-    }
-    g_logRPIdx++;
+        // Log subpass contents type for diagnostic
+        if (g_logFrame < 20) {
+            const char* cstr = (contents == VK_SUBPASS_CONTENTS_INLINE) ? "INLINE" : "SECONDARY_CMD_BUFS";
+            fprintf(stderr, "[CudaRT] Frame %lu RP%u: contents=%s\n",
+                    (unsigned long)g_logFrame, g_logRPIdx, cstr);
+        }
+        g_logRPIdx++;
+    } // unlock before driver call
 
     // G-Buffer: identify depth/MV images from framebuffer for this render pass
     if (g_rasterBoost.active && pRenderPassBegin) {
@@ -5235,15 +5569,17 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBeginRenderPass(
     }
 
     // Mid-RP timestamp: for RP2, add a BOTTOM_OF_PIPE timestamp right after begin
-    // This tells us if the stall is at render pass begin (load/clear) or at end
-    if (g_profile.ready && g_profile.queryPool && g_currentRP == 2 &&
-        g_profile.queryIdx < 62) {
-        uint32_t qi = g_profile.queryIdx;
-        disp.CmdResetQueryPool(cmdBuf, g_profile.queryPool, qi, 1);
-        disp.CmdWriteTimestamp(cmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                               g_profile.queryPool, qi);
-        g_profile.rp2MidQuery = qi;
-        g_profile.queryIdx += 1;
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        if (g_profile.ready && g_profile.queryPool && g_currentRP == 2 &&
+            g_profile.queryIdx < 62) {
+            uint32_t qi = g_profile.queryIdx;
+            disp.CmdResetQueryPool(cmdBuf, g_profile.queryPool, qi, 1);
+            disp.CmdWriteTimestamp(cmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                   g_profile.queryPool, qi);
+            g_profile.rp2MidQuery = qi;
+            g_profile.queryIdx += 1;
+        }
     }
 }
 
@@ -5251,6 +5587,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndexed(
     VkCommandBuffer cmdBuf, uint32_t indexCount, uint32_t instanceCount,
     uint32_t firstIndex, int32_t vertexOffset, uint32_t firstInstance)
 {
+    DRIVER_CMD_LOCK();
     if (g_currentRP < 8) g_drawsInRP[g_currentRP]++;
     // Explicit diagnostic: log ALL draws in RP2
     static uint64_t rp2DrawLog = 0;
@@ -5278,6 +5615,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDraw(
     VkCommandBuffer cmdBuf, uint32_t vertexCount, uint32_t instanceCount,
     uint32_t firstVertex, uint32_t firstInstance)
 {
+    DRIVER_CMD_LOCK();
     if (g_currentRP < 8) g_drawsInRP[g_currentRP]++;
     static uint64_t rp2Log = 0;
     if (g_currentRP == 2 && rp2Log < 10) {
@@ -5296,6 +5634,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndexedIndirect(
     VkCommandBuffer cmdBuf, VkBuffer buffer, VkDeviceSize offset,
     uint32_t drawCount, uint32_t stride)
 {
+    DRIVER_CMD_LOCK();
     if (g_currentRP < 8) g_drawsInRP[g_currentRP] += drawCount;
     void* key = getKey(cmdBuf);
     auto& disp = g_deviceMap[key];
@@ -5309,6 +5648,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndirect(
     VkCommandBuffer cmdBuf, VkBuffer buffer, VkDeviceSize offset,
     uint32_t drawCount, uint32_t stride)
 {
+    DRIVER_CMD_LOCK();
     if (g_currentRP < 8) g_drawsInRP[g_currentRP] += drawCount;
     void* key = getKey(cmdBuf);
     auto& disp = g_deviceMap[key];
@@ -5326,6 +5666,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndexedIndirectCount(
     VkBuffer countBuffer, VkDeviceSize countBufferOffset,
     uint32_t maxDrawCount, uint32_t stride)
 {
+    DRIVER_CMD_LOCK();
     if (g_currentRP < 8) g_drawsInRP[g_currentRP] += maxDrawCount;
     static uint64_t rp2Log = 0;
     if (g_currentRP == 2 && rp2Log < 20) {
@@ -5350,6 +5691,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndirectCount(
     VkBuffer countBuffer, VkDeviceSize countBufferOffset,
     uint32_t maxDrawCount, uint32_t stride)
 {
+    DRIVER_CMD_LOCK();
     if (g_currentRP < 8) g_drawsInRP[g_currentRP] += maxDrawCount;
     static uint64_t rp2Log = 0;
     if (g_currentRP == 2 && rp2Log < 20) {
@@ -5384,15 +5726,39 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdWaitEvents(
     uint32_t imageMemoryBarrierCount,
     const VkImageMemoryBarrier* pImageMemoryBarriers)
 {
+    DRIVER_CMD_LOCK();
     void* key = getKey(cmdBuf);
     auto& disp = g_deviceMap[key];
 
-    LOG("CmdWaitEvents: RP%u events=%u src=0x%x dst=0x%x", g_currentRP, eventCount, srcStageMask, dstStageMask);
+    // Remap RT stage/access bits for CmdWaitEvents too
+    const VkPipelineStageFlags RT_STAGE2 = VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+    const VkPipelineStageFlags AS_BUILD2 = 0x02000000;
+    VkPipelineStageFlags src2 = srcStageMask;
+    VkPipelineStageFlags dst2 = dstStageMask;
+    if (src2 & RT_STAGE2) { src2 = (src2 & ~RT_STAGE2) | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT; }
+    if (dst2 & RT_STAGE2) { dst2 = (dst2 & ~RT_STAGE2) | VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT; }
+    if (src2 & AS_BUILD2) { src2 = (src2 & ~AS_BUILD2) | VK_PIPELINE_STAGE_TRANSFER_BIT; }
+    if (dst2 & AS_BUILD2) { dst2 = (dst2 & ~AS_BUILD2) | VK_PIPELINE_STAGE_TRANSFER_BIT; }
 
-    disp.CmdWaitEvents(cmdBuf, eventCount, pEvents, srcStageMask, dstStageMask,
-                       memoryBarrierCount, pMemoryBarriers,
-                       bufferMemoryBarrierCount, pBufferMemoryBarriers,
-                       imageMemoryBarrierCount, pImageMemoryBarriers);
+    // Remap AS access flags in barrier copies (never modify app memory)
+    const VkAccessFlags AS_READ2  = 0x00200000;
+    const VkAccessFlags AS_WRITE2 = 0x00400000;
+    auto remapAccess2 = [&](VkAccessFlags f) -> VkAccessFlags {
+        if (f & AS_READ2)  f = (f & ~AS_READ2) | VK_ACCESS_SHADER_READ_BIT;
+        if (f & AS_WRITE2) f = (f & ~AS_WRITE2) | VK_ACCESS_SHADER_WRITE_BIT;
+        return f;
+    };
+    std::vector<VkMemoryBarrier> memB2(pMemoryBarriers, pMemoryBarriers + memoryBarrierCount);
+    for (auto& b : memB2) { b.srcAccessMask = remapAccess2(b.srcAccessMask); b.dstAccessMask = remapAccess2(b.dstAccessMask); }
+    std::vector<VkBufferMemoryBarrier> bufB2(pBufferMemoryBarriers, pBufferMemoryBarriers + bufferMemoryBarrierCount);
+    for (auto& b : bufB2) { b.srcAccessMask = remapAccess2(b.srcAccessMask); b.dstAccessMask = remapAccess2(b.dstAccessMask); }
+    std::vector<VkImageMemoryBarrier> imgB2(pImageMemoryBarriers, pImageMemoryBarriers + imageMemoryBarrierCount);
+    for (auto& b : imgB2) { b.srcAccessMask = remapAccess2(b.srcAccessMask); b.dstAccessMask = remapAccess2(b.dstAccessMask); }
+
+    disp.CmdWaitEvents(cmdBuf, eventCount, pEvents, src2, dst2,
+                       memoryBarrierCount, memB2.data(),
+                       bufferMemoryBarrierCount, bufB2.data(),
+                       imageMemoryBarrierCount, imgB2.data());
 }
 
 // ═══════════════════════════════════════════
@@ -5402,6 +5768,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdExecuteCommands(
     VkCommandBuffer cmdBuf, uint32_t commandBufferCount,
     const VkCommandBuffer* pCommandBuffers)
 {
+    DRIVER_CMD_LOCK();
     void* key = getKey(cmdBuf);
     auto& disp = g_deviceMap[key];
 
@@ -5421,31 +5788,37 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdExecuteCommands(
 static VKAPI_ATTR void VKAPI_CALL layer_CmdEndRenderPass(
     VkCommandBuffer cmdBuf)
 {
+    DRIVER_CMD_LOCK();
     void* key = getKey(cmdBuf);
     auto& disp = g_deviceMap[key];
 
-    // Pre-end timestamp (inside RP, before EndRenderPass) for RP2 diagnosis
-    uint32_t savedRP = g_currentRP; // save before we reset it
+    uint32_t savedRP = g_currentRP; // thread_local — safe
     
-    // Log draw counts per render pass (first few frames + periodic)
-    g_drawCountFrame++;
-    if (g_currentRP < 8 && (g_drawCountFrame <= 10 || g_drawCountFrame % 300 == 0)) {
-        if (g_drawsInRP[g_currentRP] > 0)
-            LOG("[PROFILE] RP%u ended: %u draw calls", g_currentRP, g_drawsInRP[g_currentRP]);
+    // Log draw counts per render pass
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        g_drawCountFrame++;
+        if (g_currentRP < 8 && (g_drawCountFrame <= 10 || g_drawCountFrame % 300 == 0)) {
+            if (g_drawsInRP[g_currentRP] > 0)
+                LOG("[PROFILE] RP%u ended: %u draw calls", g_currentRP, g_drawsInRP[g_currentRP]);
+        }
     }
-    g_currentRP = UINT32_MAX;
+    g_currentRP = UINT32_MAX; // thread_local
 
-    // Reset per-frame RP counter
-    if (g_logRPIdx >= 5) { g_logRPIdx = 0; g_logFrame++; }
+    // Reset per-frame RP counter (thread_local)
+    if (g_logRPIdx >= 5) { g_logRPIdx = 0; std::lock_guard<std::mutex> lock(g_lock); g_logFrame++; }
 
     // For RP2: write timestamp INSIDE the render pass, BEFORE ending it
-    if (g_profile.ready && g_profile.queryPool && savedRP == 2 && g_profile.queryIdx < 62) {
-        uint32_t qi = g_profile.queryIdx;
-        disp.CmdResetQueryPool(cmdBuf, g_profile.queryPool, qi, 1);
-        disp.CmdWriteTimestamp(cmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                               g_profile.queryPool, qi);
-        g_profile.rp2PreEndQuery = qi;
-        g_profile.queryIdx += 1;
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        if (g_profile.ready && g_profile.queryPool && savedRP == 2 && g_profile.queryIdx < 62) {
+            uint32_t qi = g_profile.queryIdx;
+            disp.CmdResetQueryPool(cmdBuf, g_profile.queryPool, qi, 1);
+            disp.CmdWriteTimestamp(cmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                   g_profile.queryPool, qi);
+            g_profile.rp2PreEndQuery = qi;
+            g_profile.queryIdx += 1;
+        }
     }
 
     // RasterBoost: flush pending draw batch before ending render pass
@@ -5456,25 +5829,26 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdEndRenderPass(
     disp.CmdEndRenderPass(cmdBuf);
 
     // Write GPU timestamp after render pass
-    if (g_profile.ready && g_profile.queryPool && !g_profile.passes.empty()) {
-        auto& lastPass = g_profile.passes.back();
-        if (lastPass.endQuery < 64) {
-            disp.CmdWriteTimestamp(cmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
-                                   g_profile.queryPool, lastPass.endQuery);
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        if (g_profile.ready && g_profile.queryPool && !g_profile.passes.empty()) {
+            auto& lastPass = g_profile.passes.back();
+            if (lastPass.endQuery < 64) {
+                disp.CmdWriteTimestamp(cmdBuf, VK_PIPELINE_STAGE_BOTTOM_OF_PIPE_BIT,
+                                       g_profile.queryPool, lastPass.endQuery);
+            }
         }
     }
 
     // RasterBoost: Detect post-FX passes for async compute overlap
-    // Heuristic: fullscreen quad pass = 1-3 draws, no depth, matching output res
     if (g_rasterBoost.active && savedRP < 8 && g_drawsInRP[savedRP] <= 3 &&
         g_drawsInRP[savedRP] > 0) {
-        // Check if this was a post-FX pass (no depth, low draw count)
+        std::lock_guard<std::mutex> lock(g_lock);
         if (!g_profile.passes.empty()) {
             auto& pt = g_profile.passes.back();
             auto rpIt = g_renderPassInfo.find(pt.renderPass);
             if (rpIt != g_renderPassInfo.end() && rpIt->second.depthAttachment == 0 &&
                 rpIt->second.colorAttachments <= 2) {
-                // This is likely a post-FX pass — tag for potential async reroute
                 static uint64_t postfxCount = 0;
                 postfxCount++;
                 if (postfxCount <= 5 || postfxCount % 500 == 0) {
@@ -5498,6 +5872,8 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindPipeline(
         return; // Don't forward — we handle RT entirely
     }
 
+    DRIVER_CMD_LOCK();
+
     // RasterBoost: flush pending draw batch on pipeline change
     if (g_drawBatch.enabled && bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS &&
         !g_drawBatch.pending.empty()) {
@@ -5512,12 +5888,31 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindPipeline(
         LOG("!!! CmdBindPipeline in RP2: bind=%d pipe=0x%lx", bindPoint, (uint64_t)pipeline);
     }
     // Lock-free compute pipeline tracking: use atomic store
-    // Only compute pipelines need tracking (for BVH desc binding in CmdDispatch)
-    if (bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE) {
-        // Use thread-local-ish approach: store last bound pipeline per cmdBuf.
-        // Since command buffers are single-threaded by spec, no mutex needed
-        // for the write. Readers in CmdDispatch use the same cmdBuf → same thread.
-        g_cmdBufBoundPipeline[(uint64_t)cmdBuf] = (uint64_t)pipeline; // lock-free: same thread
+    // Track both compute and graphics pipelines for layout replacement in CmdBindDescriptorSets
+    if (bindPoint == VK_PIPELINE_BIND_POINT_COMPUTE || bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS) {
+        // Command buffers are single-threaded, but different CBs on different 
+        // threads share this map → must synchronize
+        std::lock_guard<std::mutex> lock(g_cmdBufPipelineMutex);
+        g_cmdBufBoundPipeline[(uint64_t)cmdBuf] = (uint64_t)pipeline;
+    }
+    // Graphics pipelines with RQ shaders also need BVH descriptor binding
+    {
+    static int noBvhBind2 = -1;
+    if (noBvhBind2 < 0) { const char* e = getenv("CUDA_RT_NO_BVH_BIND"); noBvhBind2 = (e && atoi(e)) ? 1 : 0; }
+    if (!noBvhBind2 && bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS && g_bvh2.descSet) {
+        auto it = g_rqPipelines.find((uint64_t)pipeline);
+        if (it != g_rqPipelines.end()) {
+            VkPipelineLayout layout = it->second.layout;
+            uint32_t bvhSetIdx = (uint32_t)it->second.bvhDescSet;
+            if (layout && bvhSetIdx < 32) {
+                void* k2 = getKey(cmdBuf);
+                auto& d2 = g_deviceMap[k2];
+                d2.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                          layout, bvhSetIdx, 1,
+                                          &g_bvh2.descSet, 0, nullptr);
+            }
+        }
+    }
     }
     void* key = getKey(cmdBuf);
     auto& disp = g_deviceMap[key];
@@ -5527,6 +5922,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindPipeline(
 // ═══════════════════════════════════════════
 // Intercepted: CmdBindDescriptorSets — eat RT bind point
 // ═══════════════════════════════════════════
+static std::mutex g_bindDescSetMutex; // serialize CmdBindDescriptorSets (V100 driver thread-safety bug)
 static VKAPI_ATTR void VKAPI_CALL layer_CmdBindDescriptorSets(
     VkCommandBuffer cmdBuf,
     VkPipelineBindPoint bindPoint,
@@ -5537,13 +5933,26 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindDescriptorSets(
     uint32_t dynamicOffsetCount,
     const uint32_t* pDynamicOffsets)
 {
-    if (bindPoint == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR) [[unlikely]] {
-        LOG("CmdBindDescriptorSets: RT bindpoint set=%u count=%u (intercepted)", firstSet, descriptorSetCount);
-        return; // Don't forward — driver doesn't support RT bind point in stripped mode
+    static int stripExts2 = -1;
+    if (stripExts2 < 0) {
+        const char* e = getenv("CUDA_RT_STRIP_EXTENSIONS");
+        stripExts2 = (e && atoi(e)) ? 1 : 0;
     }
+    if (stripExts2 && bindPoint == VK_PIPELINE_BIND_POINT_RAY_TRACING_KHR) [[unlikely]] {
+        return;
+    }
+    DRIVER_CMD_LOCK();
+
+    // NOTE: Layout replacement in CmdBindDescriptorSets was tested and found HARMFUL.
+    // The extended layout E in CmdBindDescriptorSets confuses the driver's internal
+    // descriptor validation. App's original layout L is correct here — the pipeline
+    // was created with E but descriptor sets were allocated against L's set layouts.
+    // Layout compatibility (Vulkan spec 14.2.2) ensures sets 0..N-1 work with either.
+    VkPipelineLayout effectiveLayout = layout;
+
     void* key = getKey(cmdBuf);
     auto& disp = g_deviceMap[key];
-    disp.CmdBindDescriptorSets(cmdBuf, bindPoint, layout, firstSet, descriptorSetCount,
+    disp.CmdBindDescriptorSets(cmdBuf, bindPoint, effectiveLayout, firstSet, descriptorSetCount,
                                pDescriptorSets, dynamicOffsetCount, pDynamicOffsets);
 }
 
@@ -5562,34 +5971,116 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdPipelineBarrier(
     uint32_t imageMemoryBarrierCount,
     const VkImageMemoryBarrier* pImageMemoryBarriers)
 {
-    // Replace RT shader stage bits with compute shader stage bits
+    DRIVER_CMD_LOCK();
+    // Replace RT-related pipeline stage bits with compute equivalents
+    // when STRIP_EXTENSIONS removes RT from the driver
     const VkPipelineStageFlags RT_STAGE = VK_PIPELINE_STAGE_RAY_TRACING_SHADER_BIT_KHR;
+    const VkPipelineStageFlags AS_BUILD_STAGE = 0x02000000; // VK_PIPELINE_STAGE_ACCELERATION_STRUCTURE_BUILD_BIT_KHR
     const VkPipelineStageFlags COMPUTE_STAGE = VK_PIPELINE_STAGE_COMPUTE_SHADER_BIT;
+    const VkPipelineStageFlags TRANSFER_STAGE = VK_PIPELINE_STAGE_TRANSFER_BIT;
     VkPipelineStageFlags src = srcStageMask;
     VkPipelineStageFlags dst = dstStageMask;
     if (src & RT_STAGE) { src = (src & ~RT_STAGE) | COMPUTE_STAGE; }
     if (dst & RT_STAGE) { dst = (dst & ~RT_STAGE) | COMPUTE_STAGE; }
+    if (src & AS_BUILD_STAGE) { src = (src & ~AS_BUILD_STAGE) | TRANSFER_STAGE; }
+    if (dst & AS_BUILD_STAGE) { dst = (dst & ~AS_BUILD_STAGE) | TRANSFER_STAGE; }
 
-    // Diagnostic: log barriers (especially inside render passes)
-    static uint64_t barrierCount = 0;
-    barrierCount++;
-    if (barrierCount <= 50 || barrierCount % 300 == 0) {
-        LOG("CmdPipelineBarrier: RP%u src=0x%x dst=0x%x mem=%u buf=%u img=%u dep=0x%x",
-            g_currentRP, src, dst, memoryBarrierCount,
-            bufferMemoryBarrierCount, imageMemoryBarrierCount, dependencyFlags);
-        for (uint32_t i = 0; i < imageMemoryBarrierCount && i < 3; i++) {
-            LOG("  imgBarrier[%u]: srcAccess=0x%x dstAccess=0x%x oldL=%u newL=%u",
-                i, pImageMemoryBarriers[i].srcAccessMask, pImageMemoryBarriers[i].dstAccessMask,
-                pImageMemoryBarriers[i].oldLayout, pImageMemoryBarriers[i].newLayout);
-        }
+    // Remap AS access flags in ALL barrier types (use copies, never modify app memory)
+    const VkAccessFlags AS_READ  = 0x00200000; // VK_ACCESS_ACCELERATION_STRUCTURE_READ_BIT_KHR
+    const VkAccessFlags AS_WRITE = 0x00400000; // VK_ACCESS_ACCELERATION_STRUCTURE_WRITE_BIT_KHR
+    auto remapAccess = [&](VkAccessFlags flags) -> VkAccessFlags {
+        if (flags & AS_READ)  flags = (flags & ~AS_READ) | VK_ACCESS_SHADER_READ_BIT;
+        if (flags & AS_WRITE) flags = (flags & ~AS_WRITE) | VK_ACCESS_SHADER_WRITE_BIT;
+        return flags;
+    };
+
+    // Copy and remap memory barriers
+    std::vector<VkMemoryBarrier> memBarriers(pMemoryBarriers, pMemoryBarriers + memoryBarrierCount);
+    for (auto& mb : memBarriers) {
+        mb.srcAccessMask = remapAccess(mb.srcAccessMask);
+        mb.dstAccessMask = remapAccess(mb.dstAccessMask);
+    }
+    // Copy and remap buffer memory barriers
+    std::vector<VkBufferMemoryBarrier> bufBarriers(pBufferMemoryBarriers, pBufferMemoryBarriers + bufferMemoryBarrierCount);
+    for (auto& bb : bufBarriers) {
+        bb.srcAccessMask = remapAccess(bb.srcAccessMask);
+        bb.dstAccessMask = remapAccess(bb.dstAccessMask);
+    }
+    // Copy and remap image memory barriers
+    std::vector<VkImageMemoryBarrier> imgBarriers(pImageMemoryBarriers, pImageMemoryBarriers + imageMemoryBarrierCount);
+    for (auto& ib : imgBarriers) {
+        ib.srcAccessMask = remapAccess(ib.srcAccessMask);
+        ib.dstAccessMask = remapAccess(ib.dstAccessMask);
     }
 
     void* key = getKey(cmdBuf);
     auto& disp = g_deviceMap[key];
     disp.CmdPipelineBarrier(cmdBuf, src, dst, dependencyFlags,
-                            memoryBarrierCount, pMemoryBarriers,
-                            bufferMemoryBarrierCount, pBufferMemoryBarriers,
-                            imageMemoryBarrierCount, pImageMemoryBarriers);
+                            memoryBarrierCount, memBarriers.data(),
+                            bufferMemoryBarrierCount, bufBarriers.data(),
+                            imageMemoryBarrierCount, imgBarriers.data());
+}
+
+// ═══════════════════════════════════════════
+// Intercepted: CmdPipelineBarrier2KHR — remap RT stage/access flags (Vulkan 1.3 sync2)
+// ═══════════════════════════════════════════
+static VKAPI_ATTR void VKAPI_CALL layer_CmdPipelineBarrier2KHR(
+    VkCommandBuffer cmdBuf,
+    const VkDependencyInfo* pDependencyInfo)
+{
+    DRIVER_CMD_LOCK();
+    void* key = getKey(cmdBuf);
+    auto& disp = g_deviceMap[key];
+
+    if (!pDependencyInfo) {
+        if (disp.CmdPipelineBarrier2KHR)
+            disp.CmdPipelineBarrier2KHR(cmdBuf, pDependencyInfo);
+        return;
+    }
+
+    const VkPipelineStageFlags2 RT2  = VK_PIPELINE_STAGE_2_RAY_TRACING_SHADER_BIT_KHR;
+    const VkPipelineStageFlags2 ASB2 = VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_BUILD_BIT_KHR;
+    const VkPipelineStageFlags2 ASC2 = 0x10000000ULL; // VK_PIPELINE_STAGE_2_ACCELERATION_STRUCTURE_COPY_BIT_KHR
+    const VkAccessFlags2 AR2  = VK_ACCESS_2_ACCELERATION_STRUCTURE_READ_BIT_KHR;
+    const VkAccessFlags2 AW2  = VK_ACCESS_2_ACCELERATION_STRUCTURE_WRITE_BIT_KHR;
+    auto remapStage2 = [&](VkPipelineStageFlags2 s) -> VkPipelineStageFlags2 {
+        if (s & RT2)  s = (s & ~RT2)  | VK_PIPELINE_STAGE_2_COMPUTE_SHADER_BIT;
+        if (s & ASB2) s = (s & ~ASB2) | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        if (s & ASC2) s = (s & ~ASC2) | VK_PIPELINE_STAGE_2_TRANSFER_BIT;
+        return s;
+    };
+    auto remapAccess2s = [&](VkAccessFlags2 a) -> VkAccessFlags2 {
+        if (a & AR2) a = (a & ~AR2) | VK_ACCESS_2_SHADER_READ_BIT;
+        if (a & AW2) a = (a & ~AW2) | VK_ACCESS_2_SHADER_WRITE_BIT;
+        return a;
+    };
+
+    // Copy and remap all barrier arrays
+    std::vector<VkMemoryBarrier2> memB(pDependencyInfo->pMemoryBarriers,
+        pDependencyInfo->pMemoryBarriers + pDependencyInfo->memoryBarrierCount);
+    for (auto& b : memB) {
+        b.srcStageMask = remapStage2(b.srcStageMask); b.dstStageMask = remapStage2(b.dstStageMask);
+        b.srcAccessMask = remapAccess2s(b.srcAccessMask); b.dstAccessMask = remapAccess2s(b.dstAccessMask);
+    }
+    std::vector<VkBufferMemoryBarrier2> bufB(pDependencyInfo->pBufferMemoryBarriers,
+        pDependencyInfo->pBufferMemoryBarriers + pDependencyInfo->bufferMemoryBarrierCount);
+    for (auto& b : bufB) {
+        b.srcStageMask = remapStage2(b.srcStageMask); b.dstStageMask = remapStage2(b.dstStageMask);
+        b.srcAccessMask = remapAccess2s(b.srcAccessMask); b.dstAccessMask = remapAccess2s(b.dstAccessMask);
+    }
+    std::vector<VkImageMemoryBarrier2> imgB(pDependencyInfo->pImageMemoryBarriers,
+        pDependencyInfo->pImageMemoryBarriers + pDependencyInfo->imageMemoryBarrierCount);
+    for (auto& b : imgB) {
+        b.srcStageMask = remapStage2(b.srcStageMask); b.dstStageMask = remapStage2(b.dstStageMask);
+        b.srcAccessMask = remapAccess2s(b.srcAccessMask); b.dstAccessMask = remapAccess2s(b.dstAccessMask);
+    }
+
+    VkDependencyInfo dep2 = *pDependencyInfo;
+    dep2.pMemoryBarriers = memB.data();
+    dep2.pBufferMemoryBarriers = bufB.data();
+    dep2.pImageMemoryBarriers = imgB.data();
+
+    disp.CmdPipelineBarrier2KHR(cmdBuf, &dep2);
 }
 
 // ═══════════════════════════════════════════
@@ -6215,6 +6706,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
     uint32_t groupCountY,
     uint32_t groupCountZ)
 {
+    DRIVER_CMD_LOCK();
     void* key = getKey(cmdBuf);
     auto& disp = g_deviceMap[key];
 
@@ -6239,10 +6731,15 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
 
     // Lock-free check: RQ pipeline set is immutable after creation.
     // cmdBuf pipeline tracking is single-threaded per Vulkan spec.
-    if (g_bvh2.ready) [[likely]] {
+    // Skip ALL BVH binding if CUDA_RT_NO_BVH_BIND=1 (debugging: reduce pushbuf pressure)
+    static int noBvhBind = -1;
+    if (noBvhBind < 0) { const char* e = getenv("CUDA_RT_NO_BVH_BIND"); noBvhBind = (e && atoi(e)) ? 1 : 0; }
+
+    // Bind BVH descriptor set whenever we have one (null-safe buffers are fine)
+    if (!noBvhBind && g_bvh2.descSet) [[likely]] {
         uint64_t pipeHandle = 0;
         {
-            // No mutex needed: same thread that called CmdBindPipeline
+            std::lock_guard<std::mutex> lock(g_cmdBufPipelineMutex);
             auto it = g_cmdBufBoundPipeline.find((uint64_t)cmdBuf);
             if (it != g_cmdBufBoundPipeline.end()) pipeHandle = it->second;
         }
@@ -6277,10 +6774,25 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
                 }
 
                 if (layout && g_bvh2.descSet) {
+                    static int bindLog = 0;
+                    if (bindLog < 20) {
+                        LOG("[BVH-BIND] PRE-BIND: set=%u layout=%p descSet=%p pipe=0x%lx", 
+                            bvhSetIdx, (void*)layout, (void*)g_bvh2.descSet, pipeHandle);
+                    }
                     // Bind BVH2 descriptor set at the rewriter's chosen set index
                     disp.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
                                                 layout, bvhSetIdx, 1,
                                                 &g_bvh2.descSet, 0, nullptr);
+                    if (bindLog < 20) {
+                        bindLog++;
+                        LOG("[BVH-BIND] POST-BIND: set=%u OK", bvhSetIdx);
+                    }
+                } else {
+                    static int nobindLog = 0;
+                    if (nobindLog < 10) {
+                        nobindLog++;
+                        LOG("[BVH-BIND] FAILED: layout=%p descSet=%p", (void*)layout, (void*)g_bvh2.descSet);
+                    }
                 }
             }
         }
@@ -6315,6 +6827,52 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
         }
     }
     disp.CmdDispatch(cmdBuf, dispX, dispY, dispZ);
+}
+
+// ═══════════════════════════════════════════
+// Intercepted: CmdDispatchIndirect — bind BVH2 descriptor set for RQ pipelines (indirect path)
+// ═══════════════════════════════════════════
+static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatchIndirect(
+    VkCommandBuffer cmdBuf,
+    VkBuffer buffer,
+    VkDeviceSize offset)
+{
+    DRIVER_CMD_LOCK();
+    void* key = getKey(cmdBuf);
+    auto& disp = g_deviceMap[key];
+
+    // Same BVH binding logic as CmdDispatch
+    if (g_bvh2.descSet) [[likely]] {
+        uint64_t pipeHandle = 0;
+        {
+            std::lock_guard<std::mutex> lock(g_cmdBufPipelineMutex);
+            auto it = g_cmdBufBoundPipeline.find((uint64_t)cmdBuf);
+            if (it != g_cmdBufBoundPipeline.end()) pipeHandle = it->second;
+        }
+        if (pipeHandle) {
+            auto it = g_rqPipelines.find(pipeHandle);
+            if (it != g_rqPipelines.end()) {
+                static int rqIndLog = 0;
+                if (rqIndLog < 10) {
+                    fprintf(stderr, "[CudaRT] [RQ-DISP-IND] pipe=0x%lx bvhSet=%d\n",
+                            pipeHandle, it->second.bvhDescSet);
+                    rqIndLog++;
+                }
+                VkPipelineLayout layout = it->second.layout;
+                uint32_t bvhSetIdx = (uint32_t)it->second.bvhDescSet;
+                if (layout && g_bvh2.descSet) {
+                    disp.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                layout, bvhSetIdx, 1,
+                                                &g_bvh2.descSet, 0, nullptr);
+                }
+                // Apply same HALF_RES NOP logic
+                static int halfRes2 = -1;
+                if (halfRes2 < 0) { const char* e = getenv("CUDA_RT_HALF_RES"); halfRes2 = e ? atoi(e) : 0; }
+                if (halfRes2 >= 3) return;
+            }
+        }
+    }
+    disp.CmdDispatchIndirect(cmdBuf, buffer, offset);
 }
 
 // ═══════════════════════════════════════════
@@ -6379,6 +6937,7 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetInstanceProcAddr(VkInst
     // (GravityMark does this for vkQueueSubmit, bypassing device-level intercept)
     INTERCEPT(QueueSubmit);
     INTERCEPT(CmdDispatch);
+    INTERCEPT(CmdDispatchIndirect);
     INTERCEPT(CmdBuildAccelerationStructuresKHR);
     INTERCEPT(CmdBindPipeline);
     INTERCEPT(CmdBeginRenderPass);
@@ -6400,10 +6959,16 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetInstanceProcAddr(VkInst
     if (!strcmp(pName, "vkCmdDrawIndirectCountKHR")) return (PFN_vkVoidFunction)layer_CmdDrawIndirectCount;
     INTERCEPT(CmdExecuteCommands);
     INTERCEPT(CmdPipelineBarrier);
+    if (!strcmp(pName, "vkCmdPipelineBarrier2KHR") || !strcmp(pName, "vkCmdPipelineBarrier2"))
+        return (PFN_vkVoidFunction)layer_CmdPipelineBarrier2KHR;
     INTERCEPT(CmdWaitEvents);
-    // CmdBindDescriptorSets and CmdPipelineBarrier NOT intercepted (high-frequency, not needed for compute RQ)
+    INTERCEPT(CmdBindDescriptorSets);
+    INTERCEPT(CreateDescriptorPool);
+    INTERCEPT(CreateDescriptorSetLayout);
+    INTERCEPT(UpdateDescriptorSets);
     INTERCEPT(CreateShaderModule);
     INTERCEPT(CreateComputePipelines);
+    INTERCEPT(CreateGraphicsPipelines);
     INTERCEPT(CreatePipelineLayout);
     if (strcmp(pName, "vkQueueSubmit2KHR") == 0 || strcmp(pName, "vkQueueSubmit2") == 0)
         return (PFN_vkVoidFunction)layer_QueueSubmit2KHR;
@@ -6417,6 +6982,9 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetInstanceProcAddr(VkInst
     // Debug: log Queue/Submit function lookups
     if (pName && strstr(pName, "Queue"))
         fprintf(stderr, "[CudaRT] GetInstanceProcAddr: %s\n", pName);
+    if (pName && strstr(pName, "Pipeline"))
+        fprintf(stderr, "[CudaRT] GetInstanceProcAddr: %s → intercepted=%d\n", pName,
+                (!strcmp(pName, "vkCreateGraphicsPipelines") || !strcmp(pName, "vkCreateComputePipelines")) ? 1 : 0);
 
     // Forward to next layer
     if (instance) {
@@ -6432,11 +7000,18 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetInstanceProcAddr(VkInst
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetDeviceProcAddr(VkDevice device, const char* pName)
 {
     // CUDA_RT_MINIMAL=1: Only feature spoofing, NO interception (test driver's native RT)
+    // CUDA_RT_REWRITE_ONLY=1: Only shader rewriting + pipeline layout ext, no AS/BVH/tracking
     static int minimalMode = -1;
+    static int rewriteOnlyMode = -1;
     if (minimalMode < 0) {
         const char* env = getenv("CUDA_RT_MINIMAL");
         minimalMode = (env && atoi(env)) ? 1 : 0;
         if (minimalMode) LOG("MINIMAL MODE: Only DestroyDevice intercepted, driver handles ALL RT");
+    }
+    if (rewriteOnlyMode < 0) {
+        const char* env = getenv("CUDA_RT_REWRITE_ONLY");
+        rewriteOnlyMode = (env && atoi(env)) ? 1 : 0;
+        if (rewriteOnlyMode) LOG("REWRITE-ONLY MODE: Only shader rewrite + pipeline layout, no AS/BVH");
     }
 
     // Device lifecycle (always needed)
@@ -6455,6 +7030,7 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetDeviceProcAddr(VkDevice
     }
 
     // Buffer/memory tracking
+    if (!rewriteOnlyMode) {
     INTERCEPT(AllocateMemory);
     INTERCEPT(CreateBuffer);
     INTERCEPT(DestroyBuffer);
@@ -6473,12 +7049,28 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetDeviceProcAddr(VkDevice
     // RasterBoost: swapchain intercept for resolution substitution
     if (strcmp(pName, "vkCreateSwapchainKHR") == 0)
         return (PFN_vkVoidFunction)layer_CreateSwapchainKHR;
+    } // end !rewriteOnlyMode
 
-    // Shader module interception for ray query rewriting
+    // Shader module interception for ray query rewriting (always needed)
     INTERCEPT(CreateShaderModule);
+
+    if (rewriteOnlyMode) {
+        // In rewrite-only mode, skip ALL other interception
+        if (device) {
+            void* key = getKey(device);
+            std::lock_guard<std::mutex> lock(g_lock);
+            auto it = g_deviceMap.find(key);
+            if (it != g_deviceMap.end())
+                return it->second.GetDeviceProcAddr(device, pName);
+        }
+        return nullptr;
+    }
+
     INTERCEPT(CreatePipelineLayout);
     INTERCEPT(CreateComputePipelines);
+    INTERCEPT(CreateGraphicsPipelines);
     INTERCEPT(CmdDispatch);
+    INTERCEPT(CmdDispatchIndirect);
     INTERCEPT(QueueSubmit);
     // QueueSubmit2 for Vulkan 1.3+ apps (GravityMark uses this for per-frame rendering)
     if (strcmp(pName, "vkQueueSubmit2KHR") == 0 || strcmp(pName, "vkQueueSubmit2") == 0) {
@@ -6519,11 +7111,12 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetDeviceProcAddr(VkDevice
     if (!strcmp(pName, "vkCmdDrawIndirectCountKHR")) return (PFN_vkVoidFunction)layer_CmdDrawIndirectCount;
     INTERCEPT(CmdExecuteCommands);
     INTERCEPT(CmdPipelineBarrier);
+    if (!strcmp(pName, "vkCmdPipelineBarrier2KHR") || !strcmp(pName, "vkCmdPipelineBarrier2"))
+        return (PFN_vkVoidFunction)layer_CmdPipelineBarrier2KHR;
     INTERCEPT(CmdWaitEvents);
-    // NOTE: CmdBindDescriptorSets and CmdPipelineBarrier NOT intercepted.
-    // They were only needed for RT bind point / RT stage bit remapping, which
-    // only applies to vkCmdTraceRaysKHR-based apps (not compute ray queries).
-    // Removing saves ~100ns per call × hundreds of thousands of calls per frame.
+    // NOTE: CmdBindDescriptorSets MUST be intercepted to eat RT bind point
+    // when STRIP_EXTENSIONS removes RT from the driver.
+    INTERCEPT(CmdBindDescriptorSets);
     INTERCEPT(CreateDescriptorPool);
     INTERCEPT(CreateDescriptorSetLayout);
     INTERCEPT(UpdateDescriptorSets);
