@@ -37,59 +37,107 @@
 #include <time.h>
 #include <signal.h>
 #include <setjmp.h>
+#include <sys/mman.h>
+#include <errno.h>
 
 // SIGSEGV crash recovery for driver UAF bugs
 static thread_local sigjmp_buf g_crashJmpBuf;
 static thread_local volatile sig_atomic_t g_crashGuardActive = 0;
 static std::atomic<uint64_t> g_crashRecoveryCount{0};
+static void installCrashRecovery(); // forward declaration
+
+// Safe memory read for signal handler — returns false if address is unmapped
+static bool safeReadU64(uint64_t addr, uint64_t* out) {
+    // Use mincore to check if page is mapped (fast syscall, no allocation)
+    void* page = (void*)(addr & ~0xFFFUL);
+    unsigned char vec;
+    if (mincore(page, 4096, &vec) == 0 || errno == ENOMEM) {
+        // mincore returns 0 if mapped, ENOMEM if unmapped
+        if (mincore(page, 4096, &vec) == 0) {
+            *out = *(uint64_t*)addr;
+            return true;
+        }
+    }
+    return false;
+}
 
 static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
+    // Re-install ourselves immediately (abort() resets SIGABRT to SIG_DFL)
+    installCrashRecovery();
+
     if (g_crashGuardActive) {
         g_crashGuardActive = 0;
         g_crashRecoveryCount.fetch_add(1, std::memory_order_relaxed);
         siglongjmp(g_crashJmpBuf, 1);
     }
-    // Not in a guarded region — try to skip the faulting instruction
-    // This is a last-resort hack for driver UAF crashes
+    // Not in a guarded region — try to skip the crashing code
     ucontext_t* uc = (ucontext_t*)ctx;
     if (uc) {
-        // x86_64: decode instruction length and skip it
-        uint8_t* rip = (uint8_t*)uc->uc_mcontext.gregs[REG_RIP];
-        // Simple heuristic: most faulting instructions are 2-7 bytes
-        // Check for common prefixes and skip appropriately
-        int skip = 0;
-        if (rip[0] == 0x48 || rip[0] == 0x4C || rip[0] == 0x49 || rip[0] == 0x4D) {
-            // REX prefix + opcode
-            if (rip[1] == 0x8B || rip[1] == 0x89 || rip[1] == 0x3B || rip[1] == 0x85) {
-                // mov/cmp with ModRM — typically 3-7 bytes
-                uint8_t modrm = rip[2];
-                uint8_t mod = modrm >> 6;
-                uint8_t rm = modrm & 7;
-                skip = 3; // REX + opcode + ModRM
-                if (rm == 4) skip++; // SIB byte
-                if (mod == 1) skip++; // disp8
-                else if (mod == 2 || (mod == 0 && rm == 5)) skip += 4; // disp32
-            } else {
-                skip = 4; // generic guess for REX-prefixed instructions
+        static thread_local uint64_t skipCount = 0;
+        uint64_t rip = uc->uc_mcontext.gregs[REG_RIP];
+        uint64_t rsp = uc->uc_mcontext.gregs[REG_RSP];
+
+        skipCount++;
+        g_crashRecoveryCount.fetch_add(1, std::memory_order_relaxed);
+
+        // Strategy 1: Try to return from the current function via stack return address
+        uint64_t retAddr = 0;
+        for (int i = 0; i < 8; i++) {
+            uint64_t candidate = 0;
+            if (safeReadU64(rsp + i * 8, &candidate)) {
+                uint8_t top = candidate >> 40;
+                if (top >= 0x55 && top <= 0x7f && candidate != rip) {
+                    retAddr = candidate;
+                    uc->uc_mcontext.gregs[REG_RSP] = rsp + (i + 1) * 8;
+                    break;
+                }
             }
-        } else {
-            skip = 3; // generic guess
         }
-        if (skip > 0 && skip <= 15) {
-            g_crashRecoveryCount.fetch_add(1, std::memory_order_relaxed);
-            // Zero the destination register (RAX) to prevent cascade
+
+        if (retAddr) {
+            uc->uc_mcontext.gregs[REG_RIP] = retAddr;
             uc->uc_mcontext.gregs[REG_RAX] = 0;
-            uc->uc_mcontext.gregs[REG_RIP] += skip;
-            static uint64_t skipCount = 0;
-            skipCount++;
-            if (skipCount <= 50) {
-                fprintf(stderr, "[CudaRT] ⚠ INSTRUCTION SKIP at %p (+%d bytes, total skips: %lu)\n",
-                        (void*)rip, skip, skipCount);
+            if (skipCount <= 100) {
+                fprintf(stderr, "[CudaRT] ⚠ FUNC SKIP #%lu: sig=%d RIP=%p → ret=%p\n",
+                        skipCount, sig, (void*)rip, (void*)retAddr);
             }
-            return; // resume execution after the faulting instruction
+            return;
+        }
+
+        // Strategy 2: Simple instruction skip (4 bytes) as fallback
+        // Check if RIP itself is readable (might be corrupted)
+        uint64_t dummy;
+        if (safeReadU64(rip, &dummy)) {
+            uint8_t* ripBytes = (uint8_t*)rip;
+            int skip = 4;
+            // Better heuristic for REX-prefixed mov/cmp
+            if (ripBytes[0] >= 0x48 && ripBytes[0] <= 0x4F) {
+                if (ripBytes[1] == 0x8B || ripBytes[1] == 0x89 || ripBytes[1] == 0x3B) {
+                    uint8_t modrm = ripBytes[2];
+                    uint8_t mod = modrm >> 6;
+                    uint8_t rm = modrm & 7;
+                    skip = 3;
+                    if (rm == 4) skip++;
+                    if (mod == 1) skip++;
+                    else if (mod == 2 || (mod == 0 && rm == 5)) skip += 4;
+                }
+            }
+            uc->uc_mcontext.gregs[REG_RIP] = rip + skip;
+            uc->uc_mcontext.gregs[REG_RAX] = 0;
+            if (skipCount <= 100) {
+                fprintf(stderr, "[CudaRT] ⚠ INSN SKIP #%lu: sig=%d RIP=%p +%d\n",
+                        skipCount, sig, (void*)rip, skip);
+            }
+            return;
+        }
+
+        // RIP is corrupt — try to read return address from stack anyway
+        if (skipCount <= 100) {
+            fprintf(stderr, "[CudaRT] ⚠ CORRUPT RIP=%p sig=%d, no recovery possible\n",
+                    (void*)rip, sig);
         }
     }
-    // Can't skip — restore default and re-raise
+    // Can't recover — restore default and re-raise
     struct sigaction sa;
     sa.sa_handler = SIG_DFL;
     sigemptyset(&sa.sa_mask);
@@ -105,6 +153,9 @@ static void installCrashRecovery() {
     sa.sa_flags = SA_SIGINFO | SA_NODEFER;
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGBUS, &sa, nullptr);
+    sigaction(SIGILL, &sa, nullptr);
+    sigaction(SIGFPE, &sa, nullptr);
+    sigaction(SIGABRT, &sa, nullptr);  // catch driver abort()
 }
 
 // RasterBoost upscale engine (rasterboost_upscale.cu)
