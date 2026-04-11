@@ -575,6 +575,10 @@ static int g_verbose = 1;
 uint32_t g_rqDispatchPerFrame = 0; // reset per frame in QueuePresent
 static int g_trackVerbose = 0;
 
+// Dummy buffer for safe AS→SSBO descriptor fallback (always valid)
+static VkBuffer g_dummyBuf = VK_NULL_HANDLE;
+static VkDeviceMemory g_dummyMem = VK_NULL_HANDLE;
+
 // Neural Radiance Cache — tensor core accelerated indirect lighting
 #include "nrc.h"
 static NRCState* g_nrc = nullptr;
@@ -1250,6 +1254,30 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
 
     LOG("Device created — intercepting RT calls (async compute: %s)",
         g_async.ready ? "ENABLED" : "disabled");
+
+    // Create dummy buffer for safe AS→SSBO descriptor fallback
+    {
+        VkBufferCreateInfo dCI = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+        dCI.size = 4096;
+        dCI.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+        if (disp.CreateBuffer(*pDevice, &dCI, nullptr, &g_dummyBuf) == VK_SUCCESS) {
+            VkMemoryRequirements mr;
+            disp.GetBufferMemoryRequirements(*pDevice, g_dummyBuf, &mr);
+            VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            mai.allocationSize = mr.size;
+            for (uint32_t j = 0; j < g_memTypeCount; j++) {
+                if ((mr.memoryTypeBits & (1u << j)) &&
+                    (g_memTypes[j].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                    mai.memoryTypeIndex = j; break;
+                }
+            }
+            if (disp.AllocateMemory(*pDevice, &mai, nullptr, &g_dummyMem) == VK_SUCCESS) {
+                disp.BindBufferMemory(*pDevice, g_dummyBuf, g_dummyMem, 0);
+                LOG("  → Dummy buffer created (4096 bytes) for safe AS→SSBO descriptor fallback");
+            }
+        }
+    }
+
     return VK_SUCCESS;
 }
 
@@ -1260,6 +1288,9 @@ static VKAPI_ATTR void VKAPI_CALL layer_DestroyDevice(
     std::lock_guard<std::mutex> lock(g_lock);
     auto it = g_deviceMap.find(key);
     if (it != g_deviceMap.end()) {
+        // Clean up dummy buffer
+        if (g_dummyBuf) { it->second.DestroyBuffer(device, g_dummyBuf, nullptr); g_dummyBuf = VK_NULL_HANDLE; }
+        if (g_dummyMem) { it->second.FreeMemory(device, g_dummyMem, nullptr); g_dummyMem = VK_NULL_HANDLE; }
         it->second.DestroyDevice(device, pAllocator);
         g_deviceMap.erase(it);
     }
@@ -5117,30 +5148,31 @@ static VKAPI_ATTR void VKAPI_CALL layer_UpdateDescriptorSets(
         for (uint32_t i = 0; i < descriptorWriteCount; i++) {
             VkWriteDescriptorSet w = pDescriptorWrites[i];
             if (w.descriptorType == VK_DESCRIPTOR_TYPE_ACCELERATION_STRUCTURE_KHR) {
-                // Remap to STORAGE_BUFFER with null-safe BVH buffer
-                if (g_bvh2.nodesBuf) {
+                // Remap to STORAGE_BUFFER with best-available buffer
+                VkBuffer bindBuf = g_bvh2.nodesBuf ? g_bvh2.nodesBuf : g_dummyBuf;
+                if (bindBuf) {
                     w.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
                     w.pNext = nullptr; // strip AS pNext
                     size_t base = dummyBufInfos.size();
                     for (uint32_t d = 0; d < w.descriptorCount; d++) {
-                        dummyBufInfos.push_back({g_bvh2.nodesBuf, 0, VK_WHOLE_SIZE});
+                        dummyBufInfos.push_back({bindBuf, 0, VK_WHOLE_SIZE});
                     }
                     w.pBufferInfo = nullptr; // will fix up below
                     w.pImageInfo = nullptr;
                     w.pTexelBufferView = nullptr;
                     modified.push_back(w);
                 }
-                // If no BVH buffer yet, skip the write entirely
+                // If no buffer at all, skip the write entirely
                 continue;
             }
             modified.push_back(w);
         }
         // Fix up buffer info pointers (vector may have reallocated)
+        size_t bufInfoOffset = 0;
         for (auto& w : modified) {
             if (w.descriptorType == VK_DESCRIPTOR_TYPE_STORAGE_BUFFER && !w.pBufferInfo) {
-                // Find the next available dummy buffer info
-                static VkDescriptorBufferInfo fallback = {VK_NULL_HANDLE, 0, VK_WHOLE_SIZE};
-                w.pBufferInfo = dummyBufInfos.empty() ? &fallback : dummyBufInfos.data();
+                w.pBufferInfo = dummyBufInfos.data() + bufInfoOffset;
+                bufInfoOffset += w.descriptorCount;
             }
         }
         if (!modified.empty() || descriptorCopyCount > 0) {

@@ -2117,6 +2117,16 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             skip = true;
         }
         if (op == SpvOpRQGetInstId && wc >= 5) {
+#if SPIRV_RQ_NO_SSBO
+            // No SSBOs available — return 0 (miss/default)
+            uint32_t resType = code[pos+1];
+            uint32_t resId   = code[pos+2];
+            if (resType == tUint) {
+                spvEmit(out, SpvOpCopyObject, {tUint, resId, cu0});
+            } else {
+                spvEmit(out, SpvOpCopyObject, {tInt, resId, c0});
+            }
+#else
             // Return ORIGINAL instance index from SSBO vec4[instBase+8].z
             // (hitInstID is Morton-sorted; Q2RTX needs build-order index)
             uint32_t resType = code[pos+1];
@@ -2143,6 +2153,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             } else {
                 spvEmit(out, SpvOpConvertFToS, {tInt, resId, valF});
             }
+#endif
             skip = true;
         }
         if (op == SpvOpRQGetIntersectionType && wc >= 5) {
@@ -2191,7 +2202,10 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
         if ((op == SpvOpRQGetInstCustomIdx || op == SpvOpRQGetSBTOffset) && wc >= 4) {
             uint32_t resType = code[pos+1];
             uint32_t resId   = code[pos+2];
-            // Determine which RQ variable (wc varies: 4 for no-committed, 5 for committed)
+#if SPIRV_RQ_NO_SSBO
+            if (resType == tUint) { spvEmit(out, SpvOpCopyObject, {tUint, resId, cu0}); }
+            else { spvEmit(out, SpvOpCopyObject, {tInt, resId, c0}); }
+#else
             uint32_t rqVar = (wc >= 5) ? code[pos+3] : code[pos+3];
             uint32_t sv = rqMap.count(rqVar) ? rqMap[rqVar] : rqVar;
             // Load hitInstID from RQ struct member 7
@@ -2216,6 +2230,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             } else {
                 spvEmit(out, SpvOpConvertFToS, {tInt, resId, valF});
             }
+#endif
             skip = true;
         }
         // RayFlags: return the ray flags stored during rayQueryInitialize (NOT from instance SSBO)
@@ -2261,6 +2276,17 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
         if ((op == SpvOpRQGetObj2World || op == SpvOpRQGetWorld2Obj) && wc >= 5) {
             uint32_t resType = code[pos+1];
             uint32_t resId   = code[pos+2];
+#if SPIRV_RQ_NO_SSBO
+            // No SSBOs — return identity matrix
+            uint32_t z3 = newId(), o3 = newId();
+            spvEmit(out, SpvOpCompositeConstruct, {tVec3, z3, cf0, cf0, cf0});
+            spvEmit(out, SpvOpCompositeConstruct, {tVec3, o3, cf1, cf0, cf0});
+            uint32_t c1_3 = newId(), c2_3 = newId(), c3_3 = newId();
+            spvEmit(out, SpvOpCompositeConstruct, {tVec3, c1_3, cf0, cf1, cf0});
+            spvEmit(out, SpvOpCompositeConstruct, {tVec3, c2_3, cf0, cf0, cf1});
+            spvEmit(out, SpvOpCompositeConstruct, {tVec3, c3_3, cf0, cf0, cf0});
+            spvEmit(out, SpvOpCompositeConstruct, {resType, resId, o3, c1_3, c2_3, c3_3});
+#else
             uint32_t rqVar   = code[pos+3];
             uint32_t sv = rqMap.count(rqVar) ? rqMap[rqVar] : rqVar;
 
@@ -2319,6 +2345,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             spvEmit(out, SpvOpCompositeConstruct, {tVec3, col3, r0w, r1w, r2w});
 
             spvEmit(out, SpvOpCompositeConstruct, {resType, resId, col0, col1, col2, col3});
+#endif
             skip = true;
         }
         } // end of RQ operations rewrite block

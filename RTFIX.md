@@ -69,8 +69,17 @@ The rewriter (`spirv_ray_query_rewriter.h`) performs a single-pass transformatio
 ### Validation Results
 
 - All **196 Breaking Limit shaders** pass ASAN (zero memory bugs in rewriter)
-- All **196 rewritten shaders** pass `spirv-val` (valid SPIR-V)
+- All **196 rewritten shaders** pass `spirv-val --target-env vulkan1.2` (valid SPIR-V)
 - Shader growth: ~40% for full BVH traversal (11K → 15K words typical)
+
+### NO_SSBO Compile-Time Guards
+
+The rewriter has `#if SPIRV_RQ_NO_SSBO` guards (default: 0 = disabled) for all
+SSBO-dependent operations. When enabled, these return safe defaults (0 for IDs,
+identity matrices for transforms) instead of SSBO loads:
+- `GetInstId` → 0
+- `GetInstCustomIdx` / `GetSBTOffset` → 0
+- `GetObj2World` / `GetWorld2Obj` → identity mat4x3
 
 ## Current Status: Breaking Limit Benchmark
 
@@ -83,8 +92,10 @@ The rewriter (`spirv_ray_query_rewriter.h`) performs a single-pass transformatio
 - ✅ BVH descriptor sets created and bound
 - ✅ Barrier stage/access bits remapped (RT → compute/transfer)
 - ✅ AS descriptor types remapped (AS → SSBO) when STRIP_EXTENSIONS
+- ✅ Dummy buffer fallback for safe AS→SSBO descriptors before BVH ready
+- ✅ Per-write pBufferInfo pointer tracking (prevents descriptor heap corruption)
 - ✅ App loads scene, creates render passes, begins rendering
-- ✅ **Reaches Frame 7–19** with mitigations (of 2100 total frames needed)
+- ✅ **Reaches Frame 5–10** with mitigations (of 2100 total frames needed)
 - ✅ **Q2RTX works**: 2000 frames, 38 BLAS, 33 TLAS instances, ~237 FPS at 640×480
 
 ### Blocking: Two V100 Driver 580.126.20 Bugs
@@ -130,23 +141,37 @@ Even on single CPU, the driver crashes after Frame 7–19 due to UAF.
 
 | Configuration | Frames | Key Insight |
 |---------------|--------|-------------|
-| **taskset -c 0 + jemalloc + STRIP + NO_EXT + NO_BVH** | **7–19** | Best config |
+| **taskset -c 0 + jemalloc + STRIP + NO_EXT + NO_BVH** | **5–10** | Best config |
 | taskset -c 0 + jemalloc + full features | 0–19 | Ext layouts variable |
 | jemalloc + STRIP + NO_EXT + NO_BVH (all CPUs) | 0–6 | Thread race + UAF |
 | jemalloc + STRIP + NO_BVH (with ext layout) | 0–1 | Ext layouts worsen UAF |
 | jemalloc (default, all features, all CPUs) | 0–1 | Worst combo |
 | SERIALIZE_CMDS + taskset + jemalloc | 3–10 | Mutex contention hurts |
-| FRAME_SYNC=1 (DeviceWaitIdle every present) | 0–19 | Very variable |
+| FRAME_SYNC=1 (DeviceWaitIdle every present) | 6 | Worse — not pushbuf accumulation |
 | LEAN mode (skip draw interception) | 6–19 | Same as non-lean |
 | pushbuf_extend + jemalloc + taskset | 10–19 | Marginal improvement |
 | megafree (4M ring buffer) + jemalloc | 10–19 | Marginal improvement |
-| No strip (driver handles AS natively) | 0–19 | Same crash, not strip-related |
+| No strip (driver handles AS natively) | 7 | Same crash, not strip-related |
+| NO_REWRITE (unmodified shaders to driver) | **10–19** | V100 driver has partial RQ support |
+| NO_DISPATCH_INTERCEPT | 10 | CmdDispatch interception not the cause |
 | REWRITE_ONLY (no AS/barrier interception) | 0 | Missing barrier remap = crash |
 | MINIMAL (no rewriting at all) | 0 | Driver can't compile ray_query |
 | STRIP_ONLY (NOP ray_query ops) | 0 | Invalid SPIR-V (dangling refs) |
+| FULL_TRAVERSAL=0 (skip traversal init) | 0 | Uninitialized vars crash |
 | Stub mode (trivial traversal) | 0–12 | Same crash rate as full BVH |
-| 320×240 resolution | 10–19 | Slightly better |
+| 320×240 resolution | 5–10 | Slightly better |
 | nofree2 (suppress ALL free) | 0–11 | Breaks allocator internals |
+
+### Key Experiment: NO_REWRITE (Shader Pass-Through)
+
+The `CUDA_RT_NO_REWRITE=1` experiment revealed that **the V100 driver can parse
+and compile ray_query SPIR-V without crashing** — it just can't execute it.
+Passing unmodified shaders through (no BVH injection, no traversal rewrite)
+consistently reaches Frame 10–19 vs Frame 5–10 with full rewrite.
+
+This means the **rewritten shaders contribute ~5 frames of instability** — the
+larger shader size (~40% growth) or the injected SSBO accesses put extra pressure
+on the driver's internal allocator, triggering the UAF sooner.
 
 ### Attempted Mitigations (Detailed)
 
@@ -156,10 +181,13 @@ Even on single CPU, the driver crashes after Frame 7–19 due to UAF.
 | jemalloc preload | **Essential** | Delays memory reuse, prevents UAF trigger |
 | STRIP_EXTENSIONS=1 | **Needed** | Clean separation — layer handles all RT |
 | NO_EXT_LAYOUT + NO_BVH_BIND | **Reduces attack surface** | Fewer driver allocations |
+| Dummy buffer fallback (g_dummyBuf) | **Fixes** null descriptor | Safe AS→SSBO before BVH |
+| Per-write pBufferInfo tracking | **Fixes** heap corruption | Was pointing all writes to same offset |
 | Layout replacement in CmdBindDescriptorSets | **Harmful** (Frame 0–7) | Confused driver's descriptor validation |
 | SERIALIZE_CMDS=1 (global mutex) | **Harmful** (Frame 3–10) | Contention worse than race |
-| FRAME_SYNC (periodic DeviceWaitIdle) | **No help** | UAF isn't about in-flight work |
+| FRAME_SYNC (periodic DeviceWaitIdle) | **Harmful** (Frame 6) | UAF isn't about in-flight work |
 | LEAN mode (skip draw interceptors) | **Neutral** | Draw hooks aren't the problem |
+| NO_DISPATCH_INTERCEPT | **Neutral** | CmdDispatch hook isn't the issue |
 | SIGSEGV handler (pushbuf_extend.so) | **Marginal** | Catches overflow but not UAF |
 | SIGSEGV + instruction skip (pushbuf_v4.so) | **Harmful** | Cascade corruption |
 | tcmalloc preload | **Worse** than jemalloc | Less effective at delaying reuse |
@@ -167,6 +195,36 @@ Even on single CPU, the driver crashes after Frame 7–19 due to UAF.
 | nofree2.so (suppress all free) | **Breaks** things | Allocator can't reclaim memory properly |
 | Stub traversal (no BVH loop) | **No help** | Crash is workload-independent |
 | Smaller resolution (320×240) | **Marginal** | Slightly fewer driver allocations |
+
+### Bugs Found and Fixed
+
+#### rqVar Scoping Bug in SPIR-V Rewriter (Critical)
+
+When adding `#if SPIRV_RQ_NO_SSBO` compile-time guards to the Obj2World/World2Obj
+handler, the local `uint32_t rqVar = code[pos+3]` declaration was accidentally
+removed. The `#else` branch still used `rqVar`, but C++ silently resolved it to
+an outer-scope `rqVar = code[pos+1]` (line 1188) — which held the **result TYPE
+ID**, not the ray query variable.
+
+**Symptoms**: Shader sizes ballooned (11K → 15.5K words), wrong SSBO accesses
+generated, immediate crash at Frame 0.
+
+**Fix**: Ensure every `#else` branch that uses `rqVar` has its own declaration:
+`uint32_t rqVar = code[pos+3];`
+
+#### Descriptor Buffer Info Pointer Bug
+
+The `UpdateDescriptorSets` handler used a single `dummyBufInfos.data()` pointer
+for ALL remapped writes. With multiple AS→SSBO writes, all pointed to the same
+base offset, causing the driver to use wrong buffer offsets for later writes.
+
+**Fix**: Track per-write offset into the `dummyBufInfos` vector.
+
+#### Null Descriptor Fallback
+
+When `g_bvh2.nodesBuf` wasn't ready (before TLAS build), AS→SSBO remapped writes
+were skipped entirely, leaving stale descriptors. Now uses `g_dummyBuf` (4KB
+device-local buffer created at device init) as a safe fallback.
 
 ### Root Cause Diagnosis
 
@@ -185,6 +243,17 @@ The V100 driver 580.126.20 has **two independent bugs** in `libnvidia-glcore.so`
    Subsequent frames dereference stale pointers. jemalloc mitigates this by
    delaying memory reuse (freed memory retains valid data longer), but the
    crash eventually occurs when freed pages are finally recycled.
+
+### Disproven Theories
+
+| Theory | How Disproven |
+|--------|--------------|
+| CmdDispatch interception causes crash | NO_DISPATCH_INTERCEPT: same Frame 10 |
+| Invalid SPIR-V causes crash | spirv-val validates all 196 shaders |
+| Pushbuffer accumulation over time | FRAME_SYNC=DeviceWaitIdle every frame: WORSE |
+| Barrier heap allocations trigger UAF | Fast-path optimization: neutral |
+| Extension stripping breaks driver | Without stripping: slightly worse |
+| Larger shaders → more instability | NO_REWRITE (unmodified): Frame 10-19 vs 5-10 **(partial confirmation)** |
 
 ## Environment Variables
 
@@ -241,14 +310,19 @@ cd Q2RTX && ENABLE_CUDA_RT_LAYER=1 ./q2rtx +map q2dm1
 
 ## Next Steps
 
-1. **Solve the UAF** — The secondary crash (Frame 7–19) is the blocker.
-   Need to find a way to prevent the driver's stale pointer dereference.
+1. **Close the rewrite gap** — NO_REWRITE gets Frame 10–19, full rewrite gets
+   5–10. The rewriter adds ~40% shader size. Investigate:
+   - Trimming unnecessary SPIR-V instructions in the traversal loop
+   - Reducing SSBO binding count per shader
+   - Using push constants instead of SSBOs for small data
+2. **Solve the UAF** — The secondary crash (Frame 5–19) is the blocker.
    Approaches remaining:
+   - Different driver version (current: 580.126.20)
+   - NVK (Mesa Nouveau Vulkan) — completely different driver stack
    - Per-command-buffer descriptor binding serialization
-   - Intercepting driver's ioctl for larger pushbuffer allocation
-   - Identifying specific descriptor set / pipeline patterns that trigger UAF
-2. **Feed real BVH data** — Once stable past Frame 20+, enable BVH binding
+   - ioctl-level pushbuffer enlargement
+3. **Feed real BVH data** — Once stable past Frame 20+, enable BVH binding
    and extended layouts for actual ray tracing output
-3. **Performance** — Single-CPU mode is slow; need per-CB serialization
+4. **Performance** — Single-CPU mode is slow; need per-CB serialization
    instead of full CPU pinning
-4. **Complete benchmark** — 2100 frames needed for a score (~9 min runtime)
+5. **Complete benchmark** — 2100 frames needed for a score (~9 min runtime)
