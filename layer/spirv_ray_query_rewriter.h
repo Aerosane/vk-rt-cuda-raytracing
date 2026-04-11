@@ -2104,7 +2104,17 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             getField(code[pos+2], code[pos+3], 5, tVec2, pVec2); skip = true;
         }
         if (op == SpvOpRQGetPrimIdx && wc >= 5) {
-            getField(code[pos+2], code[pos+3], 6, tInt, pInt); skip = true;
+            uint32_t resType = code[pos+1];
+            uint32_t resId   = code[pos+2];
+            if (resType == tInt) {
+                getField(resId, code[pos+3], 6, tInt, pInt);
+            } else {
+                // App expects uint — load as int, then bitcast
+                uint32_t tmp = newId();
+                getField(tmp, code[pos+3], 6, tInt, pInt);
+                spvEmit(out, SpvOpBitcast, {tUint, resId, tmp});
+            }
+            skip = true;
         }
         if (op == SpvOpRQGetInstId && wc >= 5) {
             // Return ORIGINAL instance index from SSBO vec4[instBase+8].z
@@ -2125,14 +2135,27 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             uint32_t pM = newId(), metaV = newId();
             spvEmit(out, SpvOpAccessChain, {pVec4SB, pM, vInst, c0, metaIdx});
             spvEmit(out, SpvOpLoad, {tVec4, metaV, pM});
-            // Extract .z = originalInstIdx, convert float→int
+            // Extract .z = originalInstIdx, convert float→int/uint
             uint32_t valF = newId();
             spvEmit(out, SpvOpCompositeExtract, {tFloat, valF, metaV, (uint32_t)2});
-            spvEmit(out, SpvOpConvertFToS, {tInt, resId, valF});
+            if (resType == tUint) {
+                spvEmit(out, SpvOpConvertFToU, {tUint, resId, valF});
+            } else {
+                spvEmit(out, SpvOpConvertFToS, {tInt, resId, valF});
+            }
             skip = true;
         }
         if (op == SpvOpRQGetIntersectionType && wc >= 5) {
-            getField(code[pos+2], code[pos+3], 8, tUint, pUint); skip = true;
+            uint32_t resType = code[pos+1];
+            uint32_t resId   = code[pos+2];
+            if (resType == tUint) {
+                getField(resId, code[pos+3], 8, tUint, pUint);
+            } else {
+                uint32_t tmp = newId();
+                getField(tmp, code[pos+3], 8, tUint, pUint);
+                spvEmit(out, SpvOpBitcast, {tInt, resId, tmp});
+            }
+            skip = true;
         }
         if (op == SpvOpRQGetWorldRayDir && wc >= 4) {
             uint32_t sv = rqMap.count(code[pos+3]) ? rqMap[code[pos+3]] : code[pos+3];

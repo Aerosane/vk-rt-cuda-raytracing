@@ -962,19 +962,30 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
         modifiedCI.pNext = newHead;
     }
 
-    // V100 driver reports rayQuery=true but CreateDevice fails when rayQuery=1
-    // is combined with some feature chains. Clear it and handle via AS interception.
+    // V100 driver rejects CreateDevice with rayQuery=1 (VK_ERROR_FEATURE_NOT_PRESENT).
+    // Clear it — our layer rewrites ray_query SPIR-V to BVH2 traversal before driver sees it.
+    // IMPORTANT: we must NOT modify the app's original struct in-place, or the app will
+    // see rayQuery=0 and think the feature isn't available.  Use a stack copy instead.
+    VkPhysicalDeviceRayQueryFeaturesKHR rqCopy = {};
+    bool rqPatched = false;
     {
-        VkBaseOutStructure* cur = (VkBaseOutStructure*)modifiedCI.pNext;
+        VkBaseOutStructure* prev = (VkBaseOutStructure*)&modifiedCI;
+        VkBaseOutStructure* cur  = (VkBaseOutStructure*)modifiedCI.pNext;
         while (cur) {
             if (cur->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_QUERY_FEATURES_KHR) {
                 auto* f = (VkPhysicalDeviceRayQueryFeaturesKHR*)cur;
                 if (f->rayQuery) {
-                    LOG("  → Clearing rayQuery=1→0 (layer handles RT via CUDA BVH4 interception)");
-                    f->rayQuery = VK_FALSE;
+                    LOG("  → Patching rayQuery=1→0 via copy (V100 driver rejects; layer handles via SPIR-V rewrite)");
+                    rqCopy = *f;                     // copy the app's struct
+                    rqCopy.rayQuery = VK_FALSE;      // clear in the copy only
+                    rqCopy.pNext = (void*)cur->pNext; // preserve chain
+                    prev->pNext = (VkBaseOutStructure*)&rqCopy;  // splice copy into chain
+                    rqPatched = true;
+                    break;
                 }
             }
-            cur = cur->pNext;
+            prev = cur;
+            cur  = cur->pNext;
         }
     }
 
