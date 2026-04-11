@@ -35,6 +35,77 @@
 #include <algorithm>
 #include <atomic>
 #include <time.h>
+#include <signal.h>
+#include <setjmp.h>
+
+// SIGSEGV crash recovery for driver UAF bugs
+static thread_local sigjmp_buf g_crashJmpBuf;
+static thread_local volatile sig_atomic_t g_crashGuardActive = 0;
+static std::atomic<uint64_t> g_crashRecoveryCount{0};
+
+static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
+    if (g_crashGuardActive) {
+        g_crashGuardActive = 0;
+        g_crashRecoveryCount.fetch_add(1, std::memory_order_relaxed);
+        siglongjmp(g_crashJmpBuf, 1);
+    }
+    // Not in a guarded region — try to skip the faulting instruction
+    // This is a last-resort hack for driver UAF crashes
+    ucontext_t* uc = (ucontext_t*)ctx;
+    if (uc) {
+        // x86_64: decode instruction length and skip it
+        uint8_t* rip = (uint8_t*)uc->uc_mcontext.gregs[REG_RIP];
+        // Simple heuristic: most faulting instructions are 2-7 bytes
+        // Check for common prefixes and skip appropriately
+        int skip = 0;
+        if (rip[0] == 0x48 || rip[0] == 0x4C || rip[0] == 0x49 || rip[0] == 0x4D) {
+            // REX prefix + opcode
+            if (rip[1] == 0x8B || rip[1] == 0x89 || rip[1] == 0x3B || rip[1] == 0x85) {
+                // mov/cmp with ModRM — typically 3-7 bytes
+                uint8_t modrm = rip[2];
+                uint8_t mod = modrm >> 6;
+                uint8_t rm = modrm & 7;
+                skip = 3; // REX + opcode + ModRM
+                if (rm == 4) skip++; // SIB byte
+                if (mod == 1) skip++; // disp8
+                else if (mod == 2 || (mod == 0 && rm == 5)) skip += 4; // disp32
+            } else {
+                skip = 4; // generic guess for REX-prefixed instructions
+            }
+        } else {
+            skip = 3; // generic guess
+        }
+        if (skip > 0 && skip <= 15) {
+            g_crashRecoveryCount.fetch_add(1, std::memory_order_relaxed);
+            // Zero the destination register (RAX) to prevent cascade
+            uc->uc_mcontext.gregs[REG_RAX] = 0;
+            uc->uc_mcontext.gregs[REG_RIP] += skip;
+            static uint64_t skipCount = 0;
+            skipCount++;
+            if (skipCount <= 50) {
+                fprintf(stderr, "[CudaRT] ⚠ INSTRUCTION SKIP at %p (+%d bytes, total skips: %lu)\n",
+                        (void*)rip, skip, skipCount);
+            }
+            return; // resume execution after the faulting instruction
+        }
+    }
+    // Can't skip — restore default and re-raise
+    struct sigaction sa;
+    sa.sa_handler = SIG_DFL;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = 0;
+    sigaction(sig, &sa, nullptr);
+    raise(sig);
+}
+
+static void installCrashRecovery() {
+    struct sigaction sa;
+    sa.sa_sigaction = crashRecoveryHandler;
+    sigemptyset(&sa.sa_mask);
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sigaction(SIGSEGV, &sa, nullptr);
+    sigaction(SIGBUS, &sa, nullptr);
+}
 
 // RasterBoost upscale engine (rasterboost_upscale.cu)
 extern "C" {
@@ -158,6 +229,8 @@ struct DeviceDispatch {
     PFN_vkCreateDescriptorPool CreateDescriptorPool;
     PFN_vkDestroyDescriptorPool DestroyDescriptorPool;
     PFN_vkAllocateDescriptorSets AllocateDescriptorSets;
+    PFN_vkFreeDescriptorSets FreeDescriptorSets;
+    PFN_vkResetDescriptorPool ResetDescriptorPool;
     PFN_vkUpdateDescriptorSets UpdateDescriptorSets;
     PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
     PFN_vkCmdPushConstants CmdPushConstants;
@@ -186,6 +259,7 @@ struct DeviceDispatch {
 
     // Async compute queue
     PFN_vkGetDeviceQueue GetDeviceQueue;
+    PFN_vkGetDeviceQueue2 GetDeviceQueue2;
     PFN_vkCreateCommandPool CreateCommandPool;
     PFN_vkAllocateCommandBuffers AllocateCommandBuffers;
     PFN_vkBeginCommandBuffer BeginCommandBuffer;
@@ -579,6 +653,23 @@ static int g_trackVerbose = 0;
 static VkBuffer g_dummyBuf = VK_NULL_HANDLE;
 static VkDeviceMemory g_dummyMem = VK_NULL_HANDLE;
 
+// Poisoned command buffers: after crash recovery, skip all further ops
+static std::mutex g_poisonMutex;
+static std::unordered_map<uint64_t, bool> g_poisonedCmdBufs;
+
+static inline bool isCmdBufPoisoned(VkCommandBuffer cb) {
+    std::lock_guard<std::mutex> lock(g_poisonMutex);
+    return g_poisonedCmdBufs.count((uint64_t)cb) > 0;
+}
+static inline void poisonCmdBuf(VkCommandBuffer cb) {
+    std::lock_guard<std::mutex> lock(g_poisonMutex);
+    g_poisonedCmdBufs[(uint64_t)cb] = true;
+}
+static inline void clearPoisonedCmdBufs() {
+    std::lock_guard<std::mutex> lock(g_poisonMutex);
+    g_poisonedCmdBufs.clear();
+}
+
 // Neural Radiance Cache — tensor core accelerated indirect lighting
 #include "nrc.h"
 static NRCState* g_nrc = nullptr;
@@ -868,6 +959,33 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_EnumerateDeviceExtensionProperties(
     return (copyCount < totalCount) ? VK_INCOMPLETE : VK_SUCCESS;
 }
 
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL
+layer_GetDeviceQueue(VkDevice device, uint32_t queueFamilyIndex, uint32_t queueIndex, VkQueue* pQueue)
+{
+    void* key = getKey(device);
+    DeviceDispatch disp;
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        disp = g_deviceMap[key];
+    }
+    disp.GetDeviceQueue(device, queueFamilyIndex, queueIndex, pQueue);
+}
+
+VK_LAYER_EXPORT VKAPI_ATTR void VKAPI_CALL
+layer_GetDeviceQueue2(VkDevice device, const VkDeviceQueueInfo2* pQueueInfo, VkQueue* pQueue)
+{
+    void* key = getKey(device);
+    DeviceDispatch disp;
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        disp = g_deviceMap[key];
+    }
+    if (disp.GetDeviceQueue2)
+        disp.GetDeviceQueue2(device, pQueueInfo, pQueue);
+    else
+        disp.GetDeviceQueue(device, pQueueInfo->queueFamilyIndex, pQueueInfo->queueIndex, pQueue);
+}
+
 // ═══════════════════════════════════════════
 // Layer: CreateDevice — inject RT extensions if missing
 // ═══════════════════════════════════════════
@@ -1068,6 +1186,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
     LOAD_DEV(CreateDescriptorPool);
     LOAD_DEV(DestroyDescriptorPool);
     LOAD_DEV(AllocateDescriptorSets);
+    LOAD_DEV(FreeDescriptorSets);
+    LOAD_DEV(ResetDescriptorPool);
     LOAD_DEV(UpdateDescriptorSets);
     LOAD_DEV(CmdBindDescriptorSets);
     LOAD_DEV(CmdPushConstants);
@@ -1094,6 +1214,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
     LOAD_DEV(CmdResetQueryPool);
     // Async compute queue
     LOAD_DEV(GetDeviceQueue);
+    LOAD_DEV(GetDeviceQueue2);
     LOAD_DEV(CreateCommandPool);
     LOAD_DEV(AllocateCommandBuffers);
     LOAD_DEV(BeginCommandBuffer);
@@ -1265,18 +1386,27 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
             disp.GetBufferMemoryRequirements(*pDevice, g_dummyBuf, &mr);
             VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
             mai.allocationSize = mr.size;
-            for (uint32_t j = 0; j < g_memTypeCount; j++) {
+            auto& mp = disp.memProps;
+            for (uint32_t j = 0; j < mp.memoryTypeCount; j++) {
                 if ((mr.memoryTypeBits & (1u << j)) &&
-                    (g_memTypes[j].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                    (mp.memoryTypes[j].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
                     mai.memoryTypeIndex = j; break;
                 }
             }
             if (disp.AllocateMemory(*pDevice, &mai, nullptr, &g_dummyMem) == VK_SUCCESS) {
                 disp.BindBufferMemory(*pDevice, g_dummyBuf, g_dummyMem, 0);
                 LOG("  → Dummy buffer created (4096 bytes) for safe AS→SSBO descriptor fallback");
+            } else {
+                LOG("  → WARNING: Dummy buffer AllocateMemory failed");
             }
+        } else {
+            LOG("  → WARNING: Dummy buffer CreateBuffer failed");
         }
     }
+
+    // Install crash recovery handler for driver UAF bugs
+    installCrashRecovery();
+    LOG("  → Crash recovery handler installed (SIGSEGV/SIGBUS)");
 
     return VK_SUCCESS;
 }
@@ -1857,6 +1987,48 @@ static inline bool serializeCmds() {
 #define DRIVER_CMD_LOCK() \
     std::unique_lock<std::mutex> _drvLock(g_driverCmdMutex, std::defer_lock); \
     if (serializeCmds()) _drvLock.lock()
+
+// Crash-guarded driver call: catches SIGSEGV, poisons cmdBuf, skips the call
+// Re-installs handler each time in case driver overrides it
+#define CRASH_GUARD_CMD(cmdBuf, call, label) do { \
+    if (isCmdBufPoisoned(cmdBuf)) break; \
+    installCrashRecovery(); \
+    g_crashGuardActive = 1; \
+    if (sigsetjmp(g_crashJmpBuf, 1) == 0) { \
+        call; \
+        g_crashGuardActive = 0; \
+    } else { \
+        poisonCmdBuf(cmdBuf); \
+        uint64_t _cnt = g_crashRecoveryCount.load(std::memory_order_relaxed); \
+        fprintf(stderr, "[CudaRT] ⚠ CRASH RECOVERED in %s — cmdBuf poisoned (total: %lu)\n", label, _cnt); \
+    } \
+} while(0)
+
+// Non-cmdBuf variant for device-level calls
+#define CRASH_GUARD_CALL(call, label) do { \
+    installCrashRecovery(); \
+    g_crashGuardActive = 1; \
+    if (sigsetjmp(g_crashJmpBuf, 1) == 0) { \
+        call; \
+        g_crashGuardActive = 0; \
+    } else { \
+        uint64_t _cnt = g_crashRecoveryCount.load(std::memory_order_relaxed); \
+        fprintf(stderr, "[CudaRT] ⚠ CRASH RECOVERED in %s (total: %lu)\n", label, _cnt); \
+    } \
+} while(0)
+
+// Debug: check if our handler is still installed
+static void verifyCrashHandler() {
+    struct sigaction cur;
+    sigaction(SIGSEGV, nullptr, &cur);
+    if (cur.sa_sigaction != crashRecoveryHandler) {
+        fprintf(stderr, "[CudaRT] ⚠ SIGSEGV handler OVERRIDDEN! ours=%p current=%p flags=%d\n",
+                (void*)crashRecoveryHandler, 
+                (cur.sa_flags & SA_SIGINFO) ? (void*)cur.sa_sigaction : (void*)cur.sa_handler,
+                cur.sa_flags);
+        installCrashRecovery();
+    }
+}
 
 static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateShaderModule(
     VkDevice device,
@@ -5121,6 +5293,72 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDescriptorSetLayout(
 }
 
 // ═══════════════════════════════════════════
+// Intercepted: FreeDescriptorSets — block frees to prevent driver UAF
+// ═══════════════════════════════════════════
+static VKAPI_ATTR VkResult VKAPI_CALL layer_FreeDescriptorSets(
+    VkDevice device,
+    VkDescriptorPool descriptorPool,
+    uint32_t descriptorSetCount,
+    const VkDescriptorSet* pDescriptorSets)
+{
+    static int blockFrees = -1;
+    if (blockFrees < 0) {
+        const char* e = getenv("CUDA_RT_BLOCK_DESC_FREE");
+        blockFrees = (e && atoi(e)) ? 1 : 0;
+    }
+    if (blockFrees) {
+        // NOP — don't let the driver free descriptor set internals
+        return VK_SUCCESS;
+    }
+    void* key = getKey(device);
+    auto& disp = g_deviceMap[key];
+    return disp.FreeDescriptorSets(device, descriptorPool, descriptorSetCount, pDescriptorSets);
+}
+
+// ═══════════════════════════════════════════
+// Intercepted: DestroyDescriptorPool — block destruction to prevent driver UAF
+// ═══════════════════════════════════════════
+static VKAPI_ATTR void VKAPI_CALL layer_DestroyDescriptorPool(
+    VkDevice device,
+    VkDescriptorPool descriptorPool,
+    const VkAllocationCallbacks* pAllocator)
+{
+    static int blockFrees = -1;
+    if (blockFrees < 0) {
+        const char* e = getenv("CUDA_RT_BLOCK_DESC_FREE");
+        blockFrees = (e && atoi(e)) ? 1 : 0;
+    }
+    if (blockFrees) {
+        // NOP — keep pool alive to prevent driver UAF
+        return;
+    }
+    void* key = getKey(device);
+    auto& disp = g_deviceMap[key];
+    disp.DestroyDescriptorPool(device, descriptorPool, pAllocator);
+}
+
+// ═══════════════════════════════════════════
+// Intercepted: ResetDescriptorPool — block reset to prevent driver UAF
+// ═══════════════════════════════════════════
+static VKAPI_ATTR VkResult VKAPI_CALL layer_ResetDescriptorPool(
+    VkDevice device,
+    VkDescriptorPool descriptorPool,
+    VkDescriptorPoolResetFlags flags)
+{
+    static int blockFrees = -1;
+    if (blockFrees < 0) {
+        const char* e = getenv("CUDA_RT_BLOCK_DESC_FREE");
+        blockFrees = (e && atoi(e)) ? 1 : 0;
+    }
+    if (blockFrees) {
+        return VK_SUCCESS;
+    }
+    void* key = getKey(device);
+    auto& disp = g_deviceMap[key];
+    return disp.ResetDescriptorPool(device, descriptorPool, flags);
+}
+
+// ═══════════════════════════════════════════
 // Intercepted: UpdateDescriptorSets — skip AS descriptor writes in stripped mode
 // ═══════════════════════════════════════════
 static VKAPI_ATTR void VKAPI_CALL layer_UpdateDescriptorSets(
@@ -5595,9 +5833,9 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBeginRenderPass(
         VkRenderPassBeginInfo modified = *pRenderPassBegin;
         modified.renderArea.extent.width  = g_rasterBoost.renderW;
         modified.renderArea.extent.height = g_rasterBoost.renderH;
-        disp.CmdBeginRenderPass(cmdBuf, &modified, contents);
+        CRASH_GUARD_CMD(cmdBuf, disp.CmdBeginRenderPass(cmdBuf, &modified, contents), "CmdBeginRenderPass");
     } else {
-        disp.CmdBeginRenderPass(cmdBuf, pRenderPassBegin, contents);
+        CRASH_GUARD_CMD(cmdBuf, disp.CmdBeginRenderPass(cmdBuf, pRenderPassBegin, contents), "CmdBeginRenderPass");
     }
 
     // Mid-RP timestamp: for RP2, add a BOTTOM_OF_PIPE timestamp right after begin
@@ -5640,7 +5878,9 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndexed(
         return;  // Deferred — will flush at pipeline change, RP end, or batch limit
     }
 
-    disp.CmdDrawIndexed(cmdBuf, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance);
+    CRASH_GUARD_CMD(cmdBuf,
+        disp.CmdDrawIndexed(cmdBuf, indexCount, instanceCount, firstIndex, vertexOffset, firstInstance),
+        "CmdDrawIndexed");
 }
 
 static VKAPI_ATTR void VKAPI_CALL layer_CmdDraw(
@@ -5659,7 +5899,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDraw(
     static int rpSkip = -1;
     if (rpSkip < 0) { const char* e = getenv("CUDA_RT_SKIP_RP"); rpSkip = e ? atoi(e) : -1; }
     if (rpSkip >= 0 && g_currentRP == (uint32_t)rpSkip) return;
-    disp.CmdDraw(cmdBuf, vertexCount, instanceCount, firstVertex, firstInstance);
+    CRASH_GUARD_CMD(cmdBuf, disp.CmdDraw(cmdBuf, vertexCount, instanceCount, firstVertex, firstInstance), "CmdDraw");
 }
 
 static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndexedIndirect(
@@ -5673,7 +5913,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndexedIndirect(
     static int rpSkip = -1;
     if (rpSkip < 0) { const char* e = getenv("CUDA_RT_SKIP_RP"); rpSkip = e ? atoi(e) : -1; }
     if (rpSkip >= 0 && g_currentRP == (uint32_t)rpSkip) return;
-    disp.CmdDrawIndexedIndirect(cmdBuf, buffer, offset, drawCount, stride);
+    CRASH_GUARD_CMD(cmdBuf, disp.CmdDrawIndexedIndirect(cmdBuf, buffer, offset, drawCount, stride), "CmdDrawIndexedIndirect");
 }
 
 static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndirect(
@@ -5687,7 +5927,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndirect(
     static int rpSkip = -1;
     if (rpSkip < 0) { const char* e = getenv("CUDA_RT_SKIP_RP"); rpSkip = e ? atoi(e) : -1; }
     if (rpSkip >= 0 && g_currentRP == (uint32_t)rpSkip) return;
-    disp.CmdDrawIndirect(cmdBuf, buffer, offset, drawCount, stride);
+    CRASH_GUARD_CMD(cmdBuf, disp.CmdDrawIndirect(cmdBuf, buffer, offset, drawCount, stride), "CmdDrawIndirect");
 }
 
 // ═══════════════════════════════════════════
@@ -5715,7 +5955,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndexedIndirectCount(
     if (maxDrawCap == -2) { const char* e = getenv("CUDA_RT_MAX_DRAW"); maxDrawCap = e ? atoi(e) : -1; }
     uint32_t capped = maxDrawCount;
     if (maxDrawCap > 0 && capped > (uint32_t)maxDrawCap) capped = (uint32_t)maxDrawCap;
-    disp.CmdDrawIndexedIndirectCount(cmdBuf, buffer, offset, countBuffer, countBufferOffset, capped, stride);
+    CRASH_GUARD_CMD(cmdBuf, disp.CmdDrawIndexedIndirectCount(cmdBuf, buffer, offset, countBuffer, countBufferOffset, capped, stride), "CmdDrawIndexedIndirectCount");
 }
 
 static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndirectCount(
@@ -5739,7 +5979,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDrawIndirectCount(
     if (maxDrawCap2 == -2) { const char* e = getenv("CUDA_RT_MAX_DRAW"); maxDrawCap2 = e ? atoi(e) : -1; }
     uint32_t capped = maxDrawCount;
     if (maxDrawCap2 > 0 && capped > (uint32_t)maxDrawCap2) capped = (uint32_t)maxDrawCap2;
-    disp.CmdDrawIndirectCount(cmdBuf, buffer, offset, countBuffer, countBufferOffset, capped, stride);
+    CRASH_GUARD_CMD(cmdBuf, disp.CmdDrawIndirectCount(cmdBuf, buffer, offset, countBuffer, countBufferOffset, capped, stride), "CmdDrawIndirectCount");
 }
 
 // ═══════════════════════════════════════════
@@ -5811,7 +6051,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdExecuteCommands(
     }
     if (g_currentRP < 8) g_drawsInRP[g_currentRP] += commandBufferCount; // count as draws
 
-    disp.CmdExecuteCommands(cmdBuf, commandBufferCount, pCommandBuffers);
+    CRASH_GUARD_CMD(cmdBuf, disp.CmdExecuteCommands(cmdBuf, commandBufferCount, pCommandBuffers), "CmdExecuteCommands");
 }
 
 // ═══════════════════════════════════════════
@@ -5858,7 +6098,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdEndRenderPass(
         drawBatchFlush(cmdBuf, disp);
     }
 
-    disp.CmdEndRenderPass(cmdBuf);
+    CRASH_GUARD_CMD(cmdBuf, disp.CmdEndRenderPass(cmdBuf), "CmdEndRenderPass");
 
     // Write GPU timestamp after render pass
     {
@@ -5975,17 +6215,15 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindDescriptorSets(
     }
     DRIVER_CMD_LOCK();
 
-    // NOTE: Layout replacement in CmdBindDescriptorSets was tested and found HARMFUL.
-    // The extended layout E in CmdBindDescriptorSets confuses the driver's internal
-    // descriptor validation. App's original layout L is correct here — the pipeline
-    // was created with E but descriptor sets were allocated against L's set layouts.
-    // Layout compatibility (Vulkan spec 14.2.2) ensures sets 0..N-1 work with either.
     VkPipelineLayout effectiveLayout = layout;
 
     void* key = getKey(cmdBuf);
     auto& disp = g_deviceMap[key];
-    disp.CmdBindDescriptorSets(cmdBuf, bindPoint, effectiveLayout, firstSet, descriptorSetCount,
-                               pDescriptorSets, dynamicOffsetCount, pDynamicOffsets);
+
+    CRASH_GUARD_CMD(cmdBuf,
+        disp.CmdBindDescriptorSets(cmdBuf, bindPoint, effectiveLayout, firstSet, descriptorSetCount,
+                                   pDescriptorSets, dynamicOffsetCount, pDynamicOffsets),
+        "CmdBindDescriptorSets");
 }
 
 // ═══════════════════════════════════════════
@@ -6047,10 +6285,12 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdPipelineBarrier(
 
     void* key = getKey(cmdBuf);
     auto& disp = g_deviceMap[key];
-    disp.CmdPipelineBarrier(cmdBuf, src, dst, dependencyFlags,
-                            memoryBarrierCount, memBarriers.data(),
-                            bufferMemoryBarrierCount, bufBarriers.data(),
-                            imageMemoryBarrierCount, imgBarriers.data());
+    CRASH_GUARD_CMD(cmdBuf,
+        disp.CmdPipelineBarrier(cmdBuf, src, dst, dependencyFlags,
+                                memoryBarrierCount, memBarriers.data(),
+                                bufferMemoryBarrierCount, bufBarriers.data(),
+                                imageMemoryBarrierCount, imgBarriers.data()),
+        "CmdPipelineBarrier");
 }
 
 // ═══════════════════════════════════════════
@@ -6130,9 +6370,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
     void* key = getKey(queue);
     auto& disp = g_deviceMap[key];
 
-    // Fast path: after BLAS builds are done, pass through with minimal overhead
+    // Fast path: after BLAS builds are done, pass through with crash guard
     if (g_blasBuildsDone) {
-        VkResult r = disp.QueueSubmit(queue, submitCount, pSubmits, fence);
+        VkResult r = VK_ERROR_DEVICE_LOST;
+        installCrashRecovery();
+        g_crashGuardActive = 1;
+        if (sigsetjmp(g_crashJmpBuf, 1) == 0) {
+            r = disp.QueueSubmit(queue, submitCount, pSubmits, fence);
+            g_crashGuardActive = 0;
+        } else {
+            uint64_t cnt = g_crashRecoveryCount.load(std::memory_order_relaxed);
+            fprintf(stderr, "[CudaRT] ⚠ CRASH RECOVERED in QueueSubmit (total: %lu)\n", cnt);
+            return VK_SUCCESS; // pretend it worked
+        }
         // CUDA_RT_SYNC_SUBMIT: force GPU idle after every submit to prevent
         // pushbuffer overflow and driver race conditions
         static int syncSubmit = -1;
@@ -6301,6 +6551,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
 
     static uint32_t presentCount = 0;
     presentCount++;
+
+    // Verify our crash recovery handler is still installed
+    verifyCrashHandler();
+    // Clear poisoned command buffers at frame boundary (they'll be re-recorded)
+    clearPoisonedCmdBufs();
 
     // CUDA_RT_FRAME_SYNC: DeviceWaitIdle every N frames to flush driver state
     // and prevent UAF from accumulating in-flight resources
@@ -6880,7 +7135,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
             return;
         }
     }
-    disp.CmdDispatch(cmdBuf, dispX, dispY, dispZ);
+    CRASH_GUARD_CMD(cmdBuf, disp.CmdDispatch(cmdBuf, dispX, dispY, dispZ), "CmdDispatch");
 }
 
 // ═══════════════════════════════════════════
@@ -7018,7 +7273,10 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetInstanceProcAddr(VkInst
     INTERCEPT(CmdWaitEvents);
     INTERCEPT(CmdBindDescriptorSets);
     INTERCEPT(CreateDescriptorPool);
+    INTERCEPT(DestroyDescriptorPool);
     INTERCEPT(CreateDescriptorSetLayout);
+    INTERCEPT(FreeDescriptorSets);
+    INTERCEPT(ResetDescriptorPool);
     INTERCEPT(UpdateDescriptorSets);
     INTERCEPT(CreateShaderModule);
     INTERCEPT(CreateComputePipelines);
@@ -7175,11 +7433,18 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetDeviceProcAddr(VkDevice
     INTERCEPT(CmdWaitEvents);
 
     // Essential interceptions — always needed for RT emulation
+    INTERCEPT(GetDeviceQueue);
+    INTERCEPT(GetDeviceQueue2);
+    INTERCEPT(CreateDevice);
+    INTERCEPT(DestroyDevice);
     INTERCEPT(CmdBindDescriptorSets);
     INTERCEPT(CmdDispatch);
     INTERCEPT(CmdDispatchIndirect);
     INTERCEPT(CreateDescriptorPool);
+    INTERCEPT(DestroyDescriptorPool);
     INTERCEPT(CreateDescriptorSetLayout);
+    INTERCEPT(FreeDescriptorSets);
+    INTERCEPT(ResetDescriptorPool);
     INTERCEPT(UpdateDescriptorSets);
     INTERCEPT(DestroyPipeline);
 

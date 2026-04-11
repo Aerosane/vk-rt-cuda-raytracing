@@ -308,21 +308,66 @@ DISPLAY=:10 \
 cd Q2RTX && ENABLE_CUDA_RT_LAYER=1 ./q2rtx +map q2dm1
 ```
 
+## Crash Recovery System (SIGSEGV Handler)
+
+The V100 driver (580.126.20) has a use-after-free bug that manifests as SIGSEGV
+during command buffer submission. Our layer implements a multi-tier crash recovery:
+
+### Tier 1: Guarded Recovery (sigsetjmp/siglongjmp)
+- `CRASH_GUARD_CMD(cmdBuf, call, label)` macro wraps every Cmd* driver call
+- On SIGSEGV, longjmps back, marks cmdBuf as "poisoned"
+- Poisoned cmdBufs skip all further Cmd* calls until cleared at QueuePresent
+- QueueSubmit also wrapped — returns VK_SUCCESS on crash
+
+### Tier 2: Instruction Skip (x86_64 RIP advancement)
+- When SIGSEGV fires OUTSIDE a guard region (driver internal thread, unintercepted call)
+- Decodes faulting x86_64 instruction length using REX prefix + ModRM parsing
+- Advances RIP past the faulting instruction, zeros RAX to prevent cascade
+- Last-resort hack — keeps process alive but accumulates state corruption
+
+### Results
+
+| Mode | Frames | Crashes | Notes |
+|------|--------|---------|-------|
+| No recovery | 5-10 | SIGSEGV death | Baseline |
+| Tier 1 only | 4-10 | Still dies (unguarded paths) | Partial fix |
+| Tier 1 + Tier 2 | 10+ | 0 crashes, 50 skips | Survives but stalls |
+
+**Key finding**: Tier 2 instruction skip catches ALL crashes (50 per run at
+`0x7714440b018f` in driver + cascade at corrupted RIP `0x36xx`). Process
+survives 120s+ but driver state corrupts enough to stall rendering at ~Frame 10.
+
+### Crash Address Analysis
+- `0x7714440b018f`: Driver shared library (libGLX_nvidia / libnvidia-glcore)
+- `0x36af-0x36f4`: Corrupted return addresses (cascade from stack corruption)
+- Pattern: fault at driver addr → fault at corrupted RIP → repeat (25 cycles)
+
+### Descriptor Free Blocking (disproven)
+Intercepted FreeDescriptorSets/DestroyDescriptorPool/ResetDescriptorPool and
+NOPed them (CUDA_RT_BLOCK_DESC_FREE=1). Same crash pattern — descriptor frees
+are NOT the UAF cause.
+
+### Dummy Buffer Fix
+The dummy buffer creation in CreateDevice used undefined `g_memTypeCount`/
+`g_memTypes` variables — buffer was never actually created. Fixed to use
+`disp.memProps` (the correct VkPhysicalDeviceMemoryProperties in DeviceDispatch).
+
 ## Next Steps
 
-1. **Close the rewrite gap** — NO_REWRITE gets Frame 10–19, full rewrite gets
+1. **Identify exact driver crash function** — map `0x7714440b018f` to a
+   symbol in libnvidia-glcore.so via /proc/self/maps + addr2line
+2. **Close the rewrite gap** — NO_REWRITE gets Frame 10–19, full rewrite gets
    5–10. The rewriter adds ~40% shader size. Investigate:
    - Trimming unnecessary SPIR-V instructions in the traversal loop
    - Reducing SSBO binding count per shader
    - Using push constants instead of SSBOs for small data
-2. **Solve the UAF** — The secondary crash (Frame 5–19) is the blocker.
+3. **Solve the UAF** — The secondary crash (Frame 5–19) is the blocker.
    Approaches remaining:
    - Different driver version (current: 580.126.20)
    - NVK (Mesa Nouveau Vulkan) — completely different driver stack
-   - Per-command-buffer descriptor binding serialization
    - ioctl-level pushbuffer enlargement
-3. **Feed real BVH data** — Once stable past Frame 20+, enable BVH binding
+4. **Feed real BVH data** — Once stable past Frame 20+, enable BVH binding
    and extended layouts for actual ray tracing output
-4. **Performance** — Single-CPU mode is slow; need per-CB serialization
+5. **Performance** — Single-CPU mode is slow; need per-CB serialization
    instead of full CPU pinning
-5. **Complete benchmark** — 2100 frames needed for a score (~9 min runtime)
+6. **Complete benchmark** — 2100 frames needed for a score (~9 min runtime)
