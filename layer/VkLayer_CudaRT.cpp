@@ -119,8 +119,8 @@ static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
             int tid = (int)syscall(SYS_gettid);
             int slot = (unsigned)tid % 256;
             int tcc = tidCrashCounts[slot].fetch_add(1, std::memory_order_relaxed) + 1;
-            if (tcc > 100 && tid != getpid()) {
-                if (tcc <= 101)
+            if (tcc > 500 && tid != getpid()) {
+                if (tcc <= 501)
                     fprintf(stderr, "[CudaRT] ⚠ Thread %d suspended after %d crashes\n",
                             tid, tcc);
                 // Infinite sleep — zero CPU cost, works from signal handlers
@@ -4414,49 +4414,76 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
 static void tryEagerBLASBuild(VkCommandBuffer cmdBuf) {
     bool hasTLAS = false;
     bool hasPendingBLAS = false;
+    bool hasLateBLAS = false;
     size_t pendingCount = 0;
+    size_t lateCount = 0;
     {
         std::lock_guard<std::mutex> lock(g_lock);
         hasTLAS = g_pendingTLAS.pending && g_pendingTLAS.instanceCount > 0;
         hasPendingBLAS = !g_pendingBLAS.empty() && !g_blasBuildsDone;
+        hasLateBLAS = !g_latePendingBLAS.empty();
         pendingCount = g_pendingBLAS.size();
+        lateCount = g_latePendingBLAS.size();
     }
     static int eagerCheckLog = 0;
-    if (eagerCheckLog < 5 && (hasTLAS || hasPendingBLAS)) {
+    if (eagerCheckLog < 10 && (hasTLAS || hasPendingBLAS || hasLateBLAS)) {
         eagerCheckLog++;
-        LOG("[EAGER-CHK] hasTLAS=%d hasPendingBLAS=%d pending=%zu blasDone=%d tlasInst=%u",
-            (int)hasTLAS, (int)hasPendingBLAS, pendingCount,
+        LOG("[EAGER-CHK] hasTLAS=%d hasPendingBLAS=%d hasLateBLAS=%d pending=%zu late=%zu blasDone=%d tlasInst=%u",
+            (int)hasTLAS, (int)hasPendingBLAS, (int)hasLateBLAS,
+            pendingCount, lateCount,
             (int)g_blasBuildsDone, g_pendingTLAS.instanceCount);
     }
-    if (!hasTLAS || !hasPendingBLAS) return;
-
-    LOG("[EAGER] TLAS seen with %u instances + %zu pending BLASes → attempting immediate build",
-        g_pendingTLAS.instanceCount, pendingCount);
 
     void* key = getKey(cmdBuf);
     auto& disp = g_deviceMap[key];
 
-    // Process pending BLASes now (reads vertex data from device addresses)
-    processPendingBLAS();
+    // Case 1: Initial build — first TLAS + pending BLASes
+    if (hasTLAS && hasPendingBLAS) {
+        LOG("[EAGER] TLAS seen with %u instances + %zu pending BLASes → initial build",
+            g_pendingTLAS.instanceCount, pendingCount);
 
-    if (g_lastBLAS && !g_bvh2.ready) {
-        uploadBVH2Data(disp, g_lastBLAS);
-        LOG("[EAGER] BVH2 uploaded (ready=%d)", (int)g_bvh2.ready);
-    }
+        processPendingBLAS();
 
-    // Process TLAS if BVH2 is ready
-    if (g_bvh2.ready && g_pendingTLAS.instanceAddr != 0) {
-        uint64_t prevGen = g_tlasGeneration;
-        processPendingTLAS();
-        if (g_tlasGeneration > prevGen) {
-            reuploadTLASData(disp);
-            LOG("[EAGER] TLAS built and uploaded (gen=%lu, %d instances)",
-                g_tlasGeneration, g_bvh2.numInstances);
+        if (g_lastBLAS && !g_bvh2.ready) {
+            uploadBVH2Data(disp, g_lastBLAS);
+            LOG("[EAGER] BVH2 uploaded (ready=%d)", (int)g_bvh2.ready);
         }
-    }
 
-    if (g_bvh2.ready)
-        LOG("[EAGER] ✅ BVH pipeline ready BEFORE RQ dispatches are recorded!");
+        if (g_bvh2.ready && g_pendingTLAS.instanceAddr != 0) {
+            uint64_t prevGen = g_tlasGeneration;
+            processPendingTLAS();
+            if (g_tlasGeneration > prevGen) {
+                reuploadTLASData(disp);
+                LOG("[EAGER] TLAS built and uploaded (gen=%lu, %d instances)",
+                    g_tlasGeneration, g_bvh2.numInstances);
+            }
+        }
+
+        if (g_bvh2.ready)
+            LOG("[EAGER] ✅ BVH pipeline ready BEFORE RQ dispatches are recorded!");
+    }
+    // Case 2: Rebuild — new TLAS + late BLASes (scene change after initial build)
+    else if (hasTLAS && hasLateBLAS && g_blasBuildsDone && g_bvh2.ready) {
+        LOG("[EAGER] TLAS #2 with %zu late BLASes → rebuilding BVH pipeline", lateCount);
+
+        bool hasNew = processLateBLAS();
+        if (hasNew) {
+            uploadBVH2Data(disp, g_lastBLAS);
+            LOG("[EAGER] BVH2 re-uploaded after late BLASes");
+        }
+
+        if (g_pendingTLAS.instanceAddr != 0) {
+            uint64_t prevGen = g_tlasGeneration;
+            processPendingTLAS();
+            if (g_tlasGeneration > prevGen) {
+                reuploadTLASData(disp);
+                LOG("[EAGER] TLAS rebuilt (gen=%lu, %d instances)",
+                    g_tlasGeneration, g_bvh2.numInstances);
+            }
+        }
+
+        LOG("[EAGER] ✅ BVH pipeline rebuilt for scene change!");
+    }
 }
 
 static bool setupComputePipeline(DeviceDispatch& disp) {
