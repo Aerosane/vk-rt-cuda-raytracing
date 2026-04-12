@@ -390,26 +390,43 @@ recovery system (SIGSEGV handler + abort() interception + instruction/function
 skip) is essential for survival. The driver bug is present across the entire
 580.xx branch.
 
-### Crash Recovery Architecture (final)
-1. **CRASH_GUARD_CMD** macro: sigsetjmp around every Cmd* call → longjmp on SIGSEGV
-2. **Function skip**: On unguarded SIGSEGV, walk stack for return address, jump there
-3. **Instruction skip**: Fallback — advance RIP past faulting instruction
-4. **SIGABRT suspend**: On SIGABRT, suspend the offending thread instead of stack-walking
-   (stack walking SIGABRT frames produces garbage return addresses → cascade)
-5. **abort()/raise() interception**: LD_PRELOAD libnoabort.so catches abort() and
-   raise(SIGABRT) before they reach the signal handler
-6. **Command buffer poisoning**: Skip all ops on crashed cmdBuf until QueuePresent
-7. **SIGILL/SIGFPE/SIGBUS**: All caught and recovered from
+### Crash Recovery Architecture (v2 — current)
 
-### Multi-Resolution Benchmark (580.142, SIGABRT suspend fix)
+**3-Tier Signal Handler:**
+1. **Tier 0 — CRASH_GUARD**: sigsetjmp around every Cmd* call → longjmp on SIGSEGV
+2. **Tier 1 — Global Recovery**: per-QueueSubmit sigsetjmp → longjmp with fence preservation
+3. **Tier 2 — Driver Thread Recovery**:
+   - SIGSEGV: FUNC SKIP with loop detection (scans deeper on repeated crash/return pairs)
+   - SIGABRT: Suspend (park thread with usleep loop)
 
-| Resolution | Survival | Best Frame | Avg Skips | Notes |
-|-----------|----------|------------|-----------|-------|
-| 1280×720 | 8/10 (80%) | 19 | 94 | 2 failures = pure SEGV cascade |
-| 1920×1080 | 5/5 (100%) | 19 | 154 | Higher res = more stable |
-| 3840×2160 | 5/5 (100%) | 19 | 126 | 4K runs perfectly |
+**Supporting Infrastructure:**
+- **sigaltstack on ALL threads**: via LD_PRELOAD pthread_create wrapper in noabort.so
+  (ensures handler works even when thread stack is corrupted)
+- **WaitForFences intercept**: 2s timeout rescue, empty-submit fence signaling
+  (Note: Breaking Limit uses no fences — useful for other apps)
+- **Fence signaling in recovery paths**: both crash guard and global recovery
+  signal fences via empty QueueSubmit to prevent app deadlock
+- **abort()/raise()/\_\_stack\_chk\_fail() interception**: LD_PRELOAD libnoabort.so
+- **Command buffer poisoning**: Skip all ops on crashed cmdBuf
 
-**Key insight**: Higher resolution is MORE stable — the longer frame time
-reduces the driver thread-scheduling race window that triggers UAF. The app
-stalls at Frame 19 in all cases due to accumulated driver state corruption
-(but never crashes).
+### Latest Benchmark Results (v2 crash recovery, FRAME_SYNC=5)
+
+| Test | Frame | Crashes | Survival | Notes |
+|------|-------|---------|----------|-------|
+| 1080p Run 1 (30s) | 19 | 7 | ✅ timeout | Nearly crash-free |
+| 1080p Run 2 (30s) | 17 | 108 | ✅ timeout | Moderate crashes |
+| 1080p Run 3 (30s) | 5 | 102 | ✅ timeout | Heavy crashes |
+
+**100% survival rate** across all runs. Frame count varies 5-19 based on crash
+count (fewer crashes = higher frames). The benchmark performs 7500+ QueueSubmits
+in 30s regardless of frame progress — compute dispatches continue after render
+passes stop.
+
+**Key findings from investigation:**
+- App uses NO fences (fence=NULL in all QueueSubmit calls)
+- App never calls vkWaitForFences (zero calls intercepted)
+- Frame stall at 19 = loading→rendering transition (needs actual RT results)
+- FRAME_SYNC=5 (QueueWaitIdle every 5 submits) prevents most driver crashes
+- Without FRAME_SYNC, crashes increase dramatically (71-200 FUNC SKIPs)
+- All threads use futex for synchronization; suspended threads cause full deadlock
+- Process may OOM-kill after ~90s of accumulated leaked driver state
