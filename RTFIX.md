@@ -394,6 +394,22 @@ skip) is essential for survival. The driver bug is present across the entire
 1. **CRASH_GUARD_CMD** macro: sigsetjmp around every Cmd* call → longjmp on SIGSEGV
 2. **Function skip**: On unguarded SIGSEGV, walk stack for return address, jump there
 3. **Instruction skip**: Fallback — advance RIP past faulting instruction
-4. **abort() interception**: LD_PRELOAD libnoabort.so suspends thread instead of dying
-5. **Command buffer poisoning**: Skip all ops on crashed cmdBuf until QueuePresent
-6. **SIGILL/SIGFPE/SIGBUS**: All caught and recovered from
+4. **SIGABRT suspend**: On SIGABRT, suspend the offending thread instead of stack-walking
+   (stack walking SIGABRT frames produces garbage return addresses → cascade)
+5. **abort()/raise() interception**: LD_PRELOAD libnoabort.so catches abort() and
+   raise(SIGABRT) before they reach the signal handler
+6. **Command buffer poisoning**: Skip all ops on crashed cmdBuf until QueuePresent
+7. **SIGILL/SIGFPE/SIGBUS**: All caught and recovered from
+
+### Multi-Resolution Benchmark (580.142, SIGABRT suspend fix)
+
+| Resolution | Survival | Best Frame | Avg Skips | Notes |
+|-----------|----------|------------|-----------|-------|
+| 1280×720 | 8/10 (80%) | 19 | 94 | 2 failures = pure SEGV cascade |
+| 1920×1080 | 5/5 (100%) | 19 | 154 | Higher res = more stable |
+| 3840×2160 | 5/5 (100%) | 19 | 126 | 4K runs perfectly |
+
+**Key insight**: Higher resolution is MORE stable — the longer frame time
+reduces the driver thread-scheduling race window that triggers UAF. The app
+stalls at Frame 19 in all cases due to accumulated driver state corruption
+(but never crashes).
