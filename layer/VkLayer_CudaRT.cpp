@@ -2718,13 +2718,25 @@ static void processPendingBLAS() {
                     bit->second.numTris = (int)capturedTris.size();
                     bit->second.isReady = true;
                 }
-                // Track ALL BLASes in g_blasEntries
+                // Track BLASes in g_blasEntries — dedup by asKey
                 BLASEntry entry = {};
                 entry.bvh = bvh;
                 entry.asKey = pb.asKey;
                 entry.numTris = (int)capturedTris.size();
-                g_asKeyToBLASIdx[pb.asKey] = (int)g_blasEntries.size();
-                g_blasEntries.push_back(entry);
+                auto existingIt = g_asKeyToBLASIdx.find(pb.asKey);
+                if (existingIt != g_asKeyToBLASIdx.end()) {
+                    // Replace existing entry (BLAS rebuild with same handle)
+                    // Don't destroy old BVH — already handled by bvhMap update above
+                    int idx = existingIt->second;
+                    g_blasEntries[idx] = entry;
+                    static int dedupLog = 0;
+                    if (dedupLog++ < 5)
+                        LOG("  [BLAS-DEDUP] asKey=0x%lx replaced at idx=%d (%d tris)",
+                            (uint64_t)pb.asKey, idx, (int)capturedTris.size());
+                } else {
+                    g_asKeyToBLASIdx[pb.asKey] = (int)g_blasEntries.size();
+                    g_blasEntries.push_back(entry);
+                }
                 totalBLAS++;
 
                 if ((int)capturedTris.size() > bestTris) {
