@@ -6467,12 +6467,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
     const VkSubmitInfo* pSubmits,
     VkFence fence)
 {
-    // Heartbeat: track last time QueueSubmit was called
-    static std::atomic<uint64_t> totalSubmits{0};
-    uint64_t n = totalSubmits.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (n <= 5 || (n % 500) == 0)
-        fprintf(stderr, "[CudaRT] QueueSubmit ENTER #%lu (fence=%p)\n", n, (void*)fence);
-
     void* key = getKey(queue);
     auto& disp = g_deviceMap[key];
     g_lastSubmitQueue.store(queue, std::memory_order_relaxed);
@@ -6771,12 +6765,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_WaitForFences(
     VkDevice device, uint32_t fenceCount, const VkFence* pFences,
     VkBool32 waitAll, uint64_t timeout)
 {
-    static std::atomic<uint64_t> wfCount{0};
-    uint64_t wn = wfCount.fetch_add(1, std::memory_order_relaxed) + 1;
-    if (wn <= 5 || (wn % 200) == 0)
-        fprintf(stderr, "[CudaRT] WaitForFences ENTER #%lu (cnt=%u timeout=%lu)\n",
-                wn, fenceCount, (unsigned long)(timeout / 1000000));
-
     void* key = getKey(device);
     DeviceDispatch* pDisp = nullptr;
     {
