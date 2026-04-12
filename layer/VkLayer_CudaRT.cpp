@@ -96,15 +96,12 @@ static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
     // Tier 2: No recovery point — driver worker thread.
     // Strategy: FUNC SKIP for SIGSEGV (lets thread try to release locks),
     // SUSPEND only for SIGABRT (thread called abort, can't continue).
-    // FUNC SKIP may cascade, but often the thread survives enough to
-    // release driver locks before dying — this prevents the futex deadlock.
     {
         static std::atomic<int> tier2Count{0};
         int c = tier2Count.fetch_add(1, std::memory_order_relaxed) + 1;
         ucontext_t* uc = (ucontext_t*)ctx;
 
         if (sig == SIGABRT) {
-            // SIGABRT: suspend (abort() already called, can't return meaningfully)
             if (c <= 50) {
                 uint64_t rip = uc ? uc->uc_mcontext.gregs[REG_RIP] : 0;
                 fprintf(stderr, "[CudaRT] ⚠ SUSPEND #%d: SIGABRT RIP=%p tid=%d\n",
@@ -113,26 +110,59 @@ static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
             for (;;) usleep(1000000);
         }
 
-        // SIGSEGV/SIGBUS/etc: FUNC SKIP — scan stack for return address
+        // SIGSEGV/SIGBUS/etc: FUNC SKIP with loop detection
         if (uc && c <= 500) {
             uint64_t rip = uc->uc_mcontext.gregs[REG_RIP];
             uint64_t rsp = uc->uc_mcontext.gregs[REG_RSP];
 
-            for (int i = 0; i < 16; i++) {
-                uint64_t candidate = 0;
-                if (!safeReadU64(rsp + i * 8, &candidate)) continue;
-                uint8_t top = candidate >> 40;
-                if (top >= 0x55 && top <= 0x7e && candidate != rip) {
-                    uc->uc_mcontext.gregs[REG_RSP] = rsp + (i + 1) * 8;
-                    uc->uc_mcontext.gregs[REG_RIP] = candidate;
-                    uc->uc_mcontext.gregs[REG_RAX] = 0;
-                    if (c <= 200)
-                        fprintf(stderr, "[CudaRT] ⚠ FUNC SKIP #%d: sig=%d RIP=%p → %p tid=%d\n",
-                                c, sig, (void*)rip, (void*)candidate, (int)syscall(SYS_gettid));
-                    return;
+            // Loop detection: track last return address per thread.
+            // If we keep returning to the same address, skip deeper.
+            static thread_local uint64_t lastReturn = 0;
+            static thread_local int sameReturnCount = 0;
+            int skipDepth = 0; // how many candidate return addrs to skip
+
+            // Scan stack for return addresses
+            uint64_t candidates[32];
+            int nCandidates = 0;
+            for (int i = 0; i < 32 && nCandidates < 32; i++) {
+                uint64_t val = 0;
+                if (!safeReadU64(rsp + i * 8, &val)) continue;
+                uint8_t top = val >> 40;
+                if (top >= 0x55 && top <= 0x7e && val != rip) {
+                    candidates[nCandidates++] = val;
                 }
             }
-            // No return address found — last resort: advance RIP by 8 bytes (skip instruction)
+
+            if (nCandidates > 0) {
+                // Check if first candidate is the same as last time (loop)
+                if (candidates[0] == lastReturn) {
+                    sameReturnCount++;
+                    // Skip deeper: use candidate[N] where N = min(sameReturnCount, nCandidates-1)
+                    skipDepth = sameReturnCount < nCandidates ? sameReturnCount : nCandidates - 1;
+                } else {
+                    sameReturnCount = 0;
+                }
+
+                uint64_t target = candidates[skipDepth];
+                lastReturn = target;
+
+                // Find the stack offset for this candidate
+                for (int i = 0; i < 32; i++) {
+                    uint64_t val = 0;
+                    if (!safeReadU64(rsp + i * 8, &val)) continue;
+                    if (val == target) {
+                        uc->uc_mcontext.gregs[REG_RSP] = rsp + (i + 1) * 8;
+                        uc->uc_mcontext.gregs[REG_RIP] = target;
+                        uc->uc_mcontext.gregs[REG_RAX] = 0;
+                        if (c <= 200)
+                            fprintf(stderr, "[CudaRT] ⚠ FUNC SKIP #%d: sig=%d RIP=%p → %p (depth=%d) tid=%d\n",
+                                    c, sig, (void*)rip, (void*)target, skipDepth, (int)syscall(SYS_gettid));
+                        return;
+                    }
+                }
+            }
+
+            // No candidates or search failed — advance RIP by 8
             uc->uc_mcontext.gregs[REG_RIP] = rip + 8;
             uc->uc_mcontext.gregs[REG_RAX] = 0;
             if (c <= 200)
@@ -141,7 +171,7 @@ static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
             return;
         }
 
-        // Too many crashes — suspend as last resort
+        // Too many crashes — suspend
         for (;;) usleep(1000000);
     }
 }
@@ -6437,6 +6467,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
     const VkSubmitInfo* pSubmits,
     VkFence fence)
 {
+    // Heartbeat: track last time QueueSubmit was called
+    static std::atomic<uint64_t> totalSubmits{0};
+    uint64_t n = totalSubmits.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (n <= 5 || (n % 500) == 0)
+        fprintf(stderr, "[CudaRT] QueueSubmit ENTER #%lu (fence=%p)\n", n, (void*)fence);
+
     void* key = getKey(queue);
     auto& disp = g_deviceMap[key];
     g_lastSubmitQueue.store(queue, std::memory_order_relaxed);
@@ -6735,6 +6771,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_WaitForFences(
     VkDevice device, uint32_t fenceCount, const VkFence* pFences,
     VkBool32 waitAll, uint64_t timeout)
 {
+    static std::atomic<uint64_t> wfCount{0};
+    uint64_t wn = wfCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    if (wn <= 5 || (wn % 200) == 0)
+        fprintf(stderr, "[CudaRT] WaitForFences ENTER #%lu (cnt=%u timeout=%lu)\n",
+                wn, fenceCount, (unsigned long)(timeout / 1000000));
+
     void* key = getKey(device);
     DeviceDispatch* pDisp = nullptr;
     {
