@@ -2536,6 +2536,17 @@ static void processPendingBLAS() {
         g_pendingBLAS.clear();
     }
 
+    // CUDA_RT_MAX_BLAS: limit BLAS builds for faster startup (0=unlimited)
+    static int maxBlas = -1;
+    if (maxBlas < 0) {
+        const char* e = getenv("CUDA_RT_MAX_BLAS");
+        maxBlas = e ? atoi(e) : 0;
+    }
+    if (maxBlas > 0 && (int)pending.size() > maxBlas) {
+        LOG("[Deferred] Limiting BLAS builds from %zu to %d (CUDA_RT_MAX_BLAS)", pending.size(), maxBlas);
+        pending.resize(maxBlas);
+    }
+
     LOG("[Deferred] Processing %zu pending BLAS builds after QueueSubmit...", pending.size());
 
     CudaBVH_t bestBVH = nullptr;
@@ -6656,6 +6667,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
         // Wait for this submission to complete so GPU buffers are filled
         disp.QueueWaitIdle(queue);
         processPendingBLAS();
+
+        // Upload BVH2 data to Vulkan SSBOs immediately after build
+        // This must happen HERE (in QueueSubmit) not lazily in CmdDispatch,
+        // because CmdDispatch runs at record time before GPU data is available.
+        if (g_lastBLAS && !g_bvh2.ready) {
+            uploadBVH2Data(disp, g_lastBLAS);
+            LOG("[QS] BVH2 uploaded immediately after BLAS build (ready=%d)", (int)g_bvh2.ready);
+        }
 
         // Execute deferred CUDA trace now that BLAS is ready
         if (g_deferredTrace.pending && g_lastBLAS) {

@@ -8,7 +8,9 @@
 #include <dlfcn.h>
 #include <pthread.h>
 #include <sys/mman.h>
+#include <sched.h>
 #include <stdlib.h>
+#include <sys/syscall.h>
 
 // Install alternate signal stack on current thread (8KB, separate from main stack)
 static void install_sigaltstack(void) {
@@ -63,9 +65,14 @@ void abort(void) {
         static int abortCount = 0;
         int c = __sync_add_and_fetch(&abortCount, 1);
         if (c <= 20)
-            fprintf(stderr, "[noabort] abort() #%d intercepted — spinning\n", c);
+            fprintf(stderr, "[noabort] abort() #%d intercepted — thread %ld\n", c, (long)syscall(186));
     }
-    for (;;) usleep(1000000);
+    // Non-main threads: exit cleanly to release locks
+    if (syscall(186) != getpid()) {
+        pthread_exit(NULL);
+    }
+    // Main thread: yield instead of hard spin (single-CPU safe)
+    for (;;) sched_yield();
     __builtin_unreachable();
 }
 
