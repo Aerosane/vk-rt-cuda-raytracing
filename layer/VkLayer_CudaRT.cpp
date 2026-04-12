@@ -111,14 +111,35 @@ static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
         }
 
         // SIGSEGV/SIGBUS/etc: FUNC SKIP with loop detection
+        // Per-thread limit: suspend threads that crash too many times
+        // NOTE: thread_local is NOT async-signal-safe in dlopen'd libs
+        //       (__tls_get_addr takes locks). Use TID-indexed array instead.
+        {
+            static std::atomic<int> tidCrashCounts[256] = {};
+            int tid = (int)syscall(SYS_gettid);
+            int slot = (unsigned)tid % 256;
+            int tcc = tidCrashCounts[slot].fetch_add(1, std::memory_order_relaxed) + 1;
+            if (tcc > 100 && tid != getpid()) {
+                if (tcc <= 101)
+                    fprintf(stderr, "[CudaRT] ⚠ Thread %d suspended after %d crashes\n",
+                            tid, tcc);
+                // Infinite sleep — zero CPU cost, works from signal handlers
+                for (;;) usleep(1000000);
+            }
+        }
         if (uc && c <= 500) {
             uint64_t rip = uc->uc_mcontext.gregs[REG_RIP];
             uint64_t rsp = uc->uc_mcontext.gregs[REG_RSP];
 
             // Loop detection: track last return address per thread.
             // If we keep returning to the same address, skip deeper.
-            static thread_local uint64_t lastReturn = 0;
-            static thread_local int sameReturnCount = 0;
+            // NOTE: Use TID-indexed arrays (async-signal-safe), not thread_local
+            static std::atomic<uint64_t> lastReturnArr[256] = {};
+            static std::atomic<int> sameReturnCountArr[256] = {};
+            int tid2 = (int)syscall(SYS_gettid);
+            int slot2 = (unsigned)tid2 % 256;
+            uint64_t lastReturn = lastReturnArr[slot2].load(std::memory_order_relaxed);
+            int sameReturnCount = sameReturnCountArr[slot2].load(std::memory_order_relaxed);
             int skipDepth = 0; // how many candidate return addrs to skip
 
             // Scan stack for return addresses
@@ -137,14 +158,15 @@ static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
                 // Check if first candidate is the same as last time (loop)
                 if (candidates[0] == lastReturn) {
                     sameReturnCount++;
+                    sameReturnCountArr[slot2].store(sameReturnCount, std::memory_order_relaxed);
                     // Skip deeper: use candidate[N] where N = min(sameReturnCount, nCandidates-1)
                     skipDepth = sameReturnCount < nCandidates ? sameReturnCount : nCandidates - 1;
                 } else {
-                    sameReturnCount = 0;
+                    sameReturnCountArr[slot2].store(0, std::memory_order_relaxed);
                 }
 
                 uint64_t target = candidates[skipDepth];
-                lastReturn = target;
+                lastReturnArr[slot2].store(target, std::memory_order_relaxed);
 
                 // Find the stack offset for this candidate
                 for (int i = 0; i < 32; i++) {
@@ -154,7 +176,7 @@ static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
                         uc->uc_mcontext.gregs[REG_RSP] = rsp + (i + 1) * 8;
                         uc->uc_mcontext.gregs[REG_RIP] = target;
                         uc->uc_mcontext.gregs[REG_RAX] = 0;
-                        if (c <= 200)
+                        if (c <= 30)
                             fprintf(stderr, "[CudaRT] ⚠ FUNC SKIP #%d: sig=%d RIP=%p → %p (depth=%d) tid=%d\n",
                                     c, sig, (void*)rip, (void*)target, skipDepth, (int)syscall(SYS_gettid));
                         return;
@@ -165,7 +187,7 @@ static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
             // No candidates or search failed — advance RIP by 8
             uc->uc_mcontext.gregs[REG_RIP] = rip + 8;
             uc->uc_mcontext.gregs[REG_RAX] = 0;
-            if (c <= 200)
+            if (c <= 30)
                 fprintf(stderr, "[CudaRT] ⚠ INSN SKIP #%d: sig=%d RIP=%p+8 tid=%d\n",
                         c, sig, (void*)rip, (int)syscall(SYS_gettid));
             return;
@@ -723,6 +745,10 @@ struct BVH2Interop {
     VkDeviceMemory trisMem;
     VkDeviceMemory tlasNodesMem;
     VkDeviceMemory instancesMem;
+    VkDeviceSize nodesCapacity;      // pre-allocated capacity in bytes
+    VkDeviceSize trisCapacity;
+    VkDeviceSize tlasNodesCapacity;
+    VkDeviceSize instancesCapacity;
     VkDescriptorSetLayout dsLayout;
     VkDescriptorPool descPool;
     VkDescriptorSet descSet;
@@ -1871,6 +1897,16 @@ static void* readDeviceAddressData(VkDeviceAddress addr, VkDeviceSize size) {
                 device = mit->second.device;
                 if (!device) continue;
                 srcOffset = addr - bi.devAddr;
+                // Clamp read size to buffer bounds to avoid overread crashes
+                if (srcOffset + size > bi.size) {
+                    size_t avail = (srcOffset < bi.size) ? (bi.size - srcOffset) : 0;
+                    static int clampLog = 0;
+                    if (clampLog++ < 5)
+                        LOG("  → Staging read CLAMPED: srcOff=%zu + size=%zu > bufSize=%zu → %zu",
+                            (size_t)srcOffset, (size_t)size, (size_t)bi.size, avail);
+                    if (avail == 0) { device = VK_NULL_HANDLE; break; }
+                    size = avail;
+                }
                 srcBuffer = (VkBuffer)bufId;
 
                 static int readLog = 0;
@@ -2554,6 +2590,23 @@ static void processPendingBLAS() {
     int totalBLAS = 0;
 
     for (auto& pb : pending) {
+        // Per-BLAS crash guard: if staging read crashes, skip this BLAS
+        volatile sig_atomic_t savedGuard = g_crashGuardActive;
+        sigjmp_buf savedBuf;
+        memcpy(&savedBuf, &g_crashJmpBuf, sizeof(sigjmp_buf));
+        if (sigsetjmp(g_crashJmpBuf, 1) != 0) {
+            // Crashed during this BLAS — skip it
+            static int blasCrashCount = 0;
+            blasCrashCount++;
+            if (blasCrashCount <= 10)
+                LOG("[Deferred] ⚠ BLAS build crashed (asKey=0x%lx), skipping (#%d)",
+                    (uint64_t)pb.asKey, blasCrashCount);
+            g_crashGuardActive = savedGuard;
+            memcpy(&g_crashJmpBuf, &savedBuf, sizeof(sigjmp_buf));
+            continue;
+        }
+        g_crashGuardActive = 1;
+
         std::vector<CudaTri> capturedTris;
 
         for (auto& pg : pb.geometries) {
@@ -2638,6 +2691,9 @@ static void processPendingBLAS() {
                 }
             }
         }
+        // Restore outer crash guard after successful BLAS
+        g_crashGuardActive = savedGuard;
+        memcpy(&g_crashJmpBuf, &savedBuf, sizeof(sigjmp_buf));
     }
 
     // Compute concatenated node/tri offsets for all BLASes
@@ -3443,6 +3499,136 @@ static bool createBufferWithData(DeviceDispatch& disp, const void* data, VkDevic
     return true;
 }
 
+// Upload data into an EXISTING device-local buffer via staging copy.
+// Buffer must have been created with TRANSFER_DST_BIT and have sufficient capacity.
+static bool uploadToExistingBuffer(DeviceDispatch& disp, VkBuffer dstBuf, const void* data, VkDeviceSize size) {
+    if (!data || size == 0) return false;
+    
+    VkBuffer stagingBuf;
+    VkDeviceMemory stagingMem;
+    VkBufferCreateInfo stagCI = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    stagCI.size = size;
+    stagCI.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
+    stagCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (disp.CreateBuffer(disp.device, &stagCI, nullptr, &stagingBuf) != VK_SUCCESS) return false;
+
+    VkMemoryRequirements stagReqs;
+    disp.GetBufferMemoryRequirements(disp.device, stagingBuf, &stagReqs);
+    int hostMemType = -1;
+    for (uint32_t i = 0; i < disp.memProps.memoryTypeCount; i++) {
+        if ((stagReqs.memoryTypeBits & (1 << i)) &&
+            (disp.memProps.memoryTypes[i].propertyFlags &
+             (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+             (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            hostMemType = i; break;
+        }
+    }
+    if (hostMemType < 0) { disp.DestroyBuffer(disp.device, stagingBuf, nullptr); return false; }
+
+    VkMemoryAllocateInfo stagAlloc = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    stagAlloc.allocationSize = stagReqs.size;
+    stagAlloc.memoryTypeIndex = hostMemType;
+    if (disp.AllocateMemory(disp.device, &stagAlloc, nullptr, &stagingMem) != VK_SUCCESS) {
+        disp.DestroyBuffer(disp.device, stagingBuf, nullptr); return false;
+    }
+    disp.BindBufferMemory(disp.device, stagingBuf, stagingMem, 0);
+    void* mapped = nullptr;
+    disp.MapMemory(disp.device, stagingMem, 0, size, 0, &mapped);
+    if (!mapped) return false;
+    memcpy(mapped, data, size);
+    disp.UnmapMemory(disp.device, stagingMem);
+
+    auto createCP = (PFN_vkCreateCommandPool)disp.GetDeviceProcAddr(disp.device, "vkCreateCommandPool");
+    auto destroyCP = (PFN_vkDestroyCommandPool)disp.GetDeviceProcAddr(disp.device, "vkDestroyCommandPool");
+    auto allocCB = (PFN_vkAllocateCommandBuffers)disp.GetDeviceProcAddr(disp.device, "vkAllocateCommandBuffers");
+    auto beginCB = (PFN_vkBeginCommandBuffer)disp.GetDeviceProcAddr(disp.device, "vkBeginCommandBuffer");
+    auto endCB = (PFN_vkEndCommandBuffer)disp.GetDeviceProcAddr(disp.device, "vkEndCommandBuffer");
+    auto queueSubmit = (PFN_vkQueueSubmit)disp.GetDeviceProcAddr(disp.device, "vkQueueSubmit");
+    auto queueWait = (PFN_vkQueueWaitIdle)disp.GetDeviceProcAddr(disp.device, "vkQueueWaitIdle");
+    auto getQueue = (PFN_vkGetDeviceQueue)disp.GetDeviceProcAddr(disp.device, "vkGetDeviceQueue");
+    if (!createCP || !allocCB || !beginCB || !endCB || !queueSubmit || !queueWait || !getQueue) {
+        disp.DestroyBuffer(disp.device, stagingBuf, nullptr);
+        disp.FreeMemory(disp.device, stagingMem, nullptr);
+        return false;
+    }
+
+    VkQueue queue;
+    getQueue(disp.device, 0, 0, &queue);
+    VkCommandPool cmdPool;
+    VkCommandPoolCreateInfo cpCI = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
+    cpCI.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
+    cpCI.queueFamilyIndex = 0;
+    createCP(disp.device, &cpCI, nullptr, &cmdPool);
+
+    VkCommandBuffer cmdBuf;
+    VkCommandBufferAllocateInfo cbAI = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
+    cbAI.commandPool = cmdPool;
+    cbAI.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
+    cbAI.commandBufferCount = 1;
+    allocCB(disp.device, &cbAI, &cmdBuf);
+
+    VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
+    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
+    beginCB(cmdBuf, &beginInfo);
+    VkBufferCopy copyRegion = {};
+    copyRegion.size = size;
+    disp.CmdCopyBuffer(cmdBuf, stagingBuf, dstBuf, 1, &copyRegion);
+    endCB(cmdBuf);
+
+    VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
+    submitInfo.commandBufferCount = 1;
+    submitInfo.pCommandBuffers = &cmdBuf;
+    queueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
+    queueWait(queue);
+
+    destroyCP(disp.device, cmdPool, nullptr);
+    disp.DestroyBuffer(disp.device, stagingBuf, nullptr);
+    disp.FreeMemory(disp.device, stagingMem, nullptr);
+    return true;
+}
+
+// Ensure a buffer has at least `requiredSize` capacity. If insufficient,
+// destroy and recreate. Returns true if buffer is ready.
+static bool ensureBufferCapacity(DeviceDispatch& disp, VkDeviceSize requiredSize,
+                                  VkBuffer& buf, VkDeviceMemory& mem, VkDeviceSize& capacity) {
+    if (buf && capacity >= requiredSize) return true;
+    
+    if (buf) { disp.DestroyBuffer(disp.device, buf, nullptr); buf = VK_NULL_HANDLE; }
+    if (mem) { disp.FreeMemory(disp.device, mem, nullptr); mem = VK_NULL_HANDLE; }
+    capacity = 0;
+    
+    // Round up to next power of 2, minimum 4MB
+    VkDeviceSize allocSize = 4 * 1024 * 1024;
+    while (allocSize < requiredSize) allocSize *= 2;
+    
+    VkBufferCreateInfo bufCI = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
+    bufCI.size = allocSize;
+    bufCI.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    bufCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
+    if (disp.CreateBuffer(disp.device, &bufCI, nullptr, &buf) != VK_SUCCESS) return false;
+    
+    VkMemoryRequirements memReqs;
+    disp.GetBufferMemoryRequirements(disp.device, buf, &memReqs);
+    int devMemType = -1;
+    for (uint32_t i = 0; i < disp.memProps.memoryTypeCount; i++) {
+        if ((memReqs.memoryTypeBits & (1 << i)) &&
+            (disp.memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+            devMemType = i; break;
+        }
+    }
+    if (devMemType < 0) { disp.DestroyBuffer(disp.device, buf, nullptr); buf = VK_NULL_HANDLE; return false; }
+    
+    VkMemoryAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+    allocInfo.allocationSize = memReqs.size;
+    allocInfo.memoryTypeIndex = devMemType;
+    if (disp.AllocateMemory(disp.device, &allocInfo, nullptr, &mem) != VK_SUCCESS) {
+        disp.DestroyBuffer(disp.device, buf, nullptr); buf = VK_NULL_HANDLE; return false;
+    }
+    disp.BindBufferMemory(disp.device, buf, mem, 0);
+    capacity = allocSize;
+    return true;
+}
+
 // ═══════════════════════════════════════════
 // BVH2 interop: create Vulkan SSBOs + descriptor set for SPIR-V ray query traversal
 // ═══════════════════════════════════════════
@@ -3493,55 +3679,52 @@ static bool setupBVH2Descriptors(DeviceDispatch& disp) {
 
     LOG("[BVH2] Descriptor set layout + pool + set created (4 bindings)");
 
-    // Create null-safe BVH buffers immediately so shaders that run before real BVH data
-    // is uploaded will read valid descriptors. Use large AABB extents so no ray hits the
-    // degenerate boxes, and skip=-1 for immediate loop exit on the next iteration.
+    // Pre-allocate LARGE BVH buffers (4MB each) so they can be bound during command
+    // recording BEFORE real BVH data is available. Fill with null-safe data (huge AABB +
+    // skip=-1) so shaders that run before upload will exit traversal immediately.
+    // When real BVH data arrives, we overwrite buffer CONTENTS via staging copy — 
+    // the descriptor set never changes, so pre-recorded command buffers see the new data.
     {
-        // 4 null nodes: AABB = (FLT_MAX..FLT_MAX) to (FLT_MAX..FLT_MAX) → never hit
-        // leaf_enc=0 (internal), skip=-1 (exit). Extra nodes prevent OOB access.
+        const VkDeviceSize PREALLOC = 4 * 1024 * 1024; // 4MB per buffer
+        
+        // Allocate all 4 buffers
+        if (!ensureBufferCapacity(disp, PREALLOC, g_bvh2.nodesBuf, g_bvh2.nodesMem, g_bvh2.nodesCapacity) ||
+            !ensureBufferCapacity(disp, PREALLOC, g_bvh2.trisBuf, g_bvh2.trisMem, g_bvh2.trisCapacity) ||
+            !ensureBufferCapacity(disp, PREALLOC, g_bvh2.tlasNodesBuf, g_bvh2.tlasNodesMem, g_bvh2.tlasNodesCapacity) ||
+            !ensureBufferCapacity(disp, PREALLOC, g_bvh2.instancesBuf, g_bvh2.instancesMem, g_bvh2.instancesCapacity)) {
+            LOG("[BVH2] Failed to pre-allocate BVH buffers (%zu MB each)", (size_t)(PREALLOC/1024/1024));
+            return false;
+        }
+        
+        // Upload null-safe data to each buffer
+        // 4 null nodes: AABB = (1e30..1e30) → never hit, skip=-1 → immediate exit
         uint32_t hugeF;
         float hugeVal = 1e30f;
         memcpy(&hugeF, &hugeVal, 4);
-        uint32_t nullNodes[4*8];  // 4 nodes × 8 uint32s each
+        uint32_t nullNodes[4*8];
         for (int i = 0; i < 4; i++) {
             uint32_t* n = nullNodes + i*8;
-            n[0]=hugeF; n[1]=hugeF; n[2]=hugeF; // bmin = huge (unreachable)
-            n[3]=hugeF; n[4]=hugeF; n[5]=hugeF; // bmax = huge
-            n[6]=0;                              // leaf_enc=0 (internal)
-            n[7]=0xFFFFFFFF;                     // skip=-1 (exit loop)
+            n[0]=hugeF; n[1]=hugeF; n[2]=hugeF;
+            n[3]=hugeF; n[4]=hugeF; n[5]=hugeF;
+            n[6]=0;
+            n[7]=0xFFFFFFFF;
         }
-        // binding 0: BLAS nodes
-        if (!createBufferWithData(disp, nullNodes, sizeof(nullNodes),
-                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.nodesBuf, g_bvh2.nodesMem)) {
-            LOG("[BVH2] Failed to create null BLAS nodes buffer");
-            return false;
-        }
-        // binding 1: BLAS tris — 1 dummy triangle (3 vec4s)
         float nullTri[12] = {0};
-        if (!createBufferWithData(disp, nullTri, sizeof(nullTri),
-                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.trisBuf, g_bvh2.trisMem)) {
-            LOG("[BVH2] Failed to create null BLAS tris buffer");
-            return false;
-        }
-        // binding 2: TLAS nodes — 4 nodes with huge AABB + skip=-1
-        if (!createBufferWithData(disp, nullNodes, sizeof(nullNodes),
-                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.tlasNodesBuf, g_bvh2.tlasNodesMem)) {
-            LOG("[BVH2] Failed to create null TLAS nodes buffer");
-            return false;
-        }
-        // binding 3: instances — 1 dummy instance (8 vec4s = 128 bytes)
-        float nullInst[32] = {0};
-        if (!createBufferWithData(disp, nullInst, sizeof(nullInst),
-                                   VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.instancesBuf, g_bvh2.instancesMem)) {
-            LOG("[BVH2] Failed to create null instances buffer");
-            return false;
-        }
-        // Write null descriptors
+        float nullInst[36] = {0};
+        
+        uploadToExistingBuffer(disp, g_bvh2.nodesBuf, nullNodes, sizeof(nullNodes));
+        uploadToExistingBuffer(disp, g_bvh2.trisBuf, nullTri, sizeof(nullTri));
+        uploadToExistingBuffer(disp, g_bvh2.tlasNodesBuf, nullNodes, sizeof(nullNodes));
+        uploadToExistingBuffer(disp, g_bvh2.instancesBuf, nullInst, sizeof(nullInst));
+        
+        // Write descriptors with VK_WHOLE_SIZE — covers entire pre-allocated buffer.
+        // GPU reads actual contents at execution time, so updating buffer data later
+        // automatically becomes visible to pre-recorded command buffers.
         VkDescriptorBufferInfo bufs[4] = {
-            {g_bvh2.nodesBuf,       0, sizeof(nullNodes)},
-            {g_bvh2.trisBuf,        0, sizeof(nullTri)},
-            {g_bvh2.tlasNodesBuf,   0, sizeof(nullNodes)},
-            {g_bvh2.instancesBuf,   0, sizeof(nullInst)},
+            {g_bvh2.nodesBuf,       0, VK_WHOLE_SIZE},
+            {g_bvh2.trisBuf,        0, VK_WHOLE_SIZE},
+            {g_bvh2.tlasNodesBuf,   0, VK_WHOLE_SIZE},
+            {g_bvh2.instancesBuf,   0, VK_WHOLE_SIZE},
         };
         VkWriteDescriptorSet writes[4] = {};
         for (int i = 0; i < 4; i++) {
@@ -3553,9 +3736,9 @@ static bool setupBVH2Descriptors(DeviceDispatch& disp) {
             writes[i].pBufferInfo = &bufs[i];
         }
         disp.UpdateDescriptorSets(disp.device, 4, writes, 0, nullptr);
-        g_bvh2.descSetIdx = 4; // initial default — overridden by per-pipeline bvhDescSet at bind time
-        // NOTE: g_bvh2.ready remains false until uploadBVH2Data uploads real data
-        LOG("[BVH2] Null-safe BVH buffers initialized (huge AABB + skip=-1)");
+        g_bvh2.descSetIdx = 4;
+        LOG("[BVH2] Pre-allocated BVH buffers (%zu MB each) with null-safe data + VK_WHOLE_SIZE descriptors",
+            (size_t)(PREALLOC/1024/1024));
     }
 
     return true;
@@ -3712,29 +3895,30 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
         }
     }
 
-    // Destroy old buffers
-    if (g_bvh2.nodesBuf) { disp.DestroyBuffer(disp.device, g_bvh2.nodesBuf, nullptr); g_bvh2.nodesBuf = VK_NULL_HANDLE; }
-    if (g_bvh2.nodesMem) { disp.FreeMemory(disp.device, g_bvh2.nodesMem, nullptr); g_bvh2.nodesMem = VK_NULL_HANDLE; }
-    if (g_bvh2.trisBuf)  { disp.DestroyBuffer(disp.device, g_bvh2.trisBuf, nullptr); g_bvh2.trisBuf = VK_NULL_HANDLE; }
-    if (g_bvh2.trisMem)  { disp.FreeMemory(disp.device, g_bvh2.trisMem, nullptr); g_bvh2.trisMem = VK_NULL_HANDLE; }
-    if (g_bvh2.tlasNodesBuf) { disp.DestroyBuffer(disp.device, g_bvh2.tlasNodesBuf, nullptr); g_bvh2.tlasNodesBuf = VK_NULL_HANDLE; }
-    if (g_bvh2.tlasNodesMem) { disp.FreeMemory(disp.device, g_bvh2.tlasNodesMem, nullptr); g_bvh2.tlasNodesMem = VK_NULL_HANDLE; }
-    if (g_bvh2.instancesBuf) { disp.DestroyBuffer(disp.device, g_bvh2.instancesBuf, nullptr); g_bvh2.instancesBuf = VK_NULL_HANDLE; }
-    if (g_bvh2.instancesMem) { disp.FreeMemory(disp.device, g_bvh2.instancesMem, nullptr); g_bvh2.instancesMem = VK_NULL_HANDLE; }
-
-    // Upload concatenated nodes
+    // Reuse pre-allocated buffers — only reallocate if capacity exceeded.
+    // This is critical: the descriptor set references these buffer handles with VK_WHOLE_SIZE,
+    // and pre-recorded command buffers already have the BVH descriptor set bound. By reusing
+    // the same VkBuffer handles, those command buffers see the updated data at execution time.
     VkDeviceSize nodesSize = (VkDeviceSize)allNodes.size() * sizeof(uint32_t);
-    if (!createBufferWithData(disp, allNodes.data(), nodesSize,
-                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.nodesBuf, g_bvh2.nodesMem)) {
-        LOG("[BVH2] Failed to create nodes buffer (%d nodes, %zu bytes)", totalNodes, (size_t)nodesSize);
+    VkDeviceSize trisSize = (VkDeviceSize)allTris.size() * sizeof(float);
+    bool needDescUpdate = false;
+    
+    if (!ensureBufferCapacity(disp, nodesSize, g_bvh2.nodesBuf, g_bvh2.nodesMem, g_bvh2.nodesCapacity)) {
+        LOG("[BVH2] Failed to ensure nodes buffer capacity (%zu bytes)", (size_t)nodesSize);
         return false;
     }
-
-    // Upload concatenated tris
-    VkDeviceSize trisSize = (VkDeviceSize)allTris.size() * sizeof(float);
-    if (!createBufferWithData(disp, allTris.data(), trisSize,
-                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.trisBuf, g_bvh2.trisMem)) {
-        LOG("[BVH2] Failed to create tris buffer (%d vec4s, %zu bytes)", totalTriVec4s, (size_t)trisSize);
+    if (!ensureBufferCapacity(disp, trisSize, g_bvh2.trisBuf, g_bvh2.trisMem, g_bvh2.trisCapacity)) {
+        LOG("[BVH2] Failed to ensure tris buffer capacity (%zu bytes)", (size_t)trisSize);
+        return false;
+    }
+    
+    // Upload BLAS nodes + tris into existing buffers via staging copy
+    if (!uploadToExistingBuffer(disp, g_bvh2.nodesBuf, allNodes.data(), nodesSize)) {
+        LOG("[BVH2] Failed to upload nodes (%d nodes, %zu bytes)", totalNodes, (size_t)nodesSize);
+        return false;
+    }
+    if (!uploadToExistingBuffer(disp, g_bvh2.trisBuf, allTris.data(), trisSize)) {
+        LOG("[BVH2] Failed to upload tris (%d vec4s, %zu bytes)", totalTriVec4s, (size_t)trisSize);
         return false;
     }
 
@@ -3746,47 +3930,38 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
     std::vector<float> instPacked; // hoisted for CUDA mirror access
 
     if (g_tlasBVH && numInst > 0) {
-        // Get TLAS BVH2 stackless data
         uint32_t* tlasNodeData = nullptr;
         numTlasNodes = cudaBVH_getStacklessBVH2(g_tlasBVH, &tlasNodeData);
         if (tlasNodeData && numTlasNodes > 0) {
             tlasNodesSize = (VkDeviceSize)numTlasNodes * 8 * sizeof(uint32_t);
-            if (!createBufferWithData(disp, tlasNodeData, tlasNodesSize,
-                                      VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.tlasNodesBuf, g_bvh2.tlasNodesMem)) {
-                LOG("[BVH2] Failed to create TLAS nodes buffer");
-                return false;
+            if (!ensureBufferCapacity(disp, tlasNodesSize, g_bvh2.tlasNodesBuf, g_bvh2.tlasNodesMem, g_bvh2.tlasNodesCapacity)) {
+                LOG("[BVH2] Failed to ensure TLAS nodes capacity"); return false;
+            }
+            if (!uploadToExistingBuffer(disp, g_bvh2.tlasNodesBuf, tlasNodeData, tlasNodesSize)) {
+                LOG("[BVH2] Failed to upload TLAS nodes"); return false;
             }
             LOG("[BVH2] TLAS nodes: %d (%.1f KB)", numTlasNodes, tlasNodesSize/1024.f);
         }
 
-        // Pack InstanceGPU into vec4 array: 9 vec4s per instance = 36 floats = 144 bytes
         instancesSize = (VkDeviceSize)numInst * 9 * 4 * sizeof(float);
         instPacked.resize(numInst * 36);
         for (int i = 0; i < numInst; i++) {
-            // Use TLAS ordering if available (must match TLAS leaf indices)
             int origIdx = (g_fastTLASOrdered && i < numInst) ? g_fastTLASOrdered[i] : i;
             const InstanceGPU& gi = g_instances[origIdx];
             float* dst = instPacked.data() + i * 36;
-            // vec4[0..2] = transform rows (3 × vec4)
             memcpy(dst + 0, gi.transform + 0, 16);
             memcpy(dst + 4, gi.transform + 4, 16);
             memcpy(dst + 8, gi.transform + 8, 16);
-            // vec4[3..5] = invTransform rows (3 × vec4)
             memcpy(dst + 12, gi.invTransform + 0, 16);
             memcpy(dst + 16, gi.invTransform + 4, 16);
             memcpy(dst + 20, gi.invTransform + 8, 16);
-            // vec4[6] = (blasMin.xyz, float(blasNodeOff))
             dst[24] = gi.blasMinX; dst[25] = gi.blasMinY; dst[26] = gi.blasMinZ;
             dst[27] = (float)gi.blasNodeOff;
-            // vec4[7] = (blasMax.xyz, float(blasTriOff))
             dst[28] = gi.blasMaxX; dst[29] = gi.blasMaxY; dst[30] = gi.blasMaxZ;
             dst[31] = (float)gi.blasTriOff;
-            // vec4[8] = (float(customIdx), float(sbtOffset), float(origInstIdx), float(packed_mask_flags))
-            // packed_mask_flags = instanceMask | (instanceFlags << 8) — both uint8 values
             static int forceBSP = -1;
             if (forceBSP < 0) { const char* e = getenv("CUDA_RT_FORCE_BSP"); forceBSP = (e && atoi(e)) ? 1 : 0; }
             if (forceBSP) {
-                // DEBUG: Find world BSP instance (blasNodeOff=0, blasTriOff=0, customIdx=0)
                 static int worldOrigIdx = -1;
                 if (worldOrigIdx < 0) {
                     for (int j = 0; j < numInst; j++) {
@@ -3798,30 +3973,30 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
                             break;
                         }
                     }
-                    if (worldOrigIdx < 0) worldOrigIdx = 0; // fallback
+                    if (worldOrigIdx < 0) worldOrigIdx = 0;
                 }
-                dst[32] = 0.0f;   // customIdx = 0 (VERTEX_BUFFER_WORLD)
-                dst[33] = 0.0f;   // sbtOffset = 0 (SBTO_OPAQUE)
-                dst[34] = (float)worldOrigIdx;  // origInstIdx = world BSP build-order index
-                dst[35] = (float)(0x01 | (0x04 << 8)); // mask=1 (opaque), flags=FORCE_OPAQUE
+                dst[32] = 0.0f;
+                dst[33] = 0.0f;
+                dst[34] = (float)worldOrigIdx;
+                dst[35] = (float)(0x01 | (0x04 << 8));
             } else {
                 dst[32] = (float)gi.customIdx;
                 dst[33] = (float)gi.sbtOffset;
-                dst[34] = (float)origIdx;  // original build-order instance index (for InstanceId)
+                dst[34] = (float)origIdx;
                 dst[35] = (float)(gi.instanceMask | (gi.instanceFlags << 8));
             }
         }
-        if (!createBufferWithData(disp, instPacked.data(), instancesSize,
-                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.instancesBuf, g_bvh2.instancesMem)) {
-            LOG("[BVH2] Failed to create instances buffer");
-            return false;
+        if (!ensureBufferCapacity(disp, instancesSize, g_bvh2.instancesBuf, g_bvh2.instancesMem, g_bvh2.instancesCapacity)) {
+            LOG("[BVH2] Failed to ensure instances capacity"); return false;
+        }
+        if (!uploadToExistingBuffer(disp, g_bvh2.instancesBuf, instPacked.data(), instancesSize)) {
+            LOG("[BVH2] Failed to upload instances"); return false;
         }
         LOG("[BVH2] Instances: %d (%.1f KB)", numInst, instancesSize/1024.f);
     }
 
-    // If no TLAS, create minimal dummy buffers for bindings 2 & 3 (Vulkan requires valid buffers)
-    // 4 nodes with huge AABBs + skip=-1 to prevent OOB and ensure immediate loop exit
-    if (!g_bvh2.tlasNodesBuf) {
+    // If no TLAS data was uploaded, upload null-safe dummy data to pre-allocated buffers
+    if (tlasNodesSize == 0) {
         uint32_t hugeF;
         float hugeV = 1e30f;
         memcpy(&hugeF, &hugeV, 4);
@@ -3833,54 +4008,22 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
             n[6]=0; n[7]=0xFFFFFFFF;
         }
         tlasNodesSize = sizeof(dummy);
-        if (!createBufferWithData(disp, dummy, tlasNodesSize,
-                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.tlasNodesBuf, g_bvh2.tlasNodesMem)) {
-            LOG("[BVH2] Failed to create dummy TLAS nodes buffer");
-            return false;
-        }
+        uploadToExistingBuffer(disp, g_bvh2.tlasNodesBuf, dummy, tlasNodesSize);
     }
-    if (!g_bvh2.instancesBuf) {
-        float dummy[36] = {0};  // 9 vec4s per instance
+    if (instancesSize == 0) {
+        float dummy[36] = {0};
         instancesSize = sizeof(dummy);
-        if (!createBufferWithData(disp, dummy, instancesSize,
-                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.instancesBuf, g_bvh2.instancesMem)) {
-            LOG("[BVH2] Failed to create dummy instances buffer");
-            return false;
-        }
+        uploadToExistingBuffer(disp, g_bvh2.instancesBuf, dummy, instancesSize);
     }
 
-    // Update all 4 descriptor bindings
-    VkDescriptorBufferInfo bufInfos[4] = {};
-    bufInfos[0].buffer = g_bvh2.nodesBuf;
-    bufInfos[0].offset = 0;
-    bufInfos[0].range = nodesSize;
-    bufInfos[1].buffer = g_bvh2.trisBuf;
-    bufInfos[1].offset = 0;
-    bufInfos[1].range = trisSize;
-    bufInfos[2].buffer = g_bvh2.tlasNodesBuf;
-    bufInfos[2].offset = 0;
-    bufInfos[2].range = tlasNodesSize;
-    bufInfos[3].buffer = g_bvh2.instancesBuf;
-    bufInfos[3].offset = 0;
-    bufInfos[3].range = instancesSize;
-
-    VkWriteDescriptorSet writes[4] = {};
-    for (int i = 0; i < 4; i++) {
-        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-        writes[i].dstSet = g_bvh2.descSet;
-        writes[i].dstBinding = i;
-        writes[i].descriptorCount = 1;
-        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-        writes[i].pBufferInfo = &bufInfos[i];
-    }
-
-    disp.UpdateDescriptorSets(disp.device, 4, writes, 0, nullptr);
+    // No need to update descriptor set — it uses VK_WHOLE_SIZE on the same buffer handles.
+    // Buffer contents are updated in-place, visible to GPU at next execution.
 
     g_bvh2.numNodes = totalNodes;
     g_bvh2.numTriVec4s = totalTriVec4s;
     g_bvh2.numTlasNodes = numTlasNodes;
     g_bvh2.numInstances = numInst;
-    g_bvh2.descSetIdx = 4; // default — actual bind index comes from per-pipeline bvhDescSet
+    g_bvh2.descSetIdx = 4;
     g_bvh2.tlasGen = g_tlasGeneration;
     g_bvh2.ready = true;
 
@@ -3927,12 +4070,6 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
 static bool reuploadTLASData(DeviceDispatch& disp) {
     if (g_instances.empty() || !g_bvh2.descSet) return false;
 
-    // Destroy old TLAS + instance buffers
-    if (g_bvh2.tlasNodesBuf) { disp.DestroyBuffer(disp.device, g_bvh2.tlasNodesBuf, nullptr); g_bvh2.tlasNodesBuf = VK_NULL_HANDLE; }
-    if (g_bvh2.tlasNodesMem) { disp.FreeMemory(disp.device, g_bvh2.tlasNodesMem, nullptr); g_bvh2.tlasNodesMem = VK_NULL_HANDLE; }
-    if (g_bvh2.instancesBuf) { disp.DestroyBuffer(disp.device, g_bvh2.instancesBuf, nullptr); g_bvh2.instancesBuf = VK_NULL_HANDLE; }
-    if (g_bvh2.instancesMem) { disp.FreeMemory(disp.device, g_bvh2.instancesMem, nullptr); g_bvh2.instancesMem = VK_NULL_HANDLE; }
-
     int numInst = (int)g_instances.size();
 
     // Upload TLAS BVH2 nodes — prefer fast-built data if available
@@ -3947,9 +4084,12 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
     VkDeviceSize tlasNodesSize = 0;
     if (tlasNodeData && numTlasNodes > 0) {
         tlasNodesSize = (VkDeviceSize)numTlasNodes * 8 * sizeof(uint32_t);
-        if (!createBufferHostVisible(disp, tlasNodeData, tlasNodesSize,
-                                  VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.tlasNodesBuf, g_bvh2.tlasNodesMem)) {
-            LOG("[BVH2] TLAS reupload: failed to create TLAS nodes buffer");
+        if (!ensureBufferCapacity(disp, tlasNodesSize, g_bvh2.tlasNodesBuf, g_bvh2.tlasNodesMem, g_bvh2.tlasNodesCapacity)) {
+            LOG("[BVH2] TLAS reupload: failed to ensure TLAS nodes capacity");
+            return false;
+        }
+        if (!uploadToExistingBuffer(disp, g_bvh2.tlasNodesBuf, tlasNodeData, tlasNodesSize)) {
+            LOG("[BVH2] TLAS reupload: failed to upload TLAS nodes");
             return false;
         }
     }
@@ -4011,36 +4151,16 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
                     gi.transform[3], gi.transform[7], gi.transform[11]);
         }
     }
-    if (!createBufferHostVisible(disp, instPacked.data(), instancesSize,
-                              VK_BUFFER_USAGE_STORAGE_BUFFER_BIT, g_bvh2.instancesBuf, g_bvh2.instancesMem)) {
-        LOG("[BVH2] TLAS reupload: failed to create instances buffer");
+    if (!ensureBufferCapacity(disp, instancesSize, g_bvh2.instancesBuf, g_bvh2.instancesMem, g_bvh2.instancesCapacity)) {
+        LOG("[BVH2] TLAS reupload: failed to ensure instances capacity");
+        return false;
+    }
+    if (!uploadToExistingBuffer(disp, g_bvh2.instancesBuf, instPacked.data(), instancesSize)) {
+        LOG("[BVH2] TLAS reupload: failed to upload instances");
         return false;
     }
 
-    // Update only bindings 2 & 3 (TLAS nodes + instances)
-    VkDescriptorBufferInfo bufInfos[2] = {};
-    bufInfos[0].buffer = g_bvh2.tlasNodesBuf;
-    bufInfos[0].offset = 0;
-    bufInfos[0].range = tlasNodesSize;
-    bufInfos[1].buffer = g_bvh2.instancesBuf;
-    bufInfos[1].offset = 0;
-    bufInfos[1].range = instancesSize;
-
-    VkWriteDescriptorSet writes[2] = {};
-    writes[0].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[0].dstSet = g_bvh2.descSet;
-    writes[0].dstBinding = 2;
-    writes[0].descriptorCount = 1;
-    writes[0].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[0].pBufferInfo = &bufInfos[0];
-    writes[1].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
-    writes[1].dstSet = g_bvh2.descSet;
-    writes[1].dstBinding = 3;
-    writes[1].descriptorCount = 1;
-    writes[1].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    writes[1].pBufferInfo = &bufInfos[1];
-
-    disp.UpdateDescriptorSets(disp.device, 2, writes, 0, nullptr);
+    // No descriptor update needed — VK_WHOLE_SIZE covers the full buffer
 
     g_bvh2.numTlasNodes = numTlasNodes;
     g_bvh2.numInstances = numInst;
@@ -6279,7 +6399,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindPipeline(
     {
     static int noBvhBind2 = -1;
     if (noBvhBind2 < 0) { const char* e = getenv("CUDA_RT_NO_BVH_BIND"); noBvhBind2 = (e && atoi(e)) ? 1 : 0; }
-    if (!noBvhBind2 && bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS && g_bvh2.descSet) {
+    if (!noBvhBind2 && bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS && g_bvh2.descSet && g_bvh2.ready) {
         auto it = g_rqPipelines.find((uint64_t)pipeline);
         if (it != g_rqPipelines.end()) {
             VkPipelineLayout layout = it->second.layout;
@@ -6578,6 +6698,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
     // Call real submit with crash guard (always — the fast path above may not trigger
     // if BLAS builds are never completed, e.g. with STRIP_EXTENSIONS mode)
     VkResult res = VK_ERROR_DEVICE_LOST;
+    bool submitCrashed = false;
     if (!g_blasBuildsDone) {
         installCrashRecovery();
         g_crashGuardActive = 1;
@@ -6587,6 +6708,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
         } else {
             uint64_t cnt = g_crashRecoveryCount.load(std::memory_order_relaxed);
             fprintf(stderr, "[CudaRT] ⚠ CRASH RECOVERED in QueueSubmit-init (total: %lu)\n", cnt);
+            submitCrashed = true;
             if (fence != VK_NULL_HANDLE) {
                 disp.QueueSubmit(queue, 0, nullptr, fence);
             }
@@ -6663,7 +6785,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
         // Don't clear pending — let QueuePresent detect it
     }
 
-    if (hasPending) {
+    if (hasPending && !submitCrashed) {
         // Wait for this submission to complete so GPU buffers are filled
         disp.QueueWaitIdle(queue);
         processPendingBLAS();
@@ -6674,6 +6796,21 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
         if (g_lastBLAS && !g_bvh2.ready) {
             uploadBVH2Data(disp, g_lastBLAS);
             LOG("[QS] BVH2 uploaded immediately after BLAS build (ready=%d)", (int)g_bvh2.ready);
+
+            // Also process TLAS here — QueuePresent may not be called (compute-only apps)
+            if (g_bvh2.ready && g_pendingTLAS.instanceAddr != 0 && g_pendingTLAS.instanceCount > 0) {
+                uint64_t prevGen = g_tlasGeneration;
+                {
+                    std::lock_guard<std::mutex> lock(g_lock);
+                    g_pendingTLAS.pending = true;
+                }
+                processPendingTLAS();
+                if (g_tlasGeneration > prevGen) {
+                    reuploadTLASData(disp);
+                    LOG("[QS] TLAS built and uploaded in QueueSubmit (gen=%lu, %d instances)",
+                        g_tlasGeneration, g_bvh2.numInstances);
+                }
+            }
         }
 
         // Execute deferred CUDA trace now that BLAS is ready
@@ -7382,12 +7519,14 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
                 g_rqDispatchPerFrame++;
                 // Log dispatch size for first few RQ dispatches
                 static int rqDispLogCount = 0;
-                if (rqDispLogCount < 20) {
+                static int rqDispReadyLogCount = 0;
+                if (rqDispLogCount < 20 || (g_bvh2.ready && rqDispReadyLogCount < 30)) {
                     fprintf(stderr, "[CudaRT] [RQ-DISP] #%d grid=(%u,%u,%u) pipe=0x%lx bvhSet=%d bvh2ready=%d tlasNodes=%d instances=%d\n",
                             rqDispLogCount, groupCountX, groupCountY, groupCountZ,
                             (uint64_t)pipeHandle, it->second.bvhDescSet,
                             (int)g_bvh2.ready, g_bvh2.numTlasNodes, g_bvh2.numInstances);
                     rqDispLogCount++;
+                    if (g_bvh2.ready) rqDispReadyLogCount++;
                 }
                 VkPipelineLayout layout = it->second.layout;
                 uint32_t bvhSetIdx = (uint32_t)it->second.bvhDescSet;
@@ -7407,8 +7546,8 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
                 if (layout && g_bvh2.descSet) {
                     static int bindLog = 0;
                     if (bindLog < 20) {
-                        LOG("[BVH-BIND] PRE-BIND: set=%u layout=%p descSet=%p pipe=0x%lx", 
-                            bvhSetIdx, (void*)layout, (void*)g_bvh2.descSet, pipeHandle);
+                        LOG("[BVH-BIND] PRE-BIND: set=%u layout=%p descSet=%p pipe=0x%lx ready=%d", 
+                            bvhSetIdx, (void*)layout, (void*)g_bvh2.descSet, pipeHandle, (int)g_bvh2.ready);
                     }
                     // Bind BVH2 descriptor set at the rewriter's chosen set index
                     disp.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,

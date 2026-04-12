@@ -102,6 +102,9 @@ void __fortify_fail(const char *msg) {
     int n = __sync_add_and_fetch(&c, 1);
     if (n <= 20)
         fprintf(stderr, "[noabort] __fortify_fail(%s) ignored\n", msg);
+    if (n > 50 && syscall(186) != getpid()) {
+        pthread_exit(NULL);
+    }
 }
 
 void __stack_chk_fail(void) {
@@ -109,4 +112,9 @@ void __stack_chk_fail(void) {
     int n = __sync_add_and_fetch(&c, 1);
     if (n <= 20)
         fprintf(stderr, "[noabort] __stack_chk_fail ignored\n");
+    // After too many stack canary failures, terminate the thread to prevent
+    // infinite loop (corrupted stack keeps triggering __stack_chk_fail)
+    if (n > 50 && syscall(186) != getpid()) {
+        pthread_exit(NULL);
+    }
 }
