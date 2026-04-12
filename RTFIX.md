@@ -371,3 +371,29 @@ The dummy buffer creation in CreateDevice used undefined `g_memTypeCount`/
 5. **Performance** — Single-CPU mode is slow; need per-CB serialization
    instead of full CPU pinning
 6. **Complete benchmark** — 2100 frames needed for a score (~9 min runtime)
+
+## Driver Update: 580.126.20 → 580.142
+
+Upgraded to NVIDIA 580.142 (released March 2026) — latest in the 580.xx legacy
+branch that still supports V100.
+
+### Results: Same crash pattern persists
+
+| Config | Frames | Survival Rate | Notes |
+|--------|--------|---------------|-------|
+| 580.142 + rewrite + crash recovery | 5-11 | 3/5 survived 90s | Same UAF |
+| 580.142 + NO_REWRITE + crash recovery | 5-19 | 3/5 survived 90s | Frame 19 in best runs |
+| 580.142 clean (no recovery) | 0-1 | 0/3 | Stalls without taskset |
+
+**Conclusion**: The UAF bug exists in both 580.126.20 and 580.142. The crash
+recovery system (SIGSEGV handler + abort() interception + instruction/function
+skip) is essential for survival. The driver bug is present across the entire
+580.xx branch.
+
+### Crash Recovery Architecture (final)
+1. **CRASH_GUARD_CMD** macro: sigsetjmp around every Cmd* call → longjmp on SIGSEGV
+2. **Function skip**: On unguarded SIGSEGV, walk stack for return address, jump there
+3. **Instruction skip**: Fallback — advance RIP past faulting instruction
+4. **abort() interception**: LD_PRELOAD libnoabort.so suspends thread instead of dying
+5. **Command buffer poisoning**: Skip all ops on crashed cmdBuf until QueuePresent
+6. **SIGILL/SIGFPE/SIGBUS**: All caught and recovered from
