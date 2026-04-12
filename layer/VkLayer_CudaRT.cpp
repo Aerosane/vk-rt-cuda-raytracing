@@ -403,6 +403,7 @@ struct DeviceDispatch {
     VkDevice device;
     VkPhysicalDevice physicalDevice;
     VkPhysicalDeviceMemoryProperties memProps;
+    uint32_t maxBoundDescriptorSets;  // hardware limit (V100 = 8)
 };
 
 static std::mutex g_lock;
@@ -770,6 +771,7 @@ static BVH2Interop g_bvh2 = {};
 static int g_verbose = 1;
 uint32_t g_rqDispatchPerFrame = 0; // reset per frame in QueuePresent
 static int g_trackVerbose = 0;
+static uint32_t g_maxBoundDescSets = 8; // updated from device props in CreateDevice
 
 // Dummy buffer for safe AS→SSBO descriptor fallback (always valid)
 static VkBuffer g_dummyBuf = VK_NULL_HANDLE;
@@ -1374,6 +1376,21 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
         } else {
             LOG("  → WARNING: could not load vkGetPhysicalDeviceMemoryProperties");
             memset(&disp.memProps, 0, sizeof(disp.memProps));
+        }
+    }
+    // Query maxBoundDescriptorSets for SPIR-V BVH set index clamping
+    {
+        auto getPhysDevProps = (PFN_vkGetPhysicalDeviceProperties)
+            nextGIPA(g_instance, "vkGetPhysicalDeviceProperties");
+        if (getPhysDevProps) {
+            VkPhysicalDeviceProperties props;
+            getPhysDevProps(gpu, &props);
+            disp.maxBoundDescriptorSets = props.limits.maxBoundDescriptorSets;
+            g_maxBoundDescSets = props.limits.maxBoundDescriptorSets;
+            LOG("  → maxBoundDescriptorSets = %u", disp.maxBoundDescriptorSets);
+        } else {
+            disp.maxBoundDescriptorSets = 8;
+            g_maxBoundDescSets = 8;
         }
     }
     #undef LOAD_DEV
@@ -2075,6 +2092,8 @@ struct RQShaderInfo {
     int bvhDescSet;
     int bvhNodesBinding;
     int bvhTrisBinding;
+    int bvhTlasBinding;
+    int bvhInstBinding;
 };
 static std::unordered_map<uint64_t, RQShaderInfo> g_rqShaders;
 static std::mutex g_rqShaderMutex;
@@ -2097,6 +2116,7 @@ static std::mutex g_pipelineLayoutMutex;
 struct RQPipelineInfo {
     VkPipelineLayout layout; // pipeline's layout (already extended with BVH2 set)
     int bvhDescSet;
+    bool isMergedSet;        // true if BVH shares set index with app (high bindings 100-103)
 };
 static std::unordered_map<uint64_t, RQPipelineInfo> g_rqPipelines;
 static std::mutex g_rqPipelineMutex;
@@ -2105,6 +2125,17 @@ static std::mutex g_rqPipelineMutex;
 static std::unordered_map<uint64_t, uint64_t> g_cmdBufBoundPipeline; // cmdBuf → VkPipeline
 static std::mutex g_cmdBufPipelineMutex; // protects g_cmdBufBoundPipeline
 static std::mutex g_cmdBufMutex;
+
+// Track per-command-buffer bound descriptor sets (for merged-set BVH binding)
+struct CmdBufBoundSets {
+    VkDescriptorSet sets[8]; // sets[i] = app's descriptor set bound at set index i
+};
+static std::unordered_map<uint64_t, CmdBufBoundSets> g_cmdBufBoundSets; // cmdBuf → bound sets
+static std::mutex g_cmdBufBoundSetsMutex;
+
+// Track descriptor set layout bindings for merged-set pipeline layout creation
+static std::unordered_map<uint64_t, std::vector<VkDescriptorSetLayoutBinding>> g_dslBindings;
+static std::mutex g_dslBindingsMutex;
 
 // V100 driver thread-safety workaround: serialize ALL driver vkCmd* calls
 // Enable with CUDA_RT_SERIALIZE_CMDS=1
@@ -2279,7 +2310,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateShaderModule(
         fprintf(stderr, "[CudaRT] STRIP_ONLY: stripped %d ray_query instructions from %zu-word shader\n",
                 stripped, numWords);
     } else {
-        rw = spirvTryRewriteRayQuery(spirvCode, numWords);
+        rw = spirvTryRewriteRayQuery(spirvCode, numWords, (int)g_maxBoundDescSets);
     }
 
     if (rw.rewritten) {
@@ -2315,8 +2346,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateShaderModule(
         if (res == VK_SUCCESS) {
             std::lock_guard<std::mutex> lock(g_rqShaderMutex);
             uint64_t handle = (uint64_t)*pShaderModule;
-            g_rqShaders[handle] = {rw.bvhDescSet, rw.bvhNodesBinding, rw.bvhTrisBinding};
-            LOG("  → Registered rewritten shader %lx (set=%d)", handle, rw.bvhDescSet);
+            g_rqShaders[handle] = {rw.bvhDescSet, rw.bvhNodesBinding, rw.bvhTrisBinding,
+                                   rw.bvhTlasBinding, rw.bvhInstBinding};
+            LOG("  → Registered rewritten shader %lx (set=%d bind=%d/%d/%d/%d)", handle,
+                rw.bvhDescSet, rw.bvhNodesBinding, rw.bvhTrisBinding,
+                rw.bvhTlasBinding, rw.bvhInstBinding);
             // Store IR program if lowering succeeded
             if (hasIR) {
                 std::lock_guard<std::mutex> irLock(g_irProgramMutex);
@@ -2423,6 +2457,9 @@ static VKAPI_ATTR void VKAPI_CALL layer_GetAccelerationStructureBuildSizesKHR(
     LOG("GetASBuildSizes: geoCount=%u → structSize=%zu",
         pBuildInfo->geometryCount, (size_t)pSizeInfo->accelerationStructureSize);
 }
+
+// Forward declaration for eager BLAS build (defined after dependent functions)
+static void tryEagerBLASBuild(VkCommandBuffer cmdBuf);
 
 // ═══════════════════════════════════════════
 // Intercepted: CmdBuildAccelerationStructuresKHR
@@ -2560,6 +2597,11 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBuildAccelerationStructuresKHR(
             disp.CmdBuildAccelerationStructuresKHR(cmdBuf, infoCount, pInfos, ppBuildRangeInfos);
         }
     }
+
+    // ═══ EAGER BLAS BUILD ═══
+    // Try to build BVH immediately when TLAS + pending BLASes are seen.
+    // Solves timing: without this, BVH becomes ready AFTER RQ dispatches are recorded.
+    tryEagerBLASBuild(cmdBuf);
 }
 
 // Process all pending BLAS builds — called from QueueSubmit after GPU has executed
@@ -3635,29 +3677,36 @@ static bool ensureBufferCapacity(DeviceDispatch& disp, VkDeviceSize requiredSize
 static bool setupBVH2Descriptors(DeviceDispatch& disp) {
     if (g_bvh2.dsLayout) return true; // already set up
 
-    // Descriptor set layout: 4 SSBOs
-    // binding 0 = BLAS nodes, binding 1 = BLAS tris,
-    // binding 2 = TLAS nodes, binding 3 = instances
-    VkDescriptorSetLayoutBinding bindings[4] = {};
+    // Descriptor set layout: 8 SSBOs — bindings 0-3 (normal) + 100-103 (merged-set case)
+    // When SPIR-V rewriter can't add a new set (maxBoundDescriptorSets exceeded),
+    // it merges BVH bindings into the highest existing set at bindings 100-103.
+    // Both ranges point to the same buffers so one descriptor set works everywhere.
+    VkDescriptorSetLayoutBinding bindings[8] = {};
+    const uint32_t normalBindings[4] = {0, 1, 2, 3};
+    const uint32_t highBindings[4] = {100, 101, 102, 103};
     for (int i = 0; i < 4; i++) {
-        bindings[i].binding = i;
+        bindings[i].binding = normalBindings[i];
         bindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
         bindings[i].descriptorCount = 1;
         bindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        bindings[4+i].binding = highBindings[i];
+        bindings[4+i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        bindings[4+i].descriptorCount = 1;
+        bindings[4+i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
     }
 
     VkDescriptorSetLayoutCreateInfo dsLayoutCI = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
-    dsLayoutCI.bindingCount = 4;
+    dsLayoutCI.bindingCount = 8;
     dsLayoutCI.pBindings = bindings;
     if (disp.CreateDescriptorSetLayout(disp.device, &dsLayoutCI, nullptr, &g_bvh2.dsLayout) != VK_SUCCESS) {
         LOG("[BVH2] Failed to create descriptor set layout");
         return false;
     }
 
-    // Descriptor pool: 4 SSBO descriptors
+    // Descriptor pool: 8 SSBO descriptors (4 normal + 4 high bindings)
     VkDescriptorPoolSize poolSizes[1] = {};
     poolSizes[0].type = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-    poolSizes[0].descriptorCount = 4;
+    poolSizes[0].descriptorCount = 8;
     VkDescriptorPoolCreateInfo poolCI = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
     poolCI.maxSets = 1;
     poolCI.poolSizeCount = 1;
@@ -3677,7 +3726,7 @@ static bool setupBVH2Descriptors(DeviceDispatch& disp) {
         return false;
     }
 
-    LOG("[BVH2] Descriptor set layout + pool + set created (4 bindings)");
+    LOG("[BVH2] Descriptor set layout + pool + set created (8 bindings: 0-3 + 100-103)");
 
     // Pre-allocate LARGE BVH buffers (4MB each) so they can be bound during command
     // recording BEFORE real BVH data is available. Fill with null-safe data (huge AABB +
@@ -3720,24 +3769,26 @@ static bool setupBVH2Descriptors(DeviceDispatch& disp) {
         // Write descriptors with VK_WHOLE_SIZE — covers entire pre-allocated buffer.
         // GPU reads actual contents at execution time, so updating buffer data later
         // automatically becomes visible to pre-recorded command buffers.
+        // Write to BOTH binding ranges: 0-3 (normal) and 100-103 (merged-set).
         VkDescriptorBufferInfo bufs[4] = {
             {g_bvh2.nodesBuf,       0, VK_WHOLE_SIZE},
             {g_bvh2.trisBuf,        0, VK_WHOLE_SIZE},
             {g_bvh2.tlasNodesBuf,   0, VK_WHOLE_SIZE},
             {g_bvh2.instancesBuf,   0, VK_WHOLE_SIZE},
         };
-        VkWriteDescriptorSet writes[4] = {};
-        for (int i = 0; i < 4; i++) {
+        const uint32_t bindingNums[8] = {0, 1, 2, 3, 100, 101, 102, 103};
+        VkWriteDescriptorSet writes[8] = {};
+        for (int i = 0; i < 8; i++) {
             writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
             writes[i].dstSet = g_bvh2.descSet;
-            writes[i].dstBinding = i;
+            writes[i].dstBinding = bindingNums[i];
             writes[i].descriptorCount = 1;
             writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
-            writes[i].pBufferInfo = &bufs[i];
+            writes[i].pBufferInfo = &bufs[i % 4]; // same 4 buffers for both ranges
         }
-        disp.UpdateDescriptorSets(disp.device, 4, writes, 0, nullptr);
+        disp.UpdateDescriptorSets(disp.device, 8, writes, 0, nullptr);
         g_bvh2.descSetIdx = 4;
-        LOG("[BVH2] Pre-allocated BVH buffers (%zu MB each) with null-safe data + VK_WHOLE_SIZE descriptors",
+        LOG("[BVH2] Pre-allocated BVH buffers (%zu MB each) with null-safe data + VK_WHOLE_SIZE descriptors (bind 0-3 + 100-103)",
             (size_t)(PREALLOC/1024/1024));
     }
 
@@ -4341,6 +4392,59 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
     }
 
     return true;
+}
+
+// ═══ EAGER BLAS BUILD ═══
+// Called from CmdBuildAS after all infos are processed.
+// When TLAS + pending BLASes are both present, build BVH immediately so it's
+// ready BEFORE subsequent CmdDispatch calls record RQ dispatches.
+// Vertex data from prior submits should already be readable via staging copies.
+static void tryEagerBLASBuild(VkCommandBuffer cmdBuf) {
+    bool hasTLAS = false;
+    bool hasPendingBLAS = false;
+    size_t pendingCount = 0;
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        hasTLAS = g_pendingTLAS.pending && g_pendingTLAS.instanceCount > 0;
+        hasPendingBLAS = !g_pendingBLAS.empty() && !g_blasBuildsDone;
+        pendingCount = g_pendingBLAS.size();
+    }
+    static int eagerCheckLog = 0;
+    if (eagerCheckLog < 5 && (hasTLAS || hasPendingBLAS)) {
+        eagerCheckLog++;
+        LOG("[EAGER-CHK] hasTLAS=%d hasPendingBLAS=%d pending=%zu blasDone=%d tlasInst=%u",
+            (int)hasTLAS, (int)hasPendingBLAS, pendingCount,
+            (int)g_blasBuildsDone, g_pendingTLAS.instanceCount);
+    }
+    if (!hasTLAS || !hasPendingBLAS) return;
+
+    LOG("[EAGER] TLAS seen with %u instances + %zu pending BLASes → attempting immediate build",
+        g_pendingTLAS.instanceCount, pendingCount);
+
+    void* key = getKey(cmdBuf);
+    auto& disp = g_deviceMap[key];
+
+    // Process pending BLASes now (reads vertex data from device addresses)
+    processPendingBLAS();
+
+    if (g_lastBLAS && !g_bvh2.ready) {
+        uploadBVH2Data(disp, g_lastBLAS);
+        LOG("[EAGER] BVH2 uploaded (ready=%d)", (int)g_bvh2.ready);
+    }
+
+    // Process TLAS if BVH2 is ready
+    if (g_bvh2.ready && g_pendingTLAS.instanceAddr != 0) {
+        uint64_t prevGen = g_tlasGeneration;
+        processPendingTLAS();
+        if (g_tlasGeneration > prevGen) {
+            reuploadTLASData(disp);
+            LOG("[EAGER] TLAS built and uploaded (gen=%lu, %d instances)",
+                g_tlasGeneration, g_bvh2.numInstances);
+        }
+    }
+
+    if (g_bvh2.ready)
+        LOG("[EAGER] ✅ BVH pipeline ready BEFORE RQ dispatches are recorded!");
 }
 
 static bool setupComputePipeline(DeviceDispatch& disp) {
@@ -5223,6 +5327,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateComputePipelines(
     std::vector<VkComputePipelineCreateInfo> modInfos(pCreateInfos, pCreateInfos + createInfoCount);
     std::vector<VkPipelineLayout> extLayouts(createInfoCount, VK_NULL_HANDLE);
     std::vector<int> rqSet(createInfoCount, -1);
+    std::vector<bool> rqMerged(createInfoCount, false);
 
     setupBVH2Descriptors(disp);
 
@@ -5256,16 +5361,56 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateComputePipelines(
             }
         }
 
-        // Build extended layout: app's sets [0..N-1] + padding + BVH2 at bvhSet
-        std::vector<VkDescriptorSetLayout> sets(bvhSet + 1, g_emptyDSLayout);
-        // Copy app's original set layouts to maintain compatibility
-        for (uint32_t s = 0; s < appSetLayouts.size() && s < bvhSet; s++) {
+        bool isMergedSet = (bvhSet < (uint32_t)appSetLayouts.size());
+        rqMerged[i] = isMergedSet;
+
+        // Build extended layout: app's sets [0..N-1] + BVH2
+        uint32_t totalSets = std::max(bvhSet + 1, (uint32_t)appSetLayouts.size());
+        std::vector<VkDescriptorSetLayout> sets(totalSets, g_emptyDSLayout);
+        for (uint32_t s = 0; s < appSetLayouts.size(); s++) {
             sets[s] = appSetLayouts[s];
         }
-        sets[bvhSet] = g_bvh2.dsLayout;
+
+        VkDescriptorSetLayout mergedLayout = VK_NULL_HANDLE;
+        if (isMergedSet) {
+            // Merged case: BVH bindings share the same set index as the app.
+            // Create a COMBINED layout with the app's original bindings + our high bindings (100-103).
+            std::vector<VkDescriptorSetLayoutBinding> combined;
+            {
+                std::lock_guard<std::mutex> dslLock(g_dslBindingsMutex);
+                auto dslIt = g_dslBindings.find((uint64_t)appSetLayouts[bvhSet]);
+                if (dslIt != g_dslBindings.end()) {
+                    combined = dslIt->second;
+                }
+            }
+            // Add our high BVH bindings (100-103)
+            const uint32_t highBindNums[4] = {100, 101, 102, 103};
+            for (int b = 0; b < 4; b++) {
+                VkDescriptorSetLayoutBinding bvhBind = {};
+                bvhBind.binding = highBindNums[b];
+                bvhBind.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                bvhBind.descriptorCount = 1;
+                bvhBind.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+                combined.push_back(bvhBind);
+            }
+            VkDescriptorSetLayoutCreateInfo mergedCI = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            mergedCI.bindingCount = (uint32_t)combined.size();
+            mergedCI.pBindings = combined.data();
+            if (disp.CreateDescriptorSetLayout(device, &mergedCI, nullptr, &mergedLayout) == VK_SUCCESS) {
+                sets[bvhSet] = mergedLayout;
+                LOG("[BVH2] Created MERGED layout for set %u: %zu app bindings + 4 BVH high bindings",
+                    bvhSet, combined.size() - 4);
+            } else {
+                LOG("[BVH2] WARN: Failed to create merged layout for set %u, using BVH-only", bvhSet);
+                sets[bvhSet] = g_bvh2.dsLayout;
+            }
+        } else {
+            // Normal case: BVH set is beyond the app's range, just use our layout
+            sets[bvhSet] = g_bvh2.dsLayout;
+        }
 
         VkPipelineLayoutCreateInfo plCI = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        plCI.setLayoutCount = bvhSet + 1;
+        plCI.setLayoutCount = totalSets;
         plCI.pSetLayouts = sets.data();
         plCI.pushConstantRangeCount = (uint32_t)appPushConstants.size();
         plCI.pPushConstantRanges = appPushConstants.empty() ? nullptr : appPushConstants.data();
@@ -5274,9 +5419,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateComputePipelines(
             LOG("[BVH2] Failed to create extended pipeline layout for RQ pipeline");
             extLayouts[i] = VK_NULL_HANDLE;
         } else {
-            LOG("[BVH2] Created COMPATIBLE extended layout with %zu app sets, %zu push consts + BVH2 at set=%u",
-                appSetLayouts.size(), appPushConstants.size(), bvhSet);
+            LOG("[BVH2] Created %s layout: %u sets, %zu push consts, BVH2 at set=%u",
+                isMergedSet ? "MERGED" : "EXTENDED",
+                totalSets, appPushConstants.size(), bvhSet);
         }
+        // Leaked on purpose: mergedLayout lives for pipeline lifetime
     }
 
     // Create pipelines with EXTENDED layout for RQ pipelines so set 4 is accessible.
@@ -5300,9 +5447,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateComputePipelines(
             if (rqSet[i] < 0 || !pPipelines[i]) continue;
             uint64_t pipeHandle = (uint64_t)pPipelines[i];
             std::lock_guard<std::mutex> lock2(g_rqPipelineMutex);
-            g_rqPipelines[pipeHandle] = {extLayouts[i], rqSet[i]};
-            LOG("CreateComputePipeline: tracked RQ pipeline 0x%lx (extLayout=0x%lx, bvhSet=%d)",
-                pipeHandle, (uint64_t)extLayouts[i], rqSet[i]);
+            g_rqPipelines[pipeHandle] = {extLayouts[i], rqSet[i], rqMerged[i]};
+            LOG("CreateComputePipeline: tracked RQ pipeline 0x%lx (extLayout=0x%lx, bvhSet=%d, merged=%d)",
+                pipeHandle, (uint64_t)extLayouts[i], rqSet[i], (int)rqMerged[i]);
         }
     }
 
@@ -5330,6 +5477,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateGraphicsPipelines(
     std::vector<VkGraphicsPipelineCreateInfo> modInfos(pCreateInfos, pCreateInfos + createInfoCount);
     std::vector<VkPipelineLayout> extLayouts(createInfoCount, VK_NULL_HANDLE);
     std::vector<int> rqSet(createInfoCount, -1);
+    std::vector<bool> rqMerged(createInfoCount, false);
 
     setupBVH2Descriptors(disp);
 
@@ -5381,14 +5529,45 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateGraphicsPipelines(
             }
         }
 
-        std::vector<VkDescriptorSetLayout> sets(bvhSet + 1, g_emptyDSLayout);
-        for (uint32_t s = 0; s < appSetLayouts.size() && s < bvhSet; s++) {
+        bool isMergedSet = (bvhSet < (uint32_t)appSetLayouts.size());
+        rqMerged[i] = isMergedSet;
+        uint32_t totalSets = std::max(bvhSet + 1, (uint32_t)appSetLayouts.size());
+        std::vector<VkDescriptorSetLayout> sets(totalSets, g_emptyDSLayout);
+        for (uint32_t s = 0; s < appSetLayouts.size(); s++) {
             sets[s] = appSetLayouts[s];
         }
-        sets[bvhSet] = g_bvh2.dsLayout;
+
+        VkDescriptorSetLayout mergedLayout = VK_NULL_HANDLE;
+        if (isMergedSet) {
+            std::vector<VkDescriptorSetLayoutBinding> combined;
+            {
+                std::lock_guard<std::mutex> dslLock(g_dslBindingsMutex);
+                auto dslIt = g_dslBindings.find((uint64_t)appSetLayouts[bvhSet]);
+                if (dslIt != g_dslBindings.end()) combined = dslIt->second;
+            }
+            const uint32_t highBindNums[4] = {100, 101, 102, 103};
+            for (int b = 0; b < 4; b++) {
+                VkDescriptorSetLayoutBinding bvhBind = {};
+                bvhBind.binding = highBindNums[b];
+                bvhBind.descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                bvhBind.descriptorCount = 1;
+                bvhBind.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+                combined.push_back(bvhBind);
+            }
+            VkDescriptorSetLayoutCreateInfo mergedCI = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+            mergedCI.bindingCount = (uint32_t)combined.size();
+            mergedCI.pBindings = combined.data();
+            if (disp.CreateDescriptorSetLayout(device, &mergedCI, nullptr, &mergedLayout) == VK_SUCCESS) {
+                sets[bvhSet] = mergedLayout;
+            } else {
+                sets[bvhSet] = g_bvh2.dsLayout;
+            }
+        } else {
+            sets[bvhSet] = g_bvh2.dsLayout;
+        }
 
         VkPipelineLayoutCreateInfo plCI = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
-        plCI.setLayoutCount = bvhSet + 1;
+        plCI.setLayoutCount = totalSets;
         plCI.pSetLayouts = sets.data();
         plCI.pushConstantRangeCount = (uint32_t)appPushConstants.size();
         plCI.pPushConstantRanges = appPushConstants.empty() ? nullptr : appPushConstants.data();
@@ -5397,8 +5576,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateGraphicsPipelines(
             LOG("[BVH2] Failed to create extended layout for graphics RQ pipeline %u", i);
             extLayouts[i] = VK_NULL_HANDLE;
         } else {
-            LOG("[BVH2] Graphics pipeline %u: extended layout with %zu app sets + BVH2 at set=%u",
-                i, appSetLayouts.size(), bvhSet);
+            LOG("[BVH2] Graphics pipeline %u: %s layout with %u sets + BVH2 at set=%u",
+                i, isMergedSet ? "MERGED" : "EXTENDED", totalSets, bvhSet);
         }
     }
 
@@ -5421,9 +5600,9 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateGraphicsPipelines(
             if (rqSet[i] < 0 || !pPipelines[i]) continue;
             uint64_t pipeHandle = (uint64_t)pPipelines[i];
             std::lock_guard<std::mutex> lock2(g_rqPipelineMutex);
-            g_rqPipelines[pipeHandle] = {extLayouts[i], rqSet[i]};
-            LOG("CreateGraphicsPipeline: tracked RQ pipeline 0x%lx (extLayout=0x%lx, bvhSet=%d)",
-                pipeHandle, (uint64_t)extLayouts[i], rqSet[i]);
+            g_rqPipelines[pipeHandle] = {extLayouts[i], rqSet[i], rqMerged[i]};
+            LOG("CreateGraphicsPipeline: tracked RQ pipeline 0x%lx (extLayout=0x%lx, bvhSet=%d, merged=%d)",
+                pipeHandle, (uint64_t)extLayouts[i], rqSet[i], (int)rqMerged[i]);
         }
     }
 
@@ -5514,10 +5693,21 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDescriptorSetLayout(
         if (anyChanged) {
             VkDescriptorSetLayoutCreateInfo modCI = *pCreateInfo;
             modCI.pBindings = modified.data();
-            return disp.CreateDescriptorSetLayout(device, &modCI, pAllocator, pSetLayout);
+            VkResult res = disp.CreateDescriptorSetLayout(device, &modCI, pAllocator, pSetLayout);
+            if (res == VK_SUCCESS && pSetLayout) {
+                std::lock_guard<std::mutex> lk(g_dslBindingsMutex);
+                g_dslBindings[(uint64_t)*pSetLayout] = modified;
+            }
+            return res;
         }
     }
-    return disp.CreateDescriptorSetLayout(device, pCreateInfo, pAllocator, pSetLayout);
+    VkResult res = disp.CreateDescriptorSetLayout(device, pCreateInfo, pAllocator, pSetLayout);
+    if (res == VK_SUCCESS && pSetLayout && pCreateInfo->bindingCount > 0) {
+        std::lock_guard<std::mutex> lk(g_dslBindingsMutex);
+        g_dslBindings[(uint64_t)*pSetLayout] = std::vector<VkDescriptorSetLayoutBinding>(
+            pCreateInfo->pBindings, pCreateInfo->pBindings + pCreateInfo->bindingCount);
+    }
+    return res;
 }
 
 // ═══════════════════════════════════════════
@@ -6401,7 +6591,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindPipeline(
     if (noBvhBind2 < 0) { const char* e = getenv("CUDA_RT_NO_BVH_BIND"); noBvhBind2 = (e && atoi(e)) ? 1 : 0; }
     if (!noBvhBind2 && bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS && g_bvh2.descSet && g_bvh2.ready) {
         auto it = g_rqPipelines.find((uint64_t)pipeline);
-        if (it != g_rqPipelines.end()) {
+        if (it != g_rqPipelines.end() && !it->second.isMergedSet) {
             VkPipelineLayout layout = it->second.layout;
             uint32_t bvhSetIdx = (uint32_t)it->second.bvhDescSet;
             if (layout && bvhSetIdx < 32) {
@@ -6442,6 +6632,15 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindDescriptorSets(
         return;
     }
     DRIVER_CMD_LOCK();
+
+    // Track app's bound descriptor sets for merged-set BVH binding
+    if (pDescriptorSets && descriptorSetCount > 0) {
+        std::lock_guard<std::mutex> lk(g_cmdBufBoundSetsMutex);
+        auto& bs = g_cmdBufBoundSets[(uint64_t)cmdBuf];
+        for (uint32_t s = 0; s < descriptorSetCount && (firstSet + s) < 8; s++) {
+            bs.sets[firstSet + s] = pDescriptorSets[s];
+        }
+    }
 
     VkPipelineLayout effectiveLayout = layout;
 
@@ -7503,8 +7702,8 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
     static int noBvhBind = -1;
     if (noBvhBind < 0) { const char* e = getenv("CUDA_RT_NO_BVH_BIND"); noBvhBind = (e && atoi(e)) ? 1 : 0; }
 
-    // Bind BVH descriptor set whenever we have one (null-safe buffers are fine)
-    if (!noBvhBind && g_bvh2.descSet) [[likely]] {
+    // Detect RQ dispatch and optionally bind BVH descriptor set
+    if (!noBvhBind) [[likely]] {
         uint64_t pipeHandle = 0;
         {
             std::lock_guard<std::mutex> lock(g_cmdBufPipelineMutex);
@@ -7543,19 +7742,33 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
                     return;
                 }
 
-                if (layout && g_bvh2.descSet) {
-                    static int bindLog = 0;
-                    if (bindLog < 20) {
-                        LOG("[BVH-BIND] PRE-BIND: set=%u layout=%p descSet=%p pipe=0x%lx ready=%d", 
-                            bvhSetIdx, (void*)layout, (void*)g_bvh2.descSet, pipeHandle, (int)g_bvh2.ready);
-                    }
-                    // Bind BVH2 descriptor set at the rewriter's chosen set index
-                    disp.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                                layout, bvhSetIdx, 1,
-                                                &g_bvh2.descSet, 0, nullptr);
-                    if (bindLog < 20) {
-                        bindLog++;
-                        LOG("[BVH-BIND] POST-BIND: set=%u OK", bvhSetIdx);
+                if (layout && g_bvh2.descSet && g_bvh2.ready) {
+                    bool merged = it->second.isMergedSet;
+                    if (merged) {
+                        // Merged-set pipeline: BVH bindings are at high offsets (100-103)
+                        // within the app's existing set. We can't bind our descriptor set
+                        // without overwriting the app's. The shader will use null-safe
+                        // pre-allocated data (huge AABB, skip=-1 → zero hits).
+                        // TODO: implement descriptor copying for full merged-set support
+                        static int mergedSkipLog = 0;
+                        if (mergedSkipLog < 5) {
+                            mergedSkipLog++;
+                            LOG("[BVH-BIND] MERGED-SET: skipping bind for set=%u (shader uses high bindings 100-103)", bvhSetIdx);
+                        }
+                    } else {
+                        static int bindLog = 0;
+                        if (bindLog < 20) {
+                            LOG("[BVH-BIND] PRE-BIND: set=%u layout=%p descSet=%p pipe=0x%lx ready=%d", 
+                                bvhSetIdx, (void*)layout, (void*)g_bvh2.descSet, pipeHandle, (int)g_bvh2.ready);
+                        }
+                        // Bind BVH2 descriptor set at the rewriter's chosen set index
+                        disp.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                    layout, bvhSetIdx, 1,
+                                                    &g_bvh2.descSet, 0, nullptr);
+                        if (bindLog < 20) {
+                            bindLog++;
+                            LOG("[BVH-BIND] POST-BIND: set=%u OK", bvhSetIdx);
+                        }
                     }
                 } else {
                     static int nobindLog = 0;
@@ -7576,6 +7789,17 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
     }
     uint32_t dispX = groupCountX, dispY = groupCountY, dispZ = groupCountZ;
     if (isRQDispatch) {
+        // Skip RQ dispatches entirely when BVH data isn't ready — the rewritten
+        // SPIR-V's BVH traversal loop with null-safe data still causes V100 driver
+        // crashes (UAF in pushbuf processing). Safe to skip: no visual output either way.
+        if (!g_bvh2.ready) {
+            static int skipLog = 0;
+            if (skipLog < 10) {
+                skipLog++;
+                LOG("[RQ-DISP] Skipping dispatch (BVH not ready) grid=(%u,%u,%u)", groupCountX, groupCountY, groupCountZ);
+            }
+            return;
+        }
         if (halfRes >= 3) return; // NOP: skip RT dispatch entirely
         if (halfRes >= 2) { dispX = (dispX + 1) / 2; dispY = (dispY + 1) / 2; }
         else if (halfRes >= 1) { dispY = (dispY + 1) / 2; }
