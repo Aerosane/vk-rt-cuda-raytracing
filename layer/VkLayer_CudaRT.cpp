@@ -65,6 +65,21 @@ static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
     // Re-install ourselves immediately (abort() resets SIGABRT to SIG_DFL)
     installCrashRecovery();
 
+    // SIGABRT: driver called abort()/raise(SIGABRT) due to internal corruption.
+    // Stack walking is unreliable here — just suspend the offending thread.
+    if (sig == SIGABRT) {
+        static std::atomic<int> abortCount{0};
+        int c = abortCount.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (c <= 20) {
+            ucontext_t* uc2 = (ucontext_t*)ctx;
+            uint64_t rip2 = uc2 ? uc2->uc_mcontext.gregs[REG_RIP] : 0;
+            fprintf(stderr, "[CudaRT] ⚠ SIGABRT #%d at RIP=%p — suspending thread\n",
+                    c, (void*)rip2);
+        }
+        // Suspend this thread forever — other threads continue
+        for (;;) pause();
+    }
+
     if (g_crashGuardActive) {
         g_crashGuardActive = 0;
         g_crashRecoveryCount.fetch_add(1, std::memory_order_relaxed);
