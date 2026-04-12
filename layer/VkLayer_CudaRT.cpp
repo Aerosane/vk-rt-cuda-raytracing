@@ -38,13 +38,20 @@
 #include <signal.h>
 #include <setjmp.h>
 #include <sys/mman.h>
+#include <sys/syscall.h>
 #include <errno.h>
+#include <pthread.h>
 
 // SIGSEGV crash recovery for driver UAF bugs
 static thread_local sigjmp_buf g_crashJmpBuf;
 static thread_local volatile sig_atomic_t g_crashGuardActive = 0;
 static std::atomic<uint64_t> g_crashRecoveryCount{0};
 static void installCrashRecovery(); // forward declaration
+
+// Global recovery point: when crashes happen outside a guard region,
+// jump back here instead of trying to skip individual instructions.
+static thread_local sigjmp_buf g_globalRecoveryBuf;
+static thread_local volatile sig_atomic_t g_globalRecoverySet = 0;
 
 // Safe memory read for signal handler — returns false if address is unmapped
 static bool safeReadU64(uint64_t addr, uint64_t* out) {
@@ -62,110 +69,102 @@ static bool safeReadU64(uint64_t addr, uint64_t* out) {
 }
 
 static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
-    // Re-install ourselves immediately (abort() resets SIGABRT to SIG_DFL)
     installCrashRecovery();
 
-    // SIGABRT: driver called abort()/raise(SIGABRT) due to internal corruption.
-    // Stack walking is unreliable here — just suspend the offending thread.
-    if (sig == SIGABRT) {
-        static std::atomic<int> abortCount{0};
-        int c = abortCount.fetch_add(1, std::memory_order_relaxed) + 1;
-        if (c <= 20) {
-            ucontext_t* uc2 = (ucontext_t*)ctx;
-            uint64_t rip2 = uc2 ? uc2->uc_mcontext.gregs[REG_RIP] : 0;
-            fprintf(stderr, "[CudaRT] ⚠ SIGABRT #%d at RIP=%p — suspending thread\n",
-                    c, (void*)rip2);
-        }
-        // Suspend this thread forever — other threads continue
-        for (;;) pause();
-    }
+    g_crashRecoveryCount.fetch_add(1, std::memory_order_relaxed);
 
+    // Tier 0: If inside a CRASH_GUARD region (Cmd* call), longjmp back
     if (g_crashGuardActive) {
         g_crashGuardActive = 0;
-        g_crashRecoveryCount.fetch_add(1, std::memory_order_relaxed);
         siglongjmp(g_crashJmpBuf, 1);
     }
-    // Not in a guarded region — try to skip the crashing code
-    ucontext_t* uc = (ucontext_t*)ctx;
-    if (uc) {
-        static thread_local uint64_t skipCount = 0;
-        uint64_t rip = uc->uc_mcontext.gregs[REG_RIP];
-        uint64_t rsp = uc->uc_mcontext.gregs[REG_RSP];
 
-        skipCount++;
-        g_crashRecoveryCount.fetch_add(1, std::memory_order_relaxed);
-
-        // Strategy 1: Try to return from the current function via stack return address
-        uint64_t retAddr = 0;
-        for (int i = 0; i < 8; i++) {
-            uint64_t candidate = 0;
-            if (safeReadU64(rsp + i * 8, &candidate)) {
-                uint8_t top = candidate >> 40;
-                if (top >= 0x55 && top <= 0x7f && candidate != rip) {
-                    retAddr = candidate;
-                    uc->uc_mcontext.gregs[REG_RSP] = rsp + (i + 1) * 8;
-                    break;
-                }
-            }
+    // Tier 1: If this thread has a global recovery point (QueueSubmit), longjmp there
+    if (g_globalRecoverySet) {
+        g_globalRecoverySet = 0;
+        static thread_local uint64_t globalRecovCount = 0;
+        globalRecovCount++;
+        if (globalRecovCount <= 200) {
+            ucontext_t* uc = (ucontext_t*)ctx;
+            uint64_t rip = uc ? uc->uc_mcontext.gregs[REG_RIP] : 0;
+            fprintf(stderr, "[CudaRT] ⚠ GLOBAL RECOVERY #%lu: sig=%d RIP=%p\n",
+                    globalRecovCount, sig, (void*)rip);
         }
-
-        if (retAddr) {
-            uc->uc_mcontext.gregs[REG_RIP] = retAddr;
-            uc->uc_mcontext.gregs[REG_RAX] = 0;
-            if (skipCount <= 100) {
-                fprintf(stderr, "[CudaRT] ⚠ FUNC SKIP #%lu: sig=%d RIP=%p → ret=%p\n",
-                        skipCount, sig, (void*)rip, (void*)retAddr);
-            }
-            return;
-        }
-
-        // Strategy 2: Simple instruction skip (4 bytes) as fallback
-        // Check if RIP itself is readable (might be corrupted)
-        uint64_t dummy;
-        if (safeReadU64(rip, &dummy)) {
-            uint8_t* ripBytes = (uint8_t*)rip;
-            int skip = 4;
-            // Better heuristic for REX-prefixed mov/cmp
-            if (ripBytes[0] >= 0x48 && ripBytes[0] <= 0x4F) {
-                if (ripBytes[1] == 0x8B || ripBytes[1] == 0x89 || ripBytes[1] == 0x3B) {
-                    uint8_t modrm = ripBytes[2];
-                    uint8_t mod = modrm >> 6;
-                    uint8_t rm = modrm & 7;
-                    skip = 3;
-                    if (rm == 4) skip++;
-                    if (mod == 1) skip++;
-                    else if (mod == 2 || (mod == 0 && rm == 5)) skip += 4;
-                }
-            }
-            uc->uc_mcontext.gregs[REG_RIP] = rip + skip;
-            uc->uc_mcontext.gregs[REG_RAX] = 0;
-            if (skipCount <= 100) {
-                fprintf(stderr, "[CudaRT] ⚠ INSN SKIP #%lu: sig=%d RIP=%p +%d\n",
-                        skipCount, sig, (void*)rip, skip);
-            }
-            return;
-        }
-
-        // RIP is corrupt — try to read return address from stack anyway
-        if (skipCount <= 100) {
-            fprintf(stderr, "[CudaRT] ⚠ CORRUPT RIP=%p sig=%d, no recovery possible\n",
-                    (void*)rip, sig);
-        }
+        siglongjmp(g_globalRecoveryBuf, 1);
     }
-    // Can't recover — restore default and re-raise
-    struct sigaction sa;
-    sa.sa_handler = SIG_DFL;
-    sigemptyset(&sa.sa_mask);
-    sa.sa_flags = 0;
-    sigaction(sig, &sa, nullptr);
-    raise(sig);
+
+    // Tier 2: No recovery point — driver worker thread.
+    // Strategy: FUNC SKIP for SIGSEGV (lets thread try to release locks),
+    // SUSPEND only for SIGABRT (thread called abort, can't continue).
+    // FUNC SKIP may cascade, but often the thread survives enough to
+    // release driver locks before dying — this prevents the futex deadlock.
+    {
+        static std::atomic<int> tier2Count{0};
+        int c = tier2Count.fetch_add(1, std::memory_order_relaxed) + 1;
+        ucontext_t* uc = (ucontext_t*)ctx;
+
+        if (sig == SIGABRT) {
+            // SIGABRT: suspend (abort() already called, can't return meaningfully)
+            if (c <= 50) {
+                uint64_t rip = uc ? uc->uc_mcontext.gregs[REG_RIP] : 0;
+                fprintf(stderr, "[CudaRT] ⚠ SUSPEND #%d: SIGABRT RIP=%p tid=%d\n",
+                        c, (void*)rip, (int)syscall(SYS_gettid));
+            }
+            for (;;) usleep(1000000);
+        }
+
+        // SIGSEGV/SIGBUS/etc: FUNC SKIP — scan stack for return address
+        if (uc && c <= 500) {
+            uint64_t rip = uc->uc_mcontext.gregs[REG_RIP];
+            uint64_t rsp = uc->uc_mcontext.gregs[REG_RSP];
+
+            for (int i = 0; i < 16; i++) {
+                uint64_t candidate = 0;
+                if (!safeReadU64(rsp + i * 8, &candidate)) continue;
+                uint8_t top = candidate >> 40;
+                if (top >= 0x55 && top <= 0x7e && candidate != rip) {
+                    uc->uc_mcontext.gregs[REG_RSP] = rsp + (i + 1) * 8;
+                    uc->uc_mcontext.gregs[REG_RIP] = candidate;
+                    uc->uc_mcontext.gregs[REG_RAX] = 0;
+                    if (c <= 200)
+                        fprintf(stderr, "[CudaRT] ⚠ FUNC SKIP #%d: sig=%d RIP=%p → %p tid=%d\n",
+                                c, sig, (void*)rip, (void*)candidate, (int)syscall(SYS_gettid));
+                    return;
+                }
+            }
+            // No return address found — last resort: advance RIP by 8 bytes (skip instruction)
+            uc->uc_mcontext.gregs[REG_RIP] = rip + 8;
+            uc->uc_mcontext.gregs[REG_RAX] = 0;
+            if (c <= 200)
+                fprintf(stderr, "[CudaRT] ⚠ INSN SKIP #%d: sig=%d RIP=%p+8 tid=%d\n",
+                        c, sig, (void*)rip, (int)syscall(SYS_gettid));
+            return;
+        }
+
+        // Too many crashes — suspend as last resort
+        for (;;) usleep(1000000);
+    }
 }
 
 static void installCrashRecovery() {
+    // Set up alternate signal stack so handler works even with corrupted thread stack
+    static thread_local bool stackInstalled = false;
+    if (!stackInstalled) {
+        stack_t ss;
+        ss.ss_sp = mmap(nullptr, SIGSTKSZ * 2, PROT_READ | PROT_WRITE,
+                        MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
+        if (ss.ss_sp != MAP_FAILED) {
+            ss.ss_size = SIGSTKSZ * 2;
+            ss.ss_flags = 0;
+            sigaltstack(&ss, nullptr);
+        }
+        stackInstalled = true;
+    }
+
     struct sigaction sa;
     sa.sa_sigaction = crashRecoveryHandler;
     sigemptyset(&sa.sa_mask);
-    sa.sa_flags = SA_SIGINFO | SA_NODEFER;
+    sa.sa_flags = SA_SIGINFO | SA_NODEFER | SA_ONSTACK;
     sigaction(SIGSEGV, &sa, nullptr);
     sigaction(SIGBUS, &sa, nullptr);
     sigaction(SIGILL, &sa, nullptr);
@@ -336,6 +335,7 @@ struct DeviceDispatch {
     PFN_vkDestroyFence DestroyFence;
     PFN_vkWaitForFences WaitForFences;
     PFN_vkResetFences ResetFences;
+    PFN_vkGetFenceStatus GetFenceStatus;
     PFN_vkResetCommandBuffer ResetCommandBuffer;
 
     // Queue submit (for deferred BLAS build after GPU execution)
@@ -1291,6 +1291,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
     LOAD_DEV(DestroyFence);
     LOAD_DEV(WaitForFences);
     LOAD_DEV(ResetFences);
+    LOAD_DEV(GetFenceStatus);
     LOAD_DEV(ResetCommandBuffer);
     LOAD_DEV(QueueSubmit);
     // QueueSubmit2KHR might not exist — load manually
@@ -6425,6 +6426,9 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdPipelineBarrier2KHR(
 // Intercepted: CmdDispatch — bind BVH2 descriptor set for RQ pipelines
 // ═══════════════════════════════════════════
 // ═══════════════════════════════════════════
+// Last queue used for QueueSubmit (for fence rescue in WaitForFences)
+static std::atomic<VkQueue> g_lastSubmitQueue{VK_NULL_HANDLE};
+
 // Intercepted: QueueSubmit — process deferred BLAS builds after GPU execution
 // ═══════════════════════════════════════════
 static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
@@ -6435,6 +6439,28 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
 {
     void* key = getKey(queue);
     auto& disp = g_deviceMap[key];
+    g_lastSubmitQueue.store(queue, std::memory_order_relaxed);
+
+    // Set global recovery point — ANY crash (even in driver internal threads
+    // on our single CPU) will longjmp back here instead of cascading
+    installCrashRecovery();
+    volatile VkFence savedFence = fence; // preserve across longjmp
+    if (sigsetjmp(g_globalRecoveryBuf, 1) != 0) {
+        // Crashed during this submit — return success to keep app running
+        g_globalRecoverySet = 0;
+        g_crashGuardActive = 0;
+        static uint64_t globalRecovInSubmit = 0;
+        globalRecovInSubmit++;
+        if (globalRecovInSubmit <= 200)
+            fprintf(stderr, "[CudaRT] ⚠ GLOBAL RECOVERY in QueueSubmit #%lu\n", globalRecovInSubmit);
+        // Signal the fence so app doesn't deadlock, then drain GPU
+        if (savedFence != VK_NULL_HANDLE) {
+            disp.QueueSubmit(queue, 0, nullptr, (VkFence)savedFence);
+        }
+        disp.QueueWaitIdle(queue);
+        return VK_SUCCESS;
+    }
+    g_globalRecoverySet = 1;
 
     // Fast path: after BLAS builds are done, pass through with crash guard
     if (g_blasBuildsDone) {
@@ -6447,25 +6473,124 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
         } else {
             uint64_t cnt = g_crashRecoveryCount.load(std::memory_order_relaxed);
             fprintf(stderr, "[CudaRT] ⚠ CRASH RECOVERED in QueueSubmit (total: %lu)\n", cnt);
-            return VK_SUCCESS; // pretend it worked
+            // Signal the fence so the app doesn't deadlock waiting for it.
+            // Empty submit with just the fence — GPU signals it after drain.
+            if (fence != VK_NULL_HANDLE) {
+                disp.QueueSubmit(queue, 0, nullptr, fence);
+            }
+            g_globalRecoverySet = 0;
+            return VK_SUCCESS;
         }
-        // CUDA_RT_SYNC_SUBMIT: force GPU idle after every submit to prevent
-        // pushbuffer overflow and driver race conditions
+
+        // Per-submit frame management (since QueuePresent may not be intercepted)
+        static uint32_t submitIdx = 0;
+        submitIdx++;
+
+        // FPS / progress counter — every 2 seconds
+        {
+            static struct timespec fpsStart = {0, 0};
+            static uint32_t fpsSubmits = 0;
+            if (fpsStart.tv_sec == 0) clock_gettime(CLOCK_MONOTONIC, &fpsStart);
+            fpsSubmits++;
+            struct timespec now;
+            clock_gettime(CLOCK_MONOTONIC, &now);
+            double elapsed = (now.tv_sec - fpsStart.tv_sec) + (now.tv_nsec - fpsStart.tv_nsec) * 1e-9;
+            if (elapsed >= 2.0) {
+                double sps = fpsSubmits / elapsed;
+                uint64_t recoveries = g_crashRecoveryCount.load(std::memory_order_relaxed);
+                fprintf(stderr, "\r[CudaRT] %.1f submits/s | submit #%u | recoveries=%lu   ",
+                        sps, submitIdx, (unsigned long)recoveries);
+                fflush(stderr);
+                fpsStart = now;
+                fpsSubmits = 0;
+            }
+        }
+
+        // Periodic WaitIdle to flush driver state and prevent UAF accumulation
+        static int syncInterval = -1;
+        if (syncInterval < 0) {
+            const char* e = getenv("CUDA_RT_FRAME_SYNC");
+            syncInterval = e ? atoi(e) : 0;
+            if (syncInterval > 0)
+                LOG("[SYNC] Submit sync: QueueWaitIdle every %d submits", syncInterval);
+        }
+        if (syncInterval > 0 && (submitIdx % syncInterval) == 0) {
+            disp.QueueWaitIdle(queue);
+        }
+
+        // Clear poisoned command buffers periodically
+        if ((submitIdx % 10) == 0) {
+            clearPoisonedCmdBufs();
+        }
+
+        // CUDA_RT_SYNC_SUBMIT: force GPU idle after every submit
         static int syncSubmit = -1;
         if (syncSubmit < 0) {
             const char* e = getenv("CUDA_RT_SYNC_SUBMIT");
             syncSubmit = (e && atoi(e)) ? 1 : 0;
         }
         if (syncSubmit && r == VK_SUCCESS) disp.QueueWaitIdle(queue);
+        g_globalRecoverySet = 0;
         return r;
     }
 
-    // Call real submit first
-    VkResult res = disp.QueueSubmit(queue, submitCount, pSubmits, fence);
-    if (res != VK_SUCCESS) return res;
+    // Call real submit with crash guard (always — the fast path above may not trigger
+    // if BLAS builds are never completed, e.g. with STRIP_EXTENSIONS mode)
+    VkResult res = VK_ERROR_DEVICE_LOST;
+    if (!g_blasBuildsDone) {
+        installCrashRecovery();
+        g_crashGuardActive = 1;
+        if (sigsetjmp(g_crashJmpBuf, 1) == 0) {
+            res = disp.QueueSubmit(queue, submitCount, pSubmits, fence);
+            g_crashGuardActive = 0;
+        } else {
+            uint64_t cnt = g_crashRecoveryCount.load(std::memory_order_relaxed);
+            fprintf(stderr, "[CudaRT] ⚠ CRASH RECOVERED in QueueSubmit-init (total: %lu)\n", cnt);
+            if (fence != VK_NULL_HANDLE) {
+                disp.QueueSubmit(queue, 0, nullptr, fence);
+            }
+            res = VK_SUCCESS;
+        }
+    } else {
+        res = disp.QueueSubmit(queue, submitCount, pSubmits, fence);
+    }
+    if (res != VK_SUCCESS) { g_globalRecoverySet = 0; return res; }
 
     static int qsCount = 0;
     qsCount++;
+
+    // FPS / progress counter (works even when QueuePresent isn't intercepted)
+    {
+        static struct timespec fpsStart = {0, 0};
+        static uint32_t fpsSubmits = 0;
+        if (fpsStart.tv_sec == 0) clock_gettime(CLOCK_MONOTONIC, &fpsStart);
+        fpsSubmits++;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - fpsStart.tv_sec) + (now.tv_nsec - fpsStart.tv_nsec) * 1e-9;
+        if (elapsed >= 2.0) {
+            double sps = fpsSubmits / elapsed;
+            uint64_t recoveries = g_crashRecoveryCount.load(std::memory_order_relaxed);
+            fprintf(stderr, "\r[CudaRT] %.1f submits/s | #%d | recoveries=%lu   ",
+                    sps, qsCount, (unsigned long)recoveries);
+            fflush(stderr);
+            fpsStart = now;
+            fpsSubmits = 0;
+        }
+    }
+
+    // Periodic WaitIdle to flush driver state (CUDA_RT_FRAME_SYNC)
+    {
+        static int syncInterval = -1;
+        if (syncInterval < 0) {
+            const char* e = getenv("CUDA_RT_FRAME_SYNC");
+            syncInterval = e ? atoi(e) : 0;
+        }
+        if (syncInterval > 0 && (qsCount % syncInterval) == 0) {
+            disp.QueueWaitIdle(queue);
+        }
+    }
+
     if (qsCount <= 10 || (qsCount % 100) == 0)
         LOG("[QS] QueueSubmit #%d (TLAS gen=%lu pending=%d addr=0x%lx cnt=%u)",
             qsCount, g_tlasGeneration, g_pendingTLAS.pending ? 1 : 0,
@@ -6537,6 +6662,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
         g_pendingTLAS.pending = false;
     }
 
+    g_globalRecoverySet = 0;
     return res;
 }
 
@@ -6601,6 +6727,66 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit2KHR(
     return res;
 }
 
+// ─── WaitForFences: timeout-based deadlock breaker ───
+// When a driver worker thread crashes and gets suspended, it may hold internal locks
+// that prevent fence signaling. This intercept retries with short timeouts, and after
+// ~2 seconds auto-signals stuck fences via empty QueueSubmit.
+static VKAPI_ATTR VkResult VKAPI_CALL layer_WaitForFences(
+    VkDevice device, uint32_t fenceCount, const VkFence* pFences,
+    VkBool32 waitAll, uint64_t timeout)
+{
+    void* key = getKey(device);
+    DeviceDispatch* pDisp = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        auto it = g_deviceMap.find(key);
+        if (it != g_deviceMap.end()) pDisp = &it->second;
+    }
+    if (!pDisp) return VK_ERROR_DEVICE_LOST;
+
+    // Short timeouts: pass through directly
+    if (timeout <= 200000000ULL) { // ≤200ms
+        return pDisp->WaitForFences(device, fenceCount, pFences, waitAll, timeout);
+    }
+
+    // Long/infinite waits: retry with 100ms chunks, bail after 2s
+    static std::atomic<uint64_t> rescueCount{0};
+    const uint64_t chunk = 100000000ULL; // 100ms
+    const int maxRetries = 20;           // 20 × 100ms = 2s
+    for (int attempt = 0; attempt < maxRetries; attempt++) {
+        VkResult r = pDisp->WaitForFences(device, fenceCount, pFences, waitAll, chunk);
+        if (r == VK_SUCCESS) return VK_SUCCESS;
+        if (r != VK_TIMEOUT) return r;
+    }
+
+    // Timed out — fence is stuck. Try to rescue via empty QueueSubmit.
+    uint64_t rc = rescueCount.fetch_add(1, std::memory_order_relaxed) + 1;
+    VkQueue rescueQ = g_lastSubmitQueue.load(std::memory_order_relaxed);
+    if (rescueQ != VK_NULL_HANDLE) {
+        for (uint32_t i = 0; i < fenceCount; i++) {
+            VkResult status = pDisp->GetFenceStatus(device, pFences[i]);
+            if (status != VK_SUCCESS) {
+                // Reset fence, then signal via empty submit
+                pDisp->ResetFences(device, 1, &pFences[i]);
+                pDisp->QueueSubmit(rescueQ, 0, nullptr, pFences[i]);
+            }
+        }
+        VkResult r = pDisp->WaitForFences(device, fenceCount, pFences, waitAll, chunk);
+        if (r == VK_SUCCESS) {
+            if (rc <= 100)
+                fprintf(stderr, "[CudaRT] ⚠ FENCE RESCUE #%lu: %u fences recovered via empty submit\n",
+                        rc, fenceCount);
+            return VK_SUCCESS;
+        }
+    }
+
+    // Last resort: force return success
+    if (rc <= 50)
+        fprintf(stderr, "[CudaRT] ⚠ FENCE RESCUE #%lu: force VK_SUCCESS for %u fences\n",
+                rc, fenceCount);
+    return VK_SUCCESS;
+}
+
 // ─── QueuePresentKHR: per-frame hook for deferred TLAS retry ───
 static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
     VkQueue queue,
@@ -6649,6 +6835,27 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
     // Save dispatch count before reset (used by denoiser later)
     uint32_t rqDispatchThisFrame = g_rqDispatchPerFrame;
     g_rqDispatchPerFrame = 0;
+
+    // FPS counter — prints to stderr every second
+    {
+        static struct timespec fpsStart = {0, 0};
+        static uint32_t fpsFrames = 0;
+        if (fpsStart.tv_sec == 0) clock_gettime(CLOCK_MONOTONIC, &fpsStart);
+        fpsFrames++;
+        struct timespec now;
+        clock_gettime(CLOCK_MONOTONIC, &now);
+        double elapsed = (now.tv_sec - fpsStart.tv_sec) + (now.tv_nsec - fpsStart.tv_nsec) * 1e-9;
+        if (elapsed >= 2.0) {
+            double fps = fpsFrames / elapsed;
+            uint64_t recoveries = g_crashRecoveryCount.load(std::memory_order_relaxed);
+            fprintf(stderr, "\r[CudaRT] %.1f FPS | frame %u | dispatches/f=%u | recoveries=%lu   ",
+                    fps, presentCount, rqDispatchThisFrame, (unsigned long)recoveries);
+            fflush(stderr);
+            fpsStart = now;
+            fpsFrames = 0;
+        }
+    }
+
     if (presentCount <= 5 || presentCount % 100 == 0) {
         LOG("[PRESENT] QueuePresent #%u (TLAS gen=%u addr=0x%llx dispatches=%u)",
             presentCount, g_tlasGeneration,
@@ -7483,6 +7690,7 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetDeviceProcAddr(VkDevice
     INTERCEPT(CmdSetScissor);
     INTERCEPT(CmdExecuteCommands);
     INTERCEPT(QueueSubmit);
+    INTERCEPT(WaitForFences);
     if (strcmp(pName, "vkQueueSubmit2KHR") == 0 || strcmp(pName, "vkQueueSubmit2") == 0) {
         void* key = getKey(device);
         auto it = g_deviceMap.find(key);
