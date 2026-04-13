@@ -53,6 +53,35 @@ static void installCrashRecovery(); // forward declaration
 static thread_local sigjmp_buf g_globalRecoveryBuf;
 static thread_local volatile sig_atomic_t g_globalRecoverySet = 0;
 
+// App executable text range (populated at init from /proc/self/maps)
+static uint64_t g_appTextStart = 0, g_appTextEnd = 0;
+
+static void detectAppTextRange() {
+    // Read /proc/self/exe to get the executable path
+    char exePath[512] = {};
+    ssize_t len = readlink("/proc/self/exe", exePath, sizeof(exePath) - 1);
+    if (len <= 0) return;
+    exePath[len] = '\0';
+
+    // Parse /proc/self/maps for executable's r-xp regions
+    FILE* f = fopen("/proc/self/maps", "r");
+    if (!f) return;
+    char line[1024];
+    while (fgets(line, sizeof(line), f)) {
+        if (!strstr(line, "r-xp")) continue;
+        if (!strstr(line, exePath)) continue;
+        uint64_t lo = 0, hi = 0;
+        if (sscanf(line, "%lx-%lx", &lo, &hi) == 2) {
+            if (g_appTextStart == 0 || lo < g_appTextStart) g_appTextStart = lo;
+            if (hi > g_appTextEnd) g_appTextEnd = hi;
+        }
+    }
+    fclose(f);
+    if (g_appTextStart)
+        fprintf(stderr, "[CudaRT] App text range: %p–%p\n",
+                (void*)g_appTextStart, (void*)g_appTextEnd);
+}
+
 // Safe memory read for signal handler — returns false if address is unmapped
 static bool safeReadU64(uint64_t addr, uint64_t* out) {
     // Use mincore to check if page is mapped (fast syscall, no allocation)
@@ -104,20 +133,16 @@ static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
         int tid = (int)syscall(SYS_gettid);
         pid_t mainTid = getpid(); // main thread TID == PID
 
-        // If this is the app's main thread or app render thread, DO NOT skip.
+        // If this is the app's main thread crashing in app code, DO NOT skip.
         // Let the default signal action kill the process gracefully.
-        // We detect "app thread" vs "driver worker" by checking if RIP is in the
-        // app binary range (0x55..–0x5f..) vs driver/CUDA range (0x7f..).
+        // Use /proc/self/maps-based detection (set by detectAppTextRange at init).
         if (uc && sig != SIGABRT) {
             uint64_t rip = uc->uc_mcontext.gregs[REG_RIP];
-            uint8_t ripTop = rip >> 40;
-            bool ripInApp = (ripTop >= 0x55 && ripTop <= 0x5f);
-            // If crash is in app code OR this is the main thread with app-range crash
-            if (ripInApp && tid == mainTid) {
+            bool ripInApp = (g_appTextStart && rip >= g_appTextStart && rip < g_appTextEnd);
+            if (ripInApp) {
                 if (c <= 5)
-                    fprintf(stderr, "[CudaRT] ⚠ APP CRASH sig=%d RIP=%p tid=%d — not intercepting\n",
-                            sig, (void*)rip, tid);
-                // Restore default handler and re-raise
+                    fprintf(stderr, "[CudaRT] ⚠ APP CRASH sig=%d RIP=%p tid=%d (app text %p–%p) — not intercepting\n",
+                            sig, (void*)rip, tid, (void*)g_appTextStart, (void*)g_appTextEnd);
                 signal(sig, SIG_DFL);
                 return;
             }
@@ -221,6 +246,13 @@ static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
 }
 
 static void installCrashRecovery() {
+    // Detect app text range on first call
+    static bool rangeDetected = false;
+    if (!rangeDetected) {
+        detectAppTextRange();
+        rangeDetected = true;
+    }
+
     // Set up alternate signal stack so handler works even with corrupted thread stack
     static thread_local bool stackInstalled = false;
     if (!stackInstalled) {
@@ -3580,86 +3612,21 @@ static bool createBufferWithData(DeviceDispatch& disp, const void* data, VkDevic
 static bool uploadToExistingBuffer(DeviceDispatch& disp, VkBuffer dstBuf, const void* data, VkDeviceSize size) {
     if (!data || size == 0) return false;
     
-    VkBuffer stagingBuf;
-    VkDeviceMemory stagingMem;
-    VkBufferCreateInfo stagCI = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
-    stagCI.size = size;
-    stagCI.usage = VK_BUFFER_USAGE_TRANSFER_SRC_BIT;
-    stagCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
-    if (disp.CreateBuffer(disp.device, &stagCI, nullptr, &stagingBuf) != VK_SUCCESS) return false;
+    // Direct map/memcpy — buffers are HOST_VISIBLE+HOST_COHERENT, no staging needed.
+    // This avoids vkQueueWaitIdle which deadlocks when GPU work is hung.
+    // Find the VkDeviceMemory for this buffer from our tracked BVH2 buffers.
+    VkDeviceMemory mem = VK_NULL_HANDLE;
+    if (dstBuf == g_bvh2.nodesBuf) mem = g_bvh2.nodesMem;
+    else if (dstBuf == g_bvh2.trisBuf) mem = g_bvh2.trisMem;
+    else if (dstBuf == g_bvh2.tlasNodesBuf) mem = g_bvh2.tlasNodesMem;
+    else if (dstBuf == g_bvh2.instancesBuf) mem = g_bvh2.instancesMem;
+    if (mem == VK_NULL_HANDLE) return false;
 
-    VkMemoryRequirements stagReqs;
-    disp.GetBufferMemoryRequirements(disp.device, stagingBuf, &stagReqs);
-    int hostMemType = -1;
-    for (uint32_t i = 0; i < disp.memProps.memoryTypeCount; i++) {
-        if ((stagReqs.memoryTypeBits & (1 << i)) &&
-            (disp.memProps.memoryTypes[i].propertyFlags &
-             (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
-             (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
-            hostMemType = i; break;
-        }
-    }
-    if (hostMemType < 0) { disp.DestroyBuffer(disp.device, stagingBuf, nullptr); return false; }
-
-    VkMemoryAllocateInfo stagAlloc = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
-    stagAlloc.allocationSize = stagReqs.size;
-    stagAlloc.memoryTypeIndex = hostMemType;
-    if (disp.AllocateMemory(disp.device, &stagAlloc, nullptr, &stagingMem) != VK_SUCCESS) {
-        disp.DestroyBuffer(disp.device, stagingBuf, nullptr); return false;
-    }
-    disp.BindBufferMemory(disp.device, stagingBuf, stagingMem, 0);
     void* mapped = nullptr;
-    disp.MapMemory(disp.device, stagingMem, 0, size, 0, &mapped);
-    if (!mapped) return false;
-    memcpy(mapped, data, size);
-    disp.UnmapMemory(disp.device, stagingMem);
-
-    auto createCP = (PFN_vkCreateCommandPool)disp.GetDeviceProcAddr(disp.device, "vkCreateCommandPool");
-    auto destroyCP = (PFN_vkDestroyCommandPool)disp.GetDeviceProcAddr(disp.device, "vkDestroyCommandPool");
-    auto allocCB = (PFN_vkAllocateCommandBuffers)disp.GetDeviceProcAddr(disp.device, "vkAllocateCommandBuffers");
-    auto beginCB = (PFN_vkBeginCommandBuffer)disp.GetDeviceProcAddr(disp.device, "vkBeginCommandBuffer");
-    auto endCB = (PFN_vkEndCommandBuffer)disp.GetDeviceProcAddr(disp.device, "vkEndCommandBuffer");
-    auto queueSubmit = (PFN_vkQueueSubmit)disp.GetDeviceProcAddr(disp.device, "vkQueueSubmit");
-    auto queueWait = (PFN_vkQueueWaitIdle)disp.GetDeviceProcAddr(disp.device, "vkQueueWaitIdle");
-    auto getQueue = (PFN_vkGetDeviceQueue)disp.GetDeviceProcAddr(disp.device, "vkGetDeviceQueue");
-    if (!createCP || !allocCB || !beginCB || !endCB || !queueSubmit || !queueWait || !getQueue) {
-        disp.DestroyBuffer(disp.device, stagingBuf, nullptr);
-        disp.FreeMemory(disp.device, stagingMem, nullptr);
+    if (disp.MapMemory(disp.device, mem, 0, size, 0, &mapped) != VK_SUCCESS || !mapped)
         return false;
-    }
-
-    VkQueue queue;
-    getQueue(disp.device, 0, 0, &queue);
-    VkCommandPool cmdPool;
-    VkCommandPoolCreateInfo cpCI = {VK_STRUCTURE_TYPE_COMMAND_POOL_CREATE_INFO};
-    cpCI.flags = VK_COMMAND_POOL_CREATE_TRANSIENT_BIT;
-    cpCI.queueFamilyIndex = 0;
-    createCP(disp.device, &cpCI, nullptr, &cmdPool);
-
-    VkCommandBuffer cmdBuf;
-    VkCommandBufferAllocateInfo cbAI = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_ALLOCATE_INFO};
-    cbAI.commandPool = cmdPool;
-    cbAI.level = VK_COMMAND_BUFFER_LEVEL_PRIMARY;
-    cbAI.commandBufferCount = 1;
-    allocCB(disp.device, &cbAI, &cmdBuf);
-
-    VkCommandBufferBeginInfo beginInfo = {VK_STRUCTURE_TYPE_COMMAND_BUFFER_BEGIN_INFO};
-    beginInfo.flags = VK_COMMAND_BUFFER_USAGE_ONE_TIME_SUBMIT_BIT;
-    beginCB(cmdBuf, &beginInfo);
-    VkBufferCopy copyRegion = {};
-    copyRegion.size = size;
-    disp.CmdCopyBuffer(cmdBuf, stagingBuf, dstBuf, 1, &copyRegion);
-    endCB(cmdBuf);
-
-    VkSubmitInfo submitInfo = {VK_STRUCTURE_TYPE_SUBMIT_INFO};
-    submitInfo.commandBufferCount = 1;
-    submitInfo.pCommandBuffers = &cmdBuf;
-    queueSubmit(queue, 1, &submitInfo, VK_NULL_HANDLE);
-    queueWait(queue);
-
-    destroyCP(disp.device, cmdPool, nullptr);
-    disp.DestroyBuffer(disp.device, stagingBuf, nullptr);
-    disp.FreeMemory(disp.device, stagingMem, nullptr);
+    memcpy(mapped, data, size);
+    disp.UnmapMemory(disp.device, mem);
     return true;
 }
 
@@ -3679,24 +3646,27 @@ static bool ensureBufferCapacity(DeviceDispatch& disp, VkDeviceSize requiredSize
     
     VkBufferCreateInfo bufCI = {VK_STRUCTURE_TYPE_BUFFER_CREATE_INFO};
     bufCI.size = allocSize;
-    bufCI.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT | VK_BUFFER_USAGE_TRANSFER_DST_BIT;
+    // Use HOST_VISIBLE+HOST_COHERENT to avoid staging buffer + vkQueueWaitIdle deadlock
+    bufCI.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
     bufCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (disp.CreateBuffer(disp.device, &bufCI, nullptr, &buf) != VK_SUCCESS) return false;
     
     VkMemoryRequirements memReqs;
     disp.GetBufferMemoryRequirements(disp.device, buf, &memReqs);
-    int devMemType = -1;
+    int hostMemType = -1;
     for (uint32_t i = 0; i < disp.memProps.memoryTypeCount; i++) {
         if ((memReqs.memoryTypeBits & (1 << i)) &&
-            (disp.memProps.memoryTypes[i].propertyFlags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
-            devMemType = i; break;
+            (disp.memProps.memoryTypes[i].propertyFlags &
+             (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) ==
+             (VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+            hostMemType = i; break;
         }
     }
-    if (devMemType < 0) { disp.DestroyBuffer(disp.device, buf, nullptr); buf = VK_NULL_HANDLE; return false; }
+    if (hostMemType < 0) { disp.DestroyBuffer(disp.device, buf, nullptr); buf = VK_NULL_HANDLE; return false; }
     
     VkMemoryAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocInfo.allocationSize = memReqs.size;
-    allocInfo.memoryTypeIndex = devMemType;
+    allocInfo.memoryTypeIndex = hostMemType;
     if (disp.AllocateMemory(disp.device, &allocInfo, nullptr, &mem) != VK_SUCCESS) {
         disp.DestroyBuffer(disp.device, buf, nullptr); buf = VK_NULL_HANDLE; return false;
     }
@@ -4156,6 +4126,7 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
     if (g_instances.empty() || !g_bvh2.descSet) return false;
 
     int numInst = (int)g_instances.size();
+    LOG("[BVH2] reuploadTLASData ENTER: %d instances", numInst);
 
     // Upload TLAS BVH2 nodes — prefer fast-built data if available
     uint32_t* tlasNodeData = nullptr;
@@ -4169,6 +4140,7 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
     VkDeviceSize tlasNodesSize = 0;
     if (tlasNodeData && numTlasNodes > 0) {
         tlasNodesSize = (VkDeviceSize)numTlasNodes * 8 * sizeof(uint32_t);
+        LOG("[BVH2] reupload: TLAS nodes %d → %lu bytes", numTlasNodes, (unsigned long)tlasNodesSize);
         if (!ensureBufferCapacity(disp, tlasNodesSize, g_bvh2.tlasNodesBuf, g_bvh2.tlasNodesMem, g_bvh2.tlasNodesCapacity)) {
             LOG("[BVH2] TLAS reupload: failed to ensure TLAS nodes capacity");
             return false;
@@ -4177,6 +4149,7 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
             LOG("[BVH2] TLAS reupload: failed to upload TLAS nodes");
             return false;
         }
+        LOG("[BVH2] reupload: TLAS nodes uploaded OK");
     }
 
     // Upload instance data — reordered to match TLAS BVH leaf indices
@@ -4241,6 +4214,7 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
         LOG("[BVH2] TLAS reupload: failed to ensure instances capacity");
         return false;
     }
+    LOG("[BVH2] reupload: instances buffer ready, uploading %lu bytes", (unsigned long)instancesSize);
     if (!uploadToExistingBuffer(disp, g_bvh2.instancesBuf, instPacked.data(), instancesSize)) {
         LOG("[BVH2] TLAS reupload: failed to upload instances");
         return false;
@@ -6880,10 +6854,26 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
         } else {
             uint64_t cnt = g_crashRecoveryCount.load(std::memory_order_relaxed);
             fprintf(stderr, "[CudaRT] ⚠ CRASH RECOVERED in QueueSubmit (total: %lu)\n", cnt);
-            // Signal the fence so the app doesn't deadlock waiting for it.
-            // Empty submit with just the fence — GPU signals it after drain.
-            if (fence != VK_NULL_HANDLE) {
-                disp.QueueSubmit(queue, 0, nullptr, fence);
+            // Signal fence AND semaphores so the app doesn't deadlock.
+            // Collect all signal semaphores from the original submits.
+            std::vector<VkSemaphore> sigSems;
+            for (uint32_t si = 0; si < submitCount; si++) {
+                for (uint32_t j = 0; j < pSubmits[si].signalSemaphoreCount; j++)
+                    sigSems.push_back(pSubmits[si].pSignalSemaphores[j]);
+            }
+            if (!sigSems.empty() || fence != VK_NULL_HANDLE) {
+                VkSubmitInfo rescue = {};
+                rescue.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                rescue.signalSemaphoreCount = (uint32_t)sigSems.size();
+                rescue.pSignalSemaphores = sigSems.empty() ? nullptr : sigSems.data();
+                // Use crash guard for the rescue submit too
+                g_crashGuardActive = 1;
+                if (sigsetjmp(g_crashJmpBuf, 1) == 0) {
+                    disp.QueueSubmit(queue, 1, &rescue, fence);
+                    g_crashGuardActive = 0;
+                } else {
+                    fprintf(stderr, "[CudaRT] ⚠ Rescue submit also crashed — semaphores lost\n");
+                }
             }
             g_globalRecoverySet = 0;
             return VK_SUCCESS;
@@ -6955,8 +6945,24 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
             uint64_t cnt = g_crashRecoveryCount.load(std::memory_order_relaxed);
             fprintf(stderr, "[CudaRT] ⚠ CRASH RECOVERED in QueueSubmit-init (total: %lu)\n", cnt);
             submitCrashed = true;
-            if (fence != VK_NULL_HANDLE) {
-                disp.QueueSubmit(queue, 0, nullptr, fence);
+            // Signal fence + semaphores to prevent deadlock
+            std::vector<VkSemaphore> sigSems;
+            for (uint32_t si = 0; si < submitCount; si++) {
+                for (uint32_t j = 0; j < pSubmits[si].signalSemaphoreCount; j++)
+                    sigSems.push_back(pSubmits[si].pSignalSemaphores[j]);
+            }
+            if (!sigSems.empty() || fence != VK_NULL_HANDLE) {
+                VkSubmitInfo rescue = {};
+                rescue.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                rescue.signalSemaphoreCount = (uint32_t)sigSems.size();
+                rescue.pSignalSemaphores = sigSems.empty() ? nullptr : sigSems.data();
+                g_crashGuardActive = 1;
+                if (sigsetjmp(g_crashJmpBuf, 1) == 0) {
+                    disp.QueueSubmit(queue, 1, &rescue, fence);
+                    g_crashGuardActive = 0;
+                } else {
+                    fprintf(stderr, "[CudaRT] ⚠ Rescue submit-init also crashed\n");
+                }
             }
             res = VK_SUCCESS;
         }
