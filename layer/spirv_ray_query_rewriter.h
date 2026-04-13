@@ -235,7 +235,8 @@ static void spvEmit(std::vector<uint32_t>& out, uint16_t opcode,
 // ============================================================================
 static std::vector<uint32_t> spirvRewriteRayQuery(
     const uint32_t* code, size_t numWords,
-    int bvhDescSet, int bvhNodesBinding, int bvhTrisBinding)
+    int bvhDescSet, int bvhNodesBinding, int bvhTrisBinding,
+    int bvhTlasBinding = 2, int bvhInstBinding = 3)
 {
     if (numWords < 5 || code[0] != 0x07230203u) return {};
 
@@ -989,9 +990,9 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             E(SpvOpMemberDecorate, {tTlasS, 0, (uint32_t)DecNonWritable});
             E(SpvOpMemberDecorate, {tInstS, 0, (uint32_t)DecNonWritable});
             E(SpvOpDecorate, {vTlas, (uint32_t)DecDescriptorSet, (uint32_t)bvhDescSet});
-            E(SpvOpDecorate, {vTlas, (uint32_t)DecBinding, 2u});
+            E(SpvOpDecorate, {vTlas, (uint32_t)DecBinding, (uint32_t)bvhTlasBinding});
             E(SpvOpDecorate, {vInst, (uint32_t)DecDescriptorSet, (uint32_t)bvhDescSet});
-            E(SpvOpDecorate, {vInst, (uint32_t)DecBinding, 3u});
+            E(SpvOpDecorate, {vInst, (uint32_t)DecBinding, (uint32_t)bvhInstBinding});
 #endif // !SPIRV_RQ_NO_SSBO
         }
 #endif // !SPIRV_RQ_MINIMAL (Phase A)
@@ -2442,21 +2443,36 @@ struct SpirvRewriteResult {
 };
 
 static SpirvRewriteResult spirvTryRewriteRayQuery(
-    const uint32_t* code, size_t numWords)
+    const uint32_t* code, size_t numWords,
+    int maxBoundSets = 8)  // V100 default; caller should pass actual limit
 {
     SpirvRewriteResult r = {};
     r.rewritten = false;
     if (!spirvHasRayQuery(code, numWords)) return r;
 
     int maxSet = spirvMaxDescriptorSet(code, numWords);
-    r.bvhDescSet = maxSet + 1;
-    r.bvhNodesBinding = 0;
-    r.bvhTrisBinding = 1;
-    r.bvhTlasBinding = 2;
-    r.bvhInstBinding = 3;
+    
+    if (maxSet + 1 < maxBoundSets) {
+        // Fits: use next set after app's highest, bindings 0-3
+        r.bvhDescSet = maxSet + 1;
+        r.bvhNodesBinding = 0;
+        r.bvhTrisBinding = 1;
+        r.bvhTlasBinding = 2;
+        r.bvhInstBinding = 3;
+    } else {
+        // Capped: merge into highest valid set with high binding offsets to avoid collision
+        r.bvhDescSet = maxBoundSets - 1;
+        r.bvhNodesBinding = 100;
+        r.bvhTrisBinding = 101;
+        r.bvhTlasBinding = 102;
+        r.bvhInstBinding = 103;
+    }
 
-    fprintf(stderr, "[SPIRV-RQ] Shader has ray queries! Rewriting (BVH set=%d)\n", r.bvhDescSet);
-    r.code = spirvRewriteRayQuery(code, numWords, r.bvhDescSet, r.bvhNodesBinding, r.bvhTrisBinding);
+    fprintf(stderr, "[SPIRV-RQ] Shader has ray queries! Rewriting (BVH set=%d bind=%d,%d,%d,%d maxSet=%d limit=%d)\n",
+            r.bvhDescSet, r.bvhNodesBinding, r.bvhTrisBinding, r.bvhTlasBinding, r.bvhInstBinding,
+            maxSet, maxBoundSets);
+    r.code = spirvRewriteRayQuery(code, numWords, r.bvhDescSet, r.bvhNodesBinding, r.bvhTrisBinding,
+                                  r.bvhTlasBinding, r.bvhInstBinding);
     r.rewritten = !r.code.empty();
     return r;
 }

@@ -96,10 +96,32 @@ static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
     // Tier 2: No recovery point — driver worker thread.
     // Strategy: FUNC SKIP for SIGSEGV (lets thread try to release locks),
     // SUSPEND only for SIGABRT (thread called abort, can't continue).
+    // IMPORTANT: Only apply to driver worker threads, NOT the app's main thread.
     {
         static std::atomic<int> tier2Count{0};
         int c = tier2Count.fetch_add(1, std::memory_order_relaxed) + 1;
         ucontext_t* uc = (ucontext_t*)ctx;
+        int tid = (int)syscall(SYS_gettid);
+        pid_t mainTid = getpid(); // main thread TID == PID
+
+        // If this is the app's main thread or app render thread, DO NOT skip.
+        // Let the default signal action kill the process gracefully.
+        // We detect "app thread" vs "driver worker" by checking if RIP is in the
+        // app binary range (0x55..–0x5f..) vs driver/CUDA range (0x7f..).
+        if (uc && sig != SIGABRT) {
+            uint64_t rip = uc->uc_mcontext.gregs[REG_RIP];
+            uint8_t ripTop = rip >> 40;
+            bool ripInApp = (ripTop >= 0x55 && ripTop <= 0x5f);
+            // If crash is in app code OR this is the main thread with app-range crash
+            if (ripInApp && tid == mainTid) {
+                if (c <= 5)
+                    fprintf(stderr, "[CudaRT] ⚠ APP CRASH sig=%d RIP=%p tid=%d — not intercepting\n",
+                            sig, (void*)rip, tid);
+                // Restore default handler and re-raise
+                signal(sig, SIG_DFL);
+                return;
+            }
+        }
 
         if (sig == SIGABRT) {
             if (c <= 50) {
@@ -2777,9 +2799,10 @@ static void processPendingBLAS() {
 
             nodeOff += numNodes;
             triOff += numTris;
-            LOG("  [BLAS#%d] asKey=0x%lx, %d tris, %d nodes, nodeOff=%d, triOff=%d",
-                (int)(&be - g_blasEntries.data()), (uint64_t)be.asKey,
-                numTris, numNodes, be.nodeOffset, be.triOffset);
+            if ((int)(&be - g_blasEntries.data()) < 3 || (int)(&be - g_blasEntries.data()) >= (int)g_blasEntries.size() - 2)
+                LOG("  [BLAS#%d] asKey=0x%lx, %d tris, %d nodes, nodeOff=%d, triOff=%d",
+                    (int)(&be - g_blasEntries.data()), (uint64_t)be.asKey,
+                    numTris, numNodes, be.nodeOffset, be.triOffset);
         }
         // Map device addresses to BLAS entries
         for (auto& [devAddr, asHandle] : g_asDevAddrToHandle) {
@@ -2993,7 +3016,7 @@ static void processPendingTLAS() {
     auto t0 = std::chrono::steady_clock::now();
 
     static int tlasRebuildCount = 0;
-    bool verbose = (tlasRebuildCount < 3);
+    bool verbose = (tlasRebuildCount < 1); // only first rebuild gets full logging
 
     if (verbose) {
         LOG("[TLAS] Reading %u instances from addr=0x%lx...", numInst, (uint64_t)addr);
@@ -3183,23 +3206,22 @@ have_data:
         if (verbose) {
             LOG("[TLAS] %zu unique BLAS refs, fallbackIdx=%d (%d BLASes available, %zu tracked devAddrs)",
                 blasRefCounts.size(), fallbackBlasIdx, (int)g_blasEntries.size(), g_blasDevAddrToIdx.size());
+            int loggedRefs = 0;
             for (auto& [ref, cnt] : blasRefCounts) {
                 auto it = g_blasDevAddrToIdx.find(ref);
                 int idx = (it != g_blasDevAddrToIdx.end()) ? it->second : -1;
-                if (idx >= 0)
-                    LOG("  blasRef=0x%lx → BLAS#%d (%d tris), %d instances",
-                        ref, idx, g_blasEntries[idx].numTris, cnt);
-                else {
-                    LOG("  blasRef=0x%lx → UNMAPPED, %d instances", ref, cnt);
-                    // Dump all tracked addresses for debugging
-                    LOG("  [DEBUG] All %zu tracked BLAS devAddrs:", g_blasDevAddrToIdx.size());
-                    int dumpCount = 0;
-                    for (auto& [da, bi] : g_blasDevAddrToIdx) {
-                        LOG("    devAddr=0x%lx → BLAS#%d", da, bi);
-                        if (++dumpCount >= 10) { LOG("    ... (%zu more)", g_blasDevAddrToIdx.size() - 10); break; }
-                    }
+                if (idx >= 0) {
+                    if (loggedRefs < 3)
+                        LOG("  blasRef=0x%lx → BLAS#%d (%d tris), %d instances",
+                            ref, idx, g_blasEntries[idx].numTris, cnt);
+                } else {
+                    if (loggedRefs < 3)
+                        LOG("  blasRef=0x%lx → UNMAPPED, %d instances", ref, cnt);
                 }
+                loggedRefs++;
             }
+            if ((int)blasRefCounts.size() > 3)
+                LOG("  ... (%zu more BLAS refs)", blasRefCounts.size() - 3);
         }
     }
 
@@ -3288,8 +3310,8 @@ have_data:
         worldAABBs[i*6+0] = wMinX; worldAABBs[i*6+1] = wMinY; worldAABBs[i*6+2] = wMinZ;
         worldAABBs[i*6+3] = wMaxX; worldAABBs[i*6+4] = wMaxY; worldAABBs[i*6+5] = wMaxZ;
 
-        // Log ALL instances on first rebuild
-        if (verbose) {
+        // Log sample instances on first rebuild
+        if (verbose && (i < 3 || i >= numInst - 2)) {
             LOG("[TLAS] Instance %u: T=[%.1f,%.1f,%.1f] mask=0x%02x customIdx=%u sbt=%u flags=%u BLAS#%d (nOff=%u,tOff=%u) wAABB=(%.1f,%.1f,%.1f)-(%.1f,%.1f,%.1f)",
                 i, xform[3], xform[7], xform[11], instanceMask, customIdx, sbtOffset, instFlags,
                 blasIdx, nodeOff, triOff,
@@ -4202,11 +4224,12 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
             dst[35] = (float)(gi.instanceMask | (gi.instanceFlags << 8));
         }
     }
-    // One-time diagnostic: dump sorted→original instance mapping
+    // One-time diagnostic: dump sorted→original instance mapping (sample only)
     static bool dumpedMapping = false;
     if (!dumpedMapping) {
         dumpedMapping = true;
         for (int i = 0; i < numInst; i++) {
+            if (i >= 4 && i < numInst - 2) continue; // only first 4 + last 2
             int origIdx = (g_fastTLASOrdered && i < numInst) ? g_fastTLASOrdered[i] : i;
             const InstanceGPU& gi = g_instances[origIdx];
             fprintf(stderr, "[CudaRT] [INST-MAP] sorted[%d] → orig=%d customIdx=%d mask=0x%02x blasNOff=%d blasTOff=%d T=(%.1f,%.1f,%.1f)\n",
@@ -4274,64 +4297,49 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
         // ── CPU-side BLAS root AABB test for each instance ──
         // Mimics the GPU: transform world ray to local space, test against BLAS root node
         static int blasAabbTestCount = 0;
-        if (blasAabbTestCount < 3 && numInst > 0) {
-            LOG("[BVH2-AABB] CPU-side BLAS root AABB test (%d instances):", numInst);
+        if (blasAabbTestCount < 1 && numInst > 0) {
+            LOG("[BVH2-AABB] CPU-side BLAS root AABB test (%d instances, showing sample):", numInst);
+            int hits = 0, misses = 0;
             for (int i = 0; i < numInst; i++) {
                 float* d = instPacked.data() + i * 36;
                 float xform[12], invXform[12];
                 memcpy(xform, d, 48);
                 memcpy(invXform, d + 12, 48);
-                int blasNOff = (int)d[27]; // nodeOff stored as float
-                int blasTOff = (int)d[31]; // triOff stored as float
-
-                // BLAS root AABB from instance SSBO (blasBounds)
+                int blasNOff = (int)d[27];
+                int blasTOff = (int)d[31];
                 float bmin[3] = {d[24], d[25], d[26]};
                 float bmax[3] = {d[28], d[29], d[30]};
-
-                // Model-space center of BLAS AABB
                 float mcx = (bmin[0]+bmax[0])*0.5f, mcy = (bmin[1]+bmax[1])*0.5f, mcz = (bmin[2]+bmax[2])*0.5f;
-                // Transform to world space: worldCenter = xform * modelCenter + xform_translation
                 float wcx = xform[0]*mcx + xform[1]*mcy + xform[2]*mcz + xform[3];
                 float wcy = xform[4]*mcx + xform[5]*mcy + xform[6]*mcz + xform[7];
                 float wcz = xform[8]*mcx + xform[9]*mcy + xform[10]*mcz + xform[11];
-
-                // Create test ray: from (wcx, wcy, wcz+200) shooting -Z toward entity
                 float rox = wcx, roy = wcy, roz = wcz + 200.0f;
                 float rdx = 0, rdy = 0, rdz = -1.0f;
-
-                // Transform ray to local space using inverse transform (same as GPU)
                 float lox = invXform[0]*rox + invXform[1]*roy + invXform[2]*roz + invXform[3];
                 float loy = invXform[4]*rox + invXform[5]*roy + invXform[6]*roz + invXform[7];
                 float loz = invXform[8]*rox + invXform[9]*roy + invXform[10]*roz + invXform[11];
                 float ldx = invXform[0]*rdx + invXform[1]*rdy + invXform[2]*rdz;
                 float ldy = invXform[4]*rdx + invXform[5]*rdy + invXform[6]*rdz;
                 float ldz = invXform[8]*rdx + invXform[9]*rdy + invXform[10]*rdz;
-
-                // Safe inverse direction
                 auto safeInvF = [](float v) -> float {
                     return (fabsf(v) > 1e-8f) ? 1.0f/v : (v >= 0 ? 1e8f : -1e8f);
                 };
                 float lInvDx = safeInvF(ldx), lInvDy = safeInvF(ldy), lInvDz = safeInvF(ldz);
                 float lOodx = -lox * lInvDx, lOody = -loy * lInvDy, lOodz = -loz * lInvDz;
-
-                // AABB slab test (same as GPU)
                 float t1x = bmin[0]*lInvDx + lOodx, t2x = bmax[0]*lInvDx + lOodx;
                 float t1y = bmin[1]*lInvDy + lOody, t2y = bmax[1]*lInvDy + lOody;
                 float t1z = bmin[2]*lInvDz + lOodz, t2z = bmax[2]*lInvDz + lOodz;
                 float tNear = fmaxf(fmaxf(fminf(t1x,t2x), fminf(t1y,t2y)), fminf(t1z,t2z));
                 float tFar  = fminf(fminf(fmaxf(t1x,t2x), fmaxf(t1y,t2y)), fmaxf(t1z,t2z));
                 bool hit = (tNear <= tFar) && (tFar > 0.0f) && (tNear < 1e30f);
-
-                LOG("[BVH2-AABB]  inst[%d] nOff=%d tOff=%d",
-                    i, blasNOff, blasTOff);
-                LOG("[BVH2-AABB]    BLAS root AABB: (%.2f,%.2f,%.2f)-(%.2f,%.2f,%.2f)",
-                    bmin[0],bmin[1],bmin[2], bmax[0],bmax[1],bmax[2]);
-                LOG("[BVH2-AABB]    xform T=[%.1f,%.1f,%.1f] worldCenter=(%.1f,%.1f,%.1f)",
-                    xform[3], xform[7], xform[11], wcx, wcy, wcz);
-                LOG("[BVH2-AABB]    localRo=(%.2f,%.2f,%.2f) localRd=(%.4f,%.4f,%.4f)",
-                    lox,loy,loz, ldx,ldy,ldz);
-                LOG("[BVH2-AABB]    tNear=%.4f tFar=%.4f hit=%d", tNear, tFar, hit ? 1 : 0);
+                if (hit) hits++; else misses++;
+                if (i < 2 || i >= numInst - 1) {
+                    LOG("[BVH2-AABB]  inst[%d] nOff=%d tOff=%d AABB=(%.2f,%.2f,%.2f)-(%.2f,%.2f,%.2f) T=[%.1f,%.1f,%.1f] hit=%d",
+                        i, blasNOff, blasTOff, bmin[0],bmin[1],bmin[2], bmax[0],bmax[1],bmax[2],
+                        xform[3], xform[7], xform[11], hit ? 1 : 0);
+                }
             }
+            LOG("[BVH2-AABB] Summary: %d/%d hits, %d misses", hits, numInst, misses);
             blasAabbTestCount++;
         }
     }
