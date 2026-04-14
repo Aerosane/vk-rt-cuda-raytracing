@@ -46,6 +46,7 @@
 static thread_local sigjmp_buf g_crashJmpBuf;
 static thread_local volatile sig_atomic_t g_crashGuardActive = 0;
 static std::atomic<uint64_t> g_crashRecoveryCount{0};
+static std::atomic<int> g_suspendedThreadCount{0};  // driver threads currently suspended
 static void installCrashRecovery(); // forward declaration
 
 // Global recovery point: when crashes happen outside a guard region,
@@ -151,71 +152,109 @@ static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
         if (sig == SIGABRT) {
             if (c <= 50) {
                 uint64_t rip = uc ? uc->uc_mcontext.gregs[REG_RIP] : 0;
-                fprintf(stderr, "[CudaRT] ⚠ SUSPEND #%d: SIGABRT RIP=%p tid=%d\n",
-                        c, (void*)rip, (int)syscall(SYS_gettid));
+                fprintf(stderr, "[CudaRT] SIGABRT RIP=%p tid=%d (susp=%d)\n",
+                        (void*)rip, (int)syscall(SYS_gettid),
+                        g_suspendedThreadCount.load(std::memory_order_relaxed));
+            }
+            // Always suspend on SIGABRT (abort() loops otherwise).
+            // Try to claim budget slot via CAS; suspend regardless.
+            {
+                int exp = g_suspendedThreadCount.load(std::memory_order_relaxed);
+                if (exp < 2) g_suspendedThreadCount.compare_exchange_strong(exp, exp + 1);
             }
             for (;;) usleep(1000000);
         }
 
-        // SIGSEGV/SIGBUS/etc: FUNC SKIP with loop detection
-        // Per-thread limit: suspend threads that crash too many times
-        // NOTE: thread_local is NOT async-signal-safe in dlopen'd libs
-        //       (__tls_get_addr takes locks). Use TID-indexed array instead.
+        // SIGSEGV/SIGBUS/etc: FUNC SKIP with loop detection.
+        // KEY: limit total suspended threads to 1. With 2+ suspended,
+        // force-continue via FUNC SKIP or spin-yield instead.
         {
             static std::atomic<int> tidCrashCounts[256] = {};
-            int tid = (int)syscall(SYS_gettid);
-            int slot = (unsigned)tid % 256;
+            int tid3 = (int)syscall(SYS_gettid);
+            int slot = (unsigned)tid3 % 256;
             int tcc = tidCrashCounts[slot].fetch_add(1, std::memory_order_relaxed) + 1;
-            if (tcc > 500 && tid != getpid()) {
-                if (tcc <= 501)
-                    fprintf(stderr, "[CudaRT] ⚠ Thread %d suspended after %d crashes\n",
-                            tid, tcc);
-                // Infinite sleep — zero CPU cost, works from signal handlers
-                for (;;) usleep(1000000);
+            int curSusp = g_suspendedThreadCount.load(std::memory_order_relaxed);
+            bool canSuspend = (curSusp < 2) && (tid3 != getpid());
+
+            if (tcc > 16 && canSuspend) {
+                fprintf(stderr, "[CudaRT] Thread %d suspended after %d crashes (susp %d/2)\n",
+                        tid3, tcc, curSusp + 1);
+                {
+                    int exp = g_suspendedThreadCount.load(std::memory_order_relaxed);
+                    if (exp < 2 && g_suspendedThreadCount.compare_exchange_strong(exp, exp + 1))
+                        for (;;) usleep(1000000);
+                }
             }
         }
-        if (uc && c <= 500) {
+        if (uc && c <= 200) {
             uint64_t rip = uc->uc_mcontext.gregs[REG_RIP];
             uint64_t rsp = uc->uc_mcontext.gregs[REG_RSP];
 
-            // Loop detection: track last return address per thread.
-            // If we keep returning to the same address, skip deeper.
-            // NOTE: Use TID-indexed arrays (async-signal-safe), not thread_local
             static std::atomic<uint64_t> lastReturnArr[256] = {};
             static std::atomic<int> sameReturnCountArr[256] = {};
             int tid2 = (int)syscall(SYS_gettid);
             int slot2 = (unsigned)tid2 % 256;
             uint64_t lastReturn = lastReturnArr[slot2].load(std::memory_order_relaxed);
             int sameReturnCount = sameReturnCountArr[slot2].load(std::memory_order_relaxed);
-            int skipDepth = 0; // how many candidate return addrs to skip
 
-            // Scan stack for return addresses
             uint64_t candidates[32];
             int nCandidates = 0;
+            bool isDriverThread = (tid != (int)getpid());
             for (int i = 0; i < 32 && nCandidates < 32; i++) {
                 uint64_t val = 0;
                 if (!safeReadU64(rsp + i * 8, &val)) continue;
                 uint8_t top = val >> 40;
                 if (top >= 0x55 && top <= 0x7e && val != rip) {
+                    if (isDriverThread && top < 0x70) continue;
                     candidates[nCandidates++] = val;
                 }
             }
 
             if (nCandidates > 0) {
-                // Check if first candidate is the same as last time (loop)
                 if (candidates[0] == lastReturn) {
                     sameReturnCount++;
                     sameReturnCountArr[slot2].store(sameReturnCount, std::memory_order_relaxed);
-                    // Skip deeper: use candidate[N] where N = min(sameReturnCount, nCandidates-1)
-                    skipDepth = sameReturnCount < nCandidates ? sameReturnCount : nCandidates - 1;
+                    if (sameReturnCount >= 3) {
+                        int cs = g_suspendedThreadCount.load(std::memory_order_relaxed);
+                        if (cs < 2 && tid2 != getpid()) {
+                            fprintf(stderr, "[CudaRT] LOOP tid=%d %d same -> suspend (susp %d/2)\n",
+                                    tid2, sameReturnCount, cs + 1);
+                            {
+                                int exp = g_suspendedThreadCount.load(std::memory_order_relaxed);
+                                if (exp < 2 && g_suspendedThreadCount.compare_exchange_strong(exp, exp + 1))
+                                    for (;;) usleep(1000000);
+                            }
+                        }
+                        // Budget full: try alternate candidate
+                        if (nCandidates > 1) {
+                            uint64_t target = candidates[1];
+                            lastReturnArr[slot2].store(target, std::memory_order_relaxed);
+                            sameReturnCountArr[slot2].store(0, std::memory_order_relaxed);
+                            for (int i = 0; i < 32; i++) {
+                                uint64_t val = 0;
+                                if (!safeReadU64(rsp + i * 8, &val)) continue;
+                                if (val == target) {
+                                    uc->uc_mcontext.gregs[REG_RSP] = rsp + (i + 1) * 8;
+                                    uc->uc_mcontext.gregs[REG_RIP] = target;
+                                    uc->uc_mcontext.gregs[REG_RAX] = 0;
+                                    if (c <= 60)
+                                        fprintf(stderr, "[CudaRT] ALT-SKIP #%d: %p tid=%d\n",
+                                                c, (void*)target, tid2);
+                                    return;
+                                }
+                            }
+                        }
+                        sameReturnCountArr[slot2].store(0, std::memory_order_relaxed);
+                        usleep(1000);
+                        return;
+                    }
                 } else {
                     sameReturnCountArr[slot2].store(0, std::memory_order_relaxed);
                 }
 
-                uint64_t target = candidates[skipDepth];
+                uint64_t target = candidates[0];
                 lastReturnArr[slot2].store(target, std::memory_order_relaxed);
 
-                // Find the stack offset for this candidate
                 for (int i = 0; i < 32; i++) {
                     uint64_t val = 0;
                     if (!safeReadU64(rsp + i * 8, &val)) continue;
@@ -223,28 +262,36 @@ static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
                         uc->uc_mcontext.gregs[REG_RSP] = rsp + (i + 1) * 8;
                         uc->uc_mcontext.gregs[REG_RIP] = target;
                         uc->uc_mcontext.gregs[REG_RAX] = 0;
-                        if (c <= 30)
-                            fprintf(stderr, "[CudaRT] ⚠ FUNC SKIP #%d: sig=%d RIP=%p → %p (depth=%d) tid=%d\n",
-                                    c, sig, (void*)rip, (void*)target, skipDepth, (int)syscall(SYS_gettid));
+                        if (c <= 60)
+                            fprintf(stderr, "[CudaRT] SKIP #%d: sig=%d %p -> %p tid=%d\n",
+                                    c, sig, (void*)rip, (void*)target, tid2);
                         return;
                     }
                 }
             }
 
-            // No candidates or search failed — advance RIP by 8
-            uc->uc_mcontext.gregs[REG_RIP] = rip + 8;
-            uc->uc_mcontext.gregs[REG_RAX] = 0;
-            if (c <= 30)
-                fprintf(stderr, "[CudaRT] ⚠ INSN SKIP #%d: sig=%d RIP=%p+8 tid=%d\n",
-                        c, sig, (void*)rip, (int)syscall(SYS_gettid));
-            return;
+            // No candidates
+            {
+                int cs = g_suspendedThreadCount.load(std::memory_order_relaxed);
+                if (cs < 2 && tid != getpid()) {
+                    fprintf(stderr, "[CudaRT] No candidates -> suspend tid=%d (susp %d/2)\n",
+                            tid, cs + 1);
+                    {
+                        int exp = g_suspendedThreadCount.load(std::memory_order_relaxed);
+                        if (exp < 2 && g_suspendedThreadCount.compare_exchange_strong(exp, exp + 1))
+                            for (;;) usleep(1000000);
+                    }
+                }
+                usleep(1000);
+                return;
+            }
         }
 
-        // Too many crashes — suspend
-        for (;;) usleep(1000000);
+        // Fallback: spin-yield
+        usleep(1000);
+        return;
     }
 }
-
 static void installCrashRecovery() {
     // Detect app text range on first call
     static bool rangeDetected = false;
@@ -405,6 +452,7 @@ struct DeviceDispatch {
     PFN_vkUpdateDescriptorSets UpdateDescriptorSets;
     PFN_vkCmdBindDescriptorSets CmdBindDescriptorSets;
     PFN_vkCmdPushConstants CmdPushConstants;
+    PFN_vkCmdPushDescriptorSetKHR CmdPushDescriptorSetKHR;  // bypass descriptor pool validation
     PFN_vkCmdDispatch CmdDispatch;
     PFN_vkCmdDispatchIndirect CmdDispatchIndirect;
     PFN_vkCmdFillBuffer CmdFillBuffer;
@@ -804,9 +852,14 @@ struct BVH2Interop {
     VkDeviceSize trisCapacity;
     VkDeviceSize tlasNodesCapacity;
     VkDeviceSize instancesCapacity;
-    VkDescriptorSetLayout dsLayout;
+    VkDescriptorSetLayout dsLayout;       // 8 bindings: 0-3 + 100-103 (for merged-set case)
+    VkDescriptorSetLayout dsLayoutSimple; // 4 bindings: 0-3 only (for non-merged case)
+    VkDescriptorSetLayout dsLayoutPush;   // push descriptor layout (bypasses descriptor pool entirely)
     VkDescriptorPool descPool;
-    VkDescriptorSet descSet;
+    VkDescriptorPool descPoolSimple;
+    VkDescriptorSet descSet;             // allocated from dsLayout (has 100-103 bindings)
+    VkDescriptorSet descSetSimple;       // allocated from dsLayoutSimple (bindings 0-3 only)
+    bool usePushDescriptors;             // true if push descriptors available
     uint32_t descSetIdx;         // Which descriptor set index (4)
     bool ready;
     int numNodes;
@@ -1077,6 +1130,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_EnumerateDeviceExtensionProperties(
     if (!hidePipeline)
         rtExtNames.push_back("VK_KHR_ray_tracing_pipeline");
 
+    // GPU capability extensions: driver supports the features but may not
+    // advertise the extension strings (V100 driver 580 on Vulkan 1.4)
+    std::vector<const char*> capExtNames = {
+        "VK_EXT_extended_dynamic_state_3",
+        "VK_EXT_robustness_2",
+        "VK_KHR_fragment_shader_barycentric",
+    };
+
     // First call: get driver count
     uint32_t driverCount = 0;
     VkResult res = nextFn(physDev, nullptr, &driverCount, nullptr);
@@ -1123,6 +1184,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_EnumerateDeviceExtensionProperties(
             LOG("  → Injected extension: %s", rtName);
         }
     }
+    }
+
+    // Inject GPU capability extensions (driver has the features, just missing ext strings)
+    for (auto& capName : capExtNames) {
+        if (!hasExt(capName)) {
+            VkExtensionProperties ext{};
+            strncpy(ext.extensionName, capName, VK_MAX_EXTENSION_NAME_SIZE - 1);
+            ext.specVersion = 1;
+            merged.push_back(ext);
+            LOG("  → Injected capability extension: %s", capName);
+        }
     }
 
     uint32_t totalCount = (uint32_t)merged.size();
@@ -1220,6 +1292,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
     if (!hasExternalMemFd) {
         filteredExts.push_back("VK_KHR_external_memory_fd");
         LOG("  → Injecting VK_KHR_external_memory_fd for GPU memory capture");
+    }
+    // Inject VK_KHR_push_descriptor to bypass descriptor pool validation (crash avoidance)
+    {
+        bool hasPushDesc = false;
+        for (auto& e : filteredExts) if (!strcmp(e, "VK_KHR_push_descriptor")) hasPushDesc = true;
+        if (!hasPushDesc) {
+            filteredExts.push_back("VK_KHR_push_descriptor");
+            LOG("  → Injecting VK_KHR_push_descriptor for BVH binding (bypass descriptor pool)");
+        }
     }
 
     // Strip RT feature structs from pNext chain before forwarding to driver.
@@ -1369,6 +1450,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
     LOAD_DEV(UpdateDescriptorSets);
     LOAD_DEV(CmdBindDescriptorSets);
     LOAD_DEV(CmdPushConstants);
+    disp.CmdPushDescriptorSetKHR = (PFN_vkCmdPushDescriptorSetKHR)nextGDPA(*pDevice, "vkCmdPushDescriptorSetKHR");
     LOAD_DEV(CmdDispatch);
     LOAD_DEV(CmdDispatchIndirect);
     LOAD_DEV(CmdFillBuffer);
@@ -3633,9 +3715,12 @@ static bool uploadToExistingBuffer(DeviceDispatch& disp, VkBuffer dstBuf, const 
 // Ensure a buffer has at least `requiredSize` capacity. If insufficient,
 // destroy and recreate. Returns true if buffer is ready.
 static bool ensureBufferCapacity(DeviceDispatch& disp, VkDeviceSize requiredSize,
-                                  VkBuffer& buf, VkDeviceMemory& mem, VkDeviceSize& capacity) {
+                                  VkBuffer& buf, VkDeviceMemory& mem, VkDeviceSize& capacity,
+                                  bool* wasReallocated = nullptr) {
+    if (wasReallocated) *wasReallocated = false;
     if (buf && capacity >= requiredSize) return true;
     
+    if (wasReallocated) *wasReallocated = true;
     if (buf) { disp.DestroyBuffer(disp.device, buf, nullptr); buf = VK_NULL_HANDLE; }
     if (mem) { disp.FreeMemory(disp.device, mem, nullptr); mem = VK_NULL_HANDLE; }
     capacity = 0;
@@ -3732,22 +3817,101 @@ static bool setupBVH2Descriptors(DeviceDispatch& disp) {
 
     LOG("[BVH2] Descriptor set layout + pool + set created (8 bindings: 0-3 + 100-103)");
 
+    // Simple layout: bindings 0-3 only (for non-merged pipelines).
+    // Avoids V100 driver overhead from sparse high binding numbers (100-103).
+    {
+        VkDescriptorSetLayoutBinding simpleBindings[4] = {};
+        for (int i = 0; i < 4; i++) {
+            simpleBindings[i].binding = i;
+            simpleBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            simpleBindings[i].descriptorCount = 1;
+            simpleBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo simCI = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        simCI.bindingCount = 4;
+        simCI.pBindings = simpleBindings;
+        if (disp.CreateDescriptorSetLayout(disp.device, &simCI, nullptr, &g_bvh2.dsLayoutSimple) != VK_SUCCESS) {
+            LOG("[BVH2] WARN: Failed to create simple descriptor set layout, using full layout");
+            g_bvh2.dsLayoutSimple = g_bvh2.dsLayout;
+        } else {
+            // Pool + set for simple layout
+            VkDescriptorPoolSize simPoolSz = {VK_DESCRIPTOR_TYPE_STORAGE_BUFFER, 4};
+            VkDescriptorPoolCreateInfo simPoolCI = {VK_STRUCTURE_TYPE_DESCRIPTOR_POOL_CREATE_INFO};
+            simPoolCI.maxSets = 1;
+            simPoolCI.poolSizeCount = 1;
+            simPoolCI.pPoolSizes = &simPoolSz;
+            if (disp.CreateDescriptorPool(disp.device, &simPoolCI, nullptr, &g_bvh2.descPoolSimple) != VK_SUCCESS) {
+                g_bvh2.dsLayoutSimple = g_bvh2.dsLayout;
+                g_bvh2.descSetSimple = g_bvh2.descSet;
+            } else {
+                VkDescriptorSetAllocateInfo simAI = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_ALLOCATE_INFO};
+                simAI.descriptorPool = g_bvh2.descPoolSimple;
+                simAI.descriptorSetCount = 1;
+                simAI.pSetLayouts = &g_bvh2.dsLayoutSimple;
+                if (disp.AllocateDescriptorSets(disp.device, &simAI, &g_bvh2.descSetSimple) != VK_SUCCESS) {
+                    g_bvh2.dsLayoutSimple = g_bvh2.dsLayout;
+                    g_bvh2.descSetSimple = g_bvh2.descSet;
+                } else {
+                    LOG("[BVH2] Simple descriptor set created (4 bindings: 0-3 only)");
+                }
+            }
+        }
+    }
+
+    // Push descriptor layout: same 4 bindings but with PUSH_DESCRIPTOR flag.
+    // Push descriptors bypass the entire descriptor pool/set allocation path in the
+    // driver, avoiding the descriptor validation crash that kills driver worker threads.
+    // Push descriptors: disabled by default (V100 driver push desc path is less stable).
+    // Enable with CUDA_RT_PUSH_DESC=1 for testing.
+    g_bvh2.usePushDescriptors = false;
+    g_bvh2.dsLayoutPush = VK_NULL_HANDLE;
+    {
+        const char* pd = getenv("CUDA_RT_PUSH_DESC");
+        bool wantPush = (pd && atoi(pd));
+        if (wantPush && disp.CmdPushDescriptorSetKHR) {
+        VkDescriptorSetLayoutBinding pushBindings[4] = {};
+        for (int i = 0; i < 4; i++) {
+            pushBindings[i].binding = i;
+            pushBindings[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            pushBindings[i].descriptorCount = 1;
+            pushBindings[i].stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+        }
+        VkDescriptorSetLayoutCreateInfo pushCI = {VK_STRUCTURE_TYPE_DESCRIPTOR_SET_LAYOUT_CREATE_INFO};
+        pushCI.flags = VK_DESCRIPTOR_SET_LAYOUT_CREATE_PUSH_DESCRIPTOR_BIT_KHR;
+        pushCI.bindingCount = 4;
+        pushCI.pBindings = pushBindings;
+        if (disp.CreateDescriptorSetLayout(disp.device, &pushCI, nullptr, &g_bvh2.dsLayoutPush) == VK_SUCCESS) {
+            g_bvh2.usePushDescriptors = true;
+            LOG("[BVH2] Push descriptor layout created (bypasses descriptor pool entirely)");
+        } else {
+            LOG("[BVH2] WARN: Push descriptor layout failed, will use regular descriptor sets");
+        }
+        }
+    }
+
     // Pre-allocate LARGE BVH buffers (4MB each) so they can be bound during command
     // recording BEFORE real BVH data is available. Fill with null-safe data (huge AABB +
     // skip=-1) so shaders that run before upload will exit traversal immediately.
     // When real BVH data arrives, we overwrite buffer CONTENTS via staging copy — 
     // the descriptor set never changes, so pre-recorded command buffers see the new data.
     {
-        const VkDeviceSize PREALLOC = 4 * 1024 * 1024; // 4MB per buffer
+        // Pre-allocate LARGE buffers to avoid reallocation.
+        // Breaking Limit: nodes=153MB, tris=245MB, tlas=384KB, instances=864KB.
+        // Over-allocate to avoid descriptor set invalidation on buffer realloc.
+        const VkDeviceSize PREALLOC_LARGE = 256 * 1024 * 1024; // 256MB for nodes/tris
+        const VkDeviceSize PREALLOC_SMALL = 4 * 1024 * 1024;   // 4MB for tlas/instances
         
         // Allocate all 4 buffers
-        if (!ensureBufferCapacity(disp, PREALLOC, g_bvh2.nodesBuf, g_bvh2.nodesMem, g_bvh2.nodesCapacity) ||
-            !ensureBufferCapacity(disp, PREALLOC, g_bvh2.trisBuf, g_bvh2.trisMem, g_bvh2.trisCapacity) ||
-            !ensureBufferCapacity(disp, PREALLOC, g_bvh2.tlasNodesBuf, g_bvh2.tlasNodesMem, g_bvh2.tlasNodesCapacity) ||
-            !ensureBufferCapacity(disp, PREALLOC, g_bvh2.instancesBuf, g_bvh2.instancesMem, g_bvh2.instancesCapacity)) {
-            LOG("[BVH2] Failed to pre-allocate BVH buffers (%zu MB each)", (size_t)(PREALLOC/1024/1024));
+        if (!ensureBufferCapacity(disp, PREALLOC_LARGE, g_bvh2.nodesBuf, g_bvh2.nodesMem, g_bvh2.nodesCapacity) ||
+            !ensureBufferCapacity(disp, PREALLOC_LARGE, g_bvh2.trisBuf, g_bvh2.trisMem, g_bvh2.trisCapacity) ||
+            !ensureBufferCapacity(disp, PREALLOC_SMALL, g_bvh2.tlasNodesBuf, g_bvh2.tlasNodesMem, g_bvh2.tlasNodesCapacity) ||
+            !ensureBufferCapacity(disp, PREALLOC_SMALL, g_bvh2.instancesBuf, g_bvh2.instancesMem, g_bvh2.instancesCapacity)) {
+            LOG("[BVH2] Failed to pre-allocate BVH buffers");
             return false;
         }
+        LOG("[BVH2] Pre-allocated: nodes=%zuMB tris=%zuMB tlas=%zuMB inst=%zuMB",
+            (size_t)(g_bvh2.nodesCapacity/1024/1024), (size_t)(g_bvh2.trisCapacity/1024/1024),
+            (size_t)(g_bvh2.tlasNodesCapacity/1024/1024), (size_t)(g_bvh2.instancesCapacity/1024/1024));
         
         // Upload null-safe data to each buffer
         // 4 null nodes: AABB = (1e30..1e30) → never hit, skip=-1 → immediate exit
@@ -3791,9 +3955,21 @@ static bool setupBVH2Descriptors(DeviceDispatch& disp) {
             writes[i].pBufferInfo = &bufs[i % 4]; // same 4 buffers for both ranges
         }
         disp.UpdateDescriptorSets(disp.device, 8, writes, 0, nullptr);
+        // Also update simple descriptor set (bindings 0-3 only)
+        if (g_bvh2.descSetSimple && g_bvh2.descSetSimple != g_bvh2.descSet) {
+            VkWriteDescriptorSet simWrites[4] = {};
+            for (int i = 0; i < 4; i++) {
+                simWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                simWrites[i].dstSet = g_bvh2.descSetSimple;
+                simWrites[i].dstBinding = i;
+                simWrites[i].descriptorCount = 1;
+                simWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                simWrites[i].pBufferInfo = &bufs[i];
+            }
+            disp.UpdateDescriptorSets(disp.device, 4, simWrites, 0, nullptr);
+        }
         g_bvh2.descSetIdx = 4;
-        LOG("[BVH2] Pre-allocated BVH buffers (%zu MB each) with null-safe data + VK_WHOLE_SIZE descriptors (bind 0-3 + 100-103)",
-            (size_t)(PREALLOC/1024/1024));
+        LOG("[BVH2] Pre-allocated BVH buffers with null-safe data + VK_WHOLE_SIZE descriptors (bind 0-3 + 100-103)");
     }
 
     return true;
@@ -3958,13 +4134,22 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
     VkDeviceSize trisSize = (VkDeviceSize)allTris.size() * sizeof(float);
     bool needDescUpdate = false;
     
-    if (!ensureBufferCapacity(disp, nodesSize, g_bvh2.nodesBuf, g_bvh2.nodesMem, g_bvh2.nodesCapacity)) {
+    // Track if any buffer was reallocated (new VkBuffer handle) — if so, we MUST
+    // update descriptor sets because they reference the old destroyed buffer handles.
+    bool reallocNodes = false, reallocTris = false;
+    
+    if (!ensureBufferCapacity(disp, nodesSize, g_bvh2.nodesBuf, g_bvh2.nodesMem, g_bvh2.nodesCapacity, &reallocNodes)) {
         LOG("[BVH2] Failed to ensure nodes buffer capacity (%zu bytes)", (size_t)nodesSize);
         return false;
     }
-    if (!ensureBufferCapacity(disp, trisSize, g_bvh2.trisBuf, g_bvh2.trisMem, g_bvh2.trisCapacity)) {
+    if (!ensureBufferCapacity(disp, trisSize, g_bvh2.trisBuf, g_bvh2.trisMem, g_bvh2.trisCapacity, &reallocTris)) {
         LOG("[BVH2] Failed to ensure tris buffer capacity (%zu bytes)", (size_t)trisSize);
         return false;
+    }
+    if (reallocNodes || reallocTris) {
+        needDescUpdate = true;
+        LOG("[BVH2] Buffer reallocation detected (nodes=%d, tris=%d) — descriptor update needed",
+            (int)reallocNodes, (int)reallocTris);
     }
     
     // Upload BLAS nodes + tris into existing buffers via staging copy
@@ -3989,9 +4174,11 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
         numTlasNodes = cudaBVH_getStacklessBVH2(g_tlasBVH, &tlasNodeData);
         if (tlasNodeData && numTlasNodes > 0) {
             tlasNodesSize = (VkDeviceSize)numTlasNodes * 8 * sizeof(uint32_t);
-            if (!ensureBufferCapacity(disp, tlasNodesSize, g_bvh2.tlasNodesBuf, g_bvh2.tlasNodesMem, g_bvh2.tlasNodesCapacity)) {
+            bool reallocTlas = false;
+            if (!ensureBufferCapacity(disp, tlasNodesSize, g_bvh2.tlasNodesBuf, g_bvh2.tlasNodesMem, g_bvh2.tlasNodesCapacity, &reallocTlas)) {
                 LOG("[BVH2] Failed to ensure TLAS nodes capacity"); return false;
             }
+            if (reallocTlas) needDescUpdate = true;
             if (!uploadToExistingBuffer(disp, g_bvh2.tlasNodesBuf, tlasNodeData, tlasNodesSize)) {
                 LOG("[BVH2] Failed to upload TLAS nodes"); return false;
             }
@@ -4041,9 +4228,11 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
                 dst[35] = (float)(gi.instanceMask | (gi.instanceFlags << 8));
             }
         }
-        if (!ensureBufferCapacity(disp, instancesSize, g_bvh2.instancesBuf, g_bvh2.instancesMem, g_bvh2.instancesCapacity)) {
+        bool reallocInst = false;
+        if (!ensureBufferCapacity(disp, instancesSize, g_bvh2.instancesBuf, g_bvh2.instancesMem, g_bvh2.instancesCapacity, &reallocInst)) {
             LOG("[BVH2] Failed to ensure instances capacity"); return false;
         }
+        if (reallocInst) needDescUpdate = true;
         if (!uploadToExistingBuffer(disp, g_bvh2.instancesBuf, instPacked.data(), instancesSize)) {
             LOG("[BVH2] Failed to upload instances"); return false;
         }
@@ -4071,8 +4260,43 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
         uploadToExistingBuffer(disp, g_bvh2.instancesBuf, dummy, instancesSize);
     }
 
-    // No need to update descriptor set — it uses VK_WHOLE_SIZE on the same buffer handles.
-    // Buffer contents are updated in-place, visible to GPU at next execution.
+    // Update descriptor sets if any buffer handle changed (reallocation).
+    // Without this, the GPU reads from destroyed buffer handles → USE-AFTER-FREE crash.
+    if (needDescUpdate) {
+        LOG("[BVH2] Updating descriptor sets after buffer reallocation");
+        VkDescriptorBufferInfo bufs[4] = {
+            {g_bvh2.nodesBuf,       0, VK_WHOLE_SIZE},
+            {g_bvh2.trisBuf,        0, VK_WHOLE_SIZE},
+            {g_bvh2.tlasNodesBuf,   0, VK_WHOLE_SIZE},
+            {g_bvh2.instancesBuf,   0, VK_WHOLE_SIZE},
+        };
+        // Update full layout descriptor set (bindings 0-3 + 100-103)
+        const uint32_t bindNums[8] = {0, 1, 2, 3, 100, 101, 102, 103};
+        VkWriteDescriptorSet writes[8] = {};
+        for (int i = 0; i < 8; i++) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = g_bvh2.descSet;
+            writes[i].dstBinding = bindNums[i];
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &bufs[i % 4];
+        }
+        disp.UpdateDescriptorSets(disp.device, 8, writes, 0, nullptr);
+        // Update simple layout descriptor set (bindings 0-3 only)
+        if (g_bvh2.descSetSimple && g_bvh2.descSetSimple != g_bvh2.descSet) {
+            VkWriteDescriptorSet simWrites[4] = {};
+            for (int i = 0; i < 4; i++) {
+                simWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                simWrites[i].dstSet = g_bvh2.descSetSimple;
+                simWrites[i].dstBinding = i;
+                simWrites[i].descriptorCount = 1;
+                simWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                simWrites[i].pBufferInfo = &bufs[i];
+            }
+            disp.UpdateDescriptorSets(disp.device, 4, simWrites, 0, nullptr);
+        }
+        LOG("[BVH2] Descriptor sets updated with new buffer handles");
+    }
 
     g_bvh2.numNodes = totalNodes;
     g_bvh2.numTriVec4s = totalTriVec4s;
@@ -4138,13 +4362,16 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
         numTlasNodes = cudaBVH_getStacklessBVH2(g_tlasBVH, &tlasNodeData);
     }
     VkDeviceSize tlasNodesSize = 0;
+    bool needDescUpdate = false;
+    bool reallocTlas2 = false;
     if (tlasNodeData && numTlasNodes > 0) {
         tlasNodesSize = (VkDeviceSize)numTlasNodes * 8 * sizeof(uint32_t);
         LOG("[BVH2] reupload: TLAS nodes %d → %lu bytes", numTlasNodes, (unsigned long)tlasNodesSize);
-        if (!ensureBufferCapacity(disp, tlasNodesSize, g_bvh2.tlasNodesBuf, g_bvh2.tlasNodesMem, g_bvh2.tlasNodesCapacity)) {
+        if (!ensureBufferCapacity(disp, tlasNodesSize, g_bvh2.tlasNodesBuf, g_bvh2.tlasNodesMem, g_bvh2.tlasNodesCapacity, &reallocTlas2)) {
             LOG("[BVH2] TLAS reupload: failed to ensure TLAS nodes capacity");
             return false;
         }
+        if (reallocTlas2) needDescUpdate = true;
         if (!uploadToExistingBuffer(disp, g_bvh2.tlasNodesBuf, tlasNodeData, tlasNodesSize)) {
             LOG("[BVH2] TLAS reupload: failed to upload TLAS nodes");
             return false;
@@ -4210,17 +4437,51 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
                     gi.transform[3], gi.transform[7], gi.transform[11]);
         }
     }
-    if (!ensureBufferCapacity(disp, instancesSize, g_bvh2.instancesBuf, g_bvh2.instancesMem, g_bvh2.instancesCapacity)) {
+    bool reallocInst2 = false;
+    if (!ensureBufferCapacity(disp, instancesSize, g_bvh2.instancesBuf, g_bvh2.instancesMem, g_bvh2.instancesCapacity, &reallocInst2)) {
         LOG("[BVH2] TLAS reupload: failed to ensure instances capacity");
         return false;
     }
+    if (reallocInst2) needDescUpdate = true;
     LOG("[BVH2] reupload: instances buffer ready, uploading %lu bytes", (unsigned long)instancesSize);
     if (!uploadToExistingBuffer(disp, g_bvh2.instancesBuf, instPacked.data(), instancesSize)) {
         LOG("[BVH2] TLAS reupload: failed to upload instances");
         return false;
     }
 
-    // No descriptor update needed — VK_WHOLE_SIZE covers the full buffer
+    // Update descriptor sets if any buffer handle changed
+    if (needDescUpdate) {
+        LOG("[BVH2] TLAS reupload: updating descriptor sets after buffer reallocation");
+        VkDescriptorBufferInfo bufs[4] = {
+            {g_bvh2.nodesBuf,       0, VK_WHOLE_SIZE},
+            {g_bvh2.trisBuf,        0, VK_WHOLE_SIZE},
+            {g_bvh2.tlasNodesBuf,   0, VK_WHOLE_SIZE},
+            {g_bvh2.instancesBuf,   0, VK_WHOLE_SIZE},
+        };
+        const uint32_t bindNums[8] = {0, 1, 2, 3, 100, 101, 102, 103};
+        VkWriteDescriptorSet writes[8] = {};
+        for (int i = 0; i < 8; i++) {
+            writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+            writes[i].dstSet = g_bvh2.descSet;
+            writes[i].dstBinding = bindNums[i];
+            writes[i].descriptorCount = 1;
+            writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+            writes[i].pBufferInfo = &bufs[i % 4];
+        }
+        disp.UpdateDescriptorSets(disp.device, 8, writes, 0, nullptr);
+        if (g_bvh2.descSetSimple && g_bvh2.descSetSimple != g_bvh2.descSet) {
+            VkWriteDescriptorSet simWrites[4] = {};
+            for (int i = 0; i < 4; i++) {
+                simWrites[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+                simWrites[i].dstSet = g_bvh2.descSetSimple;
+                simWrites[i].dstBinding = i;
+                simWrites[i].descriptorCount = 1;
+                simWrites[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+                simWrites[i].pBufferInfo = &bufs[i];
+            }
+            disp.UpdateDescriptorSets(disp.device, 4, simWrites, 0, nullptr);
+        }
+    }
 
     g_bvh2.numTlasNodes = numTlasNodes;
     g_bvh2.numInstances = numInst;
@@ -5426,8 +5687,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateComputePipelines(
                 sets[bvhSet] = g_bvh2.dsLayout;
             }
         } else {
-            // Normal case: BVH set is beyond the app's range, just use our layout
-            sets[bvhSet] = g_bvh2.dsLayout;
+            // Normal case: BVH set is beyond the app's range — use PUSH layout
+            // (bindings 0-3 only) when available, else fall back to simple layout
+            if (g_bvh2.usePushDescriptors && g_bvh2.dsLayoutPush)
+                sets[bvhSet] = g_bvh2.dsLayoutPush;
+            else
+                sets[bvhSet] = g_bvh2.dsLayoutSimple ? g_bvh2.dsLayoutSimple : g_bvh2.dsLayout;
         }
 
         VkPipelineLayoutCreateInfo plCI = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -5584,7 +5849,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateGraphicsPipelines(
                 sets[bvhSet] = g_bvh2.dsLayout;
             }
         } else {
-            sets[bvhSet] = g_bvh2.dsLayout;
+            if (g_bvh2.usePushDescriptors && g_bvh2.dsLayoutPush)
+                sets[bvhSet] = g_bvh2.dsLayoutPush;
+            else
+                sets[bvhSet] = g_bvh2.dsLayoutSimple ? g_bvh2.dsLayoutSimple : g_bvh2.dsLayout;
         }
 
         VkPipelineLayoutCreateInfo plCI = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
@@ -6574,6 +6842,9 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdEndRenderPass(
 // ═══════════════════════════════════════════
 // Intercepted: CmdBindPipeline — track compute pipeline + RT no-op
 // ═══════════════════════════════════════════
+static bool pushBVH2Descriptors(DeviceDispatch& disp, VkCommandBuffer cmdBuf,
+                                 VkPipelineBindPoint bindPoint, VkPipelineLayout layout,
+                                 uint32_t bvhSetIdx);
 static VKAPI_ATTR void VKAPI_CALL layer_CmdBindPipeline(
     VkCommandBuffer cmdBuf,
     VkPipelineBindPoint bindPoint,
@@ -6610,7 +6881,8 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindPipeline(
     {
     static int noBvhBind2 = -1;
     if (noBvhBind2 < 0) { const char* e = getenv("CUDA_RT_NO_BVH_BIND"); noBvhBind2 = (e && atoi(e)) ? 1 : 0; }
-    if (!noBvhBind2 && bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS && g_bvh2.descSet && g_bvh2.ready) {
+    if (!noBvhBind2 && bindPoint == VK_PIPELINE_BIND_POINT_GRAPHICS && g_bvh2.descSet && g_bvh2.ready
+        && g_suspendedThreadCount.load(std::memory_order_relaxed) < 2) {
         auto it = g_rqPipelines.find((uint64_t)pipeline);
         if (it != g_rqPipelines.end() && !it->second.isMergedSet) {
             VkPipelineLayout layout = it->second.layout;
@@ -6618,9 +6890,13 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindPipeline(
             if (layout && bvhSetIdx < 32) {
                 void* k2 = getKey(cmdBuf);
                 auto& d2 = g_deviceMap[k2];
-                d2.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_GRAPHICS,
-                                          layout, bvhSetIdx, 1,
-                                          &g_bvh2.descSet, 0, nullptr);
+                if (!pushBVH2Descriptors(d2, cmdBuf, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, bvhSetIdx)) {
+                    VkDescriptorSet bindSet = (g_bvh2.descSetSimple && g_bvh2.descSetSimple != g_bvh2.descSet)
+                                              ? g_bvh2.descSetSimple : g_bvh2.descSet;
+                    d2.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_GRAPHICS,
+                                              layout, bvhSetIdx, 1,
+                                              &bindSet, 0, nullptr);
+                }
             }
         }
     }
@@ -7720,6 +7996,36 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
     return pDisp->QueuePresentKHR(queue, pPresentInfo);
 }
 
+// Push BVH descriptor buffers directly into command buffer (bypasses descriptor pool entirely).
+// Returns true if push was done, false if fallback to CmdBindDescriptorSets needed.
+static bool pushBVH2Descriptors(DeviceDispatch& disp, VkCommandBuffer cmdBuf,
+                                 VkPipelineBindPoint bindPoint, VkPipelineLayout layout,
+                                 uint32_t bvhSetIdx)
+{
+    if (!g_bvh2.usePushDescriptors || !disp.CmdPushDescriptorSetKHR)
+        return false;
+    if (!g_bvh2.nodesBuf || !g_bvh2.trisBuf || !g_bvh2.tlasNodesBuf || !g_bvh2.instancesBuf)
+        return false;
+
+    VkDescriptorBufferInfo bufInfos[4] = {};
+    bufInfos[0] = {g_bvh2.nodesBuf, 0, VK_WHOLE_SIZE};
+    bufInfos[1] = {g_bvh2.trisBuf, 0, VK_WHOLE_SIZE};
+    bufInfos[2] = {g_bvh2.tlasNodesBuf, 0, VK_WHOLE_SIZE};
+    bufInfos[3] = {g_bvh2.instancesBuf, 0, VK_WHOLE_SIZE};
+
+    VkWriteDescriptorSet writes[4] = {};
+    for (int i = 0; i < 4; i++) {
+        writes[i].sType = VK_STRUCTURE_TYPE_WRITE_DESCRIPTOR_SET;
+        writes[i].dstBinding = i;
+        writes[i].descriptorCount = 1;
+        writes[i].descriptorType = VK_DESCRIPTOR_TYPE_STORAGE_BUFFER;
+        writes[i].pBufferInfo = &bufInfos[i];
+    }
+
+    disp.CmdPushDescriptorSetKHR(cmdBuf, bindPoint, layout, bvhSetIdx, 4, writes);
+    return true;
+}
+
 static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
     VkCommandBuffer cmdBuf,
     uint32_t groupCountX,
@@ -7809,18 +8115,19 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
                             LOG("[BVH-BIND] MERGED-SET: skipping bind for set=%u (shader uses high bindings 100-103)", bvhSetIdx);
                         }
                     } else {
+                        // Non-merged: prefer push descriptors (bypass descriptor pool)
+                        if (!pushBVH2Descriptors(disp, cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, layout, bvhSetIdx)) {
+                            VkDescriptorSet bindSet = (g_bvh2.descSetSimple && g_bvh2.descSetSimple != g_bvh2.descSet)
+                                                      ? g_bvh2.descSetSimple : g_bvh2.descSet;
+                            disp.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                        layout, bvhSetIdx, 1,
+                                                        &bindSet, 0, nullptr);
+                        }
                         static int bindLog = 0;
                         if (bindLog < 20) {
-                            LOG("[BVH-BIND] PRE-BIND: set=%u layout=%p descSet=%p pipe=0x%lx ready=%d", 
-                                bvhSetIdx, (void*)layout, (void*)g_bvh2.descSet, pipeHandle, (int)g_bvh2.ready);
-                        }
-                        // Bind BVH2 descriptor set at the rewriter's chosen set index
-                        disp.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                                    layout, bvhSetIdx, 1,
-                                                    &g_bvh2.descSet, 0, nullptr);
-                        if (bindLog < 20) {
                             bindLog++;
-                            LOG("[BVH-BIND] POST-BIND: set=%u OK", bvhSetIdx);
+                            LOG("[BVH-BIND] set=%u layout=%p push=%d pipe=0x%lx ready=%d",
+                                bvhSetIdx, (void*)layout, (int)g_bvh2.usePushDescriptors, pipeHandle, (int)g_bvh2.ready);
                         }
                     }
                 } else {
@@ -7854,6 +8161,21 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
             return;
         }
         if (halfRes >= 3) return; // NOP: skip RT dispatch entirely
+        // Dynamic driver health check: skip RT dispatches when too many driver threads
+        // are suspended. 2+ suspended threads = locks held forever = deadlock on next submit.
+        // This lets the benchmark continue with rasterization-only rendering.
+        {
+            int susp = g_suspendedThreadCount.load(std::memory_order_relaxed);
+            if (susp >= 2) {
+                static int healthSkipLog = 0;
+                if (healthSkipLog < 5) {
+                    healthSkipLog++;
+                    LOG("[RQ-DISP] Skipping dispatch (driver health: %d threads suspended) grid=(%u,%u,%u)",
+                        susp, groupCountX, groupCountY, groupCountZ);
+                }
+                return;
+            }
+        }
         if (halfRes >= 2) { dispX = (dispX + 1) / 2; dispY = (dispY + 1) / 2; }
         else if (halfRes >= 1) { dispY = (dispY + 1) / 2; }
 
@@ -7908,14 +8230,24 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatchIndirect(
                 VkPipelineLayout layout = it->second.layout;
                 uint32_t bvhSetIdx = (uint32_t)it->second.bvhDescSet;
                 if (layout && g_bvh2.descSet) {
-                    disp.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
-                                                layout, bvhSetIdx, 1,
-                                                &g_bvh2.descSet, 0, nullptr);
+                    bool merged = it->second.isMergedSet;
+                    if (!merged && !pushBVH2Descriptors(disp, cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, layout, bvhSetIdx)) {
+                        VkDescriptorSet bindSet = (g_bvh2.descSetSimple && g_bvh2.descSetSimple != g_bvh2.descSet)
+                                                  ? g_bvh2.descSetSimple : g_bvh2.descSet;
+                        disp.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                    layout, bvhSetIdx, 1,
+                                                    &bindSet, 0, nullptr);
+                    } else if (merged) {
+                        disp.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
+                                                    layout, bvhSetIdx, 1,
+                                                    &g_bvh2.descSet, 0, nullptr);
+                    }
                 }
                 // Apply same HALF_RES NOP logic
                 static int halfRes2 = -1;
                 if (halfRes2 < 0) { const char* e = getenv("CUDA_RT_HALF_RES"); halfRes2 = e ? atoi(e) : 0; }
                 if (halfRes2 >= 3) return;
+                if (g_suspendedThreadCount.load(std::memory_order_relaxed) >= 2) return;
             }
         }
     }
