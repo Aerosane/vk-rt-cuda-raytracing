@@ -440,7 +440,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
     uint32_t c6 = newId(), c7 = newId(), c8 = newId(), c9 = newId(), c10 = newId();
     uint32_t cf0 = newId(), cf_huge = newId();
     // Additional constants for traversal
-    uint32_t cu0 = newId(), cu1 = newId(), cu2 = newId(), cu3 = newId(), cu7 = newId();
+    uint32_t cu0 = newId(), cu1 = newId(), cu2 = newId(), cu3 = newId(), cu4 = newId(), cu7 = newId();
     uint32_t cu8 = newId(), cu16 = newId(), cu32 = newId(), cu255 = newId(); // bit ops + cull flags
     uint32_t cf1 = newId(), cfn1 = newId(); // float 1.0, float -1.0
     float tiny = 1e-8f; uint32_t cf_tiny = newId();
@@ -1149,6 +1149,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             E(SpvOpConstant, {tUint, cu1, 1});
             E(SpvOpConstant, {tUint, cu2, 2});
             E(SpvOpConstant, {tUint, cu3, 3});
+            E(SpvOpConstant, {tUint, cu4, 4});   // TerminateOnFirstHit flag
             E(SpvOpConstant, {tUint, cu7, 7});
             E(SpvOpConstant, {tUint, cu8, 8});   // shift amount for packed mask/flags
             E(SpvOpConstant, {tUint, cu16, 16}); // CullBackFace flag
