@@ -47,6 +47,10 @@ static thread_local sigjmp_buf g_crashJmpBuf;
 static thread_local volatile sig_atomic_t g_crashGuardActive = 0;
 static std::atomic<uint64_t> g_crashRecoveryCount{0};
 static std::atomic<int> g_suspendedThreadCount{0};  // driver threads currently suspended
+static std::atomic<bool> g_rtDisabled{false};        // permanently disable RT after driver crash
+static bool g_noBvh = false;                          // CUDA_RT_NO_BVH=1: skip all BVH operations
+static thread_local int g_threadCrashCount = 0;       // per-thread FUNC SKIP counter
+static volatile uint32_t g_presentCount = 0;           // monotonic frame counter (volatile for cross-thread visibility)
 static void installCrashRecovery(); // forward declaration
 
 // Global recovery point: when crashes happen outside a guard region,
@@ -96,6 +100,14 @@ static bool safeReadU64(uint64_t addr, uint64_t* out) {
         }
     }
     return false;
+}
+
+// Trampoline: signal handler redirects here for clean thread exit from normal context.
+// pthread_exit from normal context is safe (unlike from signal handler).
+static void __attribute__((noreturn, noinline)) crashThreadTrampoline() {
+    fprintf(stderr, "[CudaRT] TRAMPOLINE: tid=%d — clean pthread_exit\n", (int)syscall(SYS_gettid));
+    pthread_exit(NULL);
+    __builtin_unreachable();
 }
 
 static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
@@ -165,131 +177,68 @@ static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
             for (;;) usleep(1000000);
         }
 
-        // SIGSEGV/SIGBUS/etc: FUNC SKIP with loop detection.
-        // KEY: limit total suspended threads to 1. With 2+ suspended,
-        // force-continue via FUNC SKIP or spin-yield instead.
+        // SIGSEGV/SIGBUS in driver worker thread.
+        // Strategy: FUNC SKIP to release driver locks + g_rtDisabled to prevent new crashes.
+        // After too many SKIPs on same thread → pthread_exit (mimics test9 success pattern).
         {
-            static std::atomic<int> tidCrashCounts[256] = {};
-            int tid3 = (int)syscall(SYS_gettid);
-            int slot = (unsigned)tid3 % 256;
-            int tcc = tidCrashCounts[slot].fetch_add(1, std::memory_order_relaxed) + 1;
-            int curSusp = g_suspendedThreadCount.load(std::memory_order_relaxed);
-            bool canSuspend = (curSusp < 2) && (tid3 != getpid());
-
-            if (tcc > 16 && canSuspend) {
-                fprintf(stderr, "[CudaRT] Thread %d suspended after %d crashes (susp %d/2)\n",
-                        tid3, tcc, curSusp + 1);
-                {
-                    int exp = g_suspendedThreadCount.load(std::memory_order_relaxed);
-                    if (exp < 2 && g_suspendedThreadCount.compare_exchange_strong(exp, exp + 1))
-                        for (;;) usleep(1000000);
-                }
+            // Mark driver as unstable — permanently disable RT dispatches
+            if (!g_rtDisabled.load(std::memory_order_relaxed)) {
+                g_rtDisabled.store(true, std::memory_order_relaxed);
+                fprintf(stderr, "[CudaRT] ⚠ DRIVER CRASH sig=%d tid=%d — RT dispatches permanently disabled\n",
+                        sig, (int)syscall(SYS_gettid));
             }
-        }
-        if (uc && c <= 200) {
-            uint64_t rip = uc->uc_mcontext.gregs[REG_RIP];
-            uint64_t rsp = uc->uc_mcontext.gregs[REG_RSP];
 
-            static std::atomic<uint64_t> lastReturnArr[256] = {};
-            static std::atomic<int> sameReturnCountArr[256] = {};
+            g_threadCrashCount++;
             int tid2 = (int)syscall(SYS_gettid);
-            int slot2 = (unsigned)tid2 % 256;
-            uint64_t lastReturn = lastReturnArr[slot2].load(std::memory_order_relaxed);
-            int sameReturnCount = sameReturnCountArr[slot2].load(std::memory_order_relaxed);
 
-            uint64_t candidates[32];
-            int nCandidates = 0;
-            bool isDriverThread = (tid != (int)getpid());
-            for (int i = 0; i < 32 && nCandidates < 32; i++) {
-                uint64_t val = 0;
-                if (!safeReadU64(rsp + i * 8, &val)) continue;
-                uint8_t top = val >> 40;
-                if (top >= 0x55 && top <= 0x7e && val != rip) {
-                    if (isDriverThread && top < 0x70) continue;
-                    candidates[nCandidates++] = val;
+            // After 20 FUNC SKIPs on this thread, it's in a loop.
+            // During init (Frame 0): PARK thread (test18 got Frame 19 with this).
+            // After init: trampoline pthread_exit (releases locks cleanly).
+            if (g_threadCrashCount > 20 && uc) {
+                int exp = g_suspendedThreadCount.load(std::memory_order_relaxed);
+                if (exp < 4) g_suspendedThreadCount.compare_exchange_strong(exp, exp + 1);
+
+                if (g_presentCount > 0) {
+                    fprintf(stderr, "[CudaRT] THREAD EXIT: tid=%d after %d crashes (frame %u) — trampoline\n",
+                            tid2, g_threadCrashCount, g_presentCount);
+                    uc->uc_mcontext.gregs[REG_RIP] = (uint64_t)(void*)&crashThreadTrampoline;
+                    uc->uc_mcontext.gregs[REG_RSP] = (uc->uc_mcontext.gregs[REG_RSP] & ~0xFULL) - 128;
+                    return;
+                } else {
+                    if (g_threadCrashCount == 21)
+                        fprintf(stderr, "[CudaRT] THREAD PARK: tid=%d after %d crashes (still in init) — suspending\n",
+                                tid2, g_threadCrashCount);
+                    for (;;) usleep(1000000);
                 }
             }
 
-            if (nCandidates > 0) {
-                if (candidates[0] == lastReturn) {
-                    sameReturnCount++;
-                    sameReturnCountArr[slot2].store(sameReturnCount, std::memory_order_relaxed);
-                    if (sameReturnCount >= 3) {
-                        int cs = g_suspendedThreadCount.load(std::memory_order_relaxed);
-                        if (cs < 2 && tid2 != getpid()) {
-                            fprintf(stderr, "[CudaRT] LOOP tid=%d %d same -> suspend (susp %d/2)\n",
-                                    tid2, sameReturnCount, cs + 1);
-                            {
-                                int exp = g_suspendedThreadCount.load(std::memory_order_relaxed);
-                                if (exp < 2 && g_suspendedThreadCount.compare_exchange_strong(exp, exp + 1))
-                                    for (;;) usleep(1000000);
-                            }
-                        }
-                        // Budget full: try alternate candidate
-                        if (nCandidates > 1) {
-                            uint64_t target = candidates[1];
-                            lastReturnArr[slot2].store(target, std::memory_order_relaxed);
-                            sameReturnCountArr[slot2].store(0, std::memory_order_relaxed);
-                            for (int i = 0; i < 32; i++) {
-                                uint64_t val = 0;
-                                if (!safeReadU64(rsp + i * 8, &val)) continue;
-                                if (val == target) {
-                                    uc->uc_mcontext.gregs[REG_RSP] = rsp + (i + 1) * 8;
-                                    uc->uc_mcontext.gregs[REG_RIP] = target;
-                                    uc->uc_mcontext.gregs[REG_RAX] = 0;
-                                    if (c <= 60)
-                                        fprintf(stderr, "[CudaRT] ALT-SKIP #%d: %p tid=%d\n",
-                                                c, (void*)target, tid2);
-                                    return;
-                                }
-                            }
-                        }
-                        sameReturnCountArr[slot2].store(0, std::memory_order_relaxed);
-                        usleep(1000);
-                        return;
-                    }
-                } else {
-                    sameReturnCountArr[slot2].store(0, std::memory_order_relaxed);
-                }
-
-                uint64_t target = candidates[0];
-                lastReturnArr[slot2].store(target, std::memory_order_relaxed);
+            // FUNC SKIP: scan stack for return addresses and jump to caller.
+            if (uc) {
+                uint64_t rip = uc->uc_mcontext.gregs[REG_RIP];
+                uint64_t rsp = uc->uc_mcontext.gregs[REG_RSP];
 
                 for (int i = 0; i < 32; i++) {
                     uint64_t val = 0;
-                    if (!safeReadU64(rsp + i * 8, &val)) continue;
-                    if (val == target) {
+                    void* page = (void*)((rsp + i * 8) & ~0xFFFUL);
+                    unsigned char vec;
+                    if (mincore(page, 4096, &vec) != 0) continue;
+                    val = *(uint64_t*)(rsp + i * 8);
+                    uint8_t top = val >> 40;
+                    if (top >= 0x70 && top <= 0x7e && val != rip) {
                         uc->uc_mcontext.gregs[REG_RSP] = rsp + (i + 1) * 8;
-                        uc->uc_mcontext.gregs[REG_RIP] = target;
+                        uc->uc_mcontext.gregs[REG_RIP] = val;
                         uc->uc_mcontext.gregs[REG_RAX] = 0;
-                        if (c <= 60)
-                            fprintf(stderr, "[CudaRT] SKIP #%d: sig=%d %p -> %p tid=%d\n",
-                                    c, sig, (void*)rip, (void*)target, tid2);
+                        if (c <= 50)
+                            fprintf(stderr, "[CudaRT] SKIP #%d: sig=%d %p -> %p tid=%d tc=%d\n",
+                                    c, sig, (void*)rip, (void*)val, tid2, g_threadCrashCount);
                         return;
                     }
                 }
             }
-
-            // No candidates
-            {
-                int cs = g_suspendedThreadCount.load(std::memory_order_relaxed);
-                if (cs < 2 && tid != getpid()) {
-                    fprintf(stderr, "[CudaRT] No candidates -> suspend tid=%d (susp %d/2)\n",
-                            tid, cs + 1);
-                    {
-                        int exp = g_suspendedThreadCount.load(std::memory_order_relaxed);
-                        if (exp < 2 && g_suspendedThreadCount.compare_exchange_strong(exp, exp + 1))
-                            for (;;) usleep(1000000);
-                    }
-                }
-                usleep(1000);
-                return;
-            }
+            // No valid return address found — yield and retry
+            usleep(10000);
+            return;
         }
-
-        // Fallback: spin-yield
-        usleep(1000);
-        return;
     }
 }
 static void installCrashRecovery() {
@@ -891,8 +840,29 @@ static bool g_bdaRequested = []() {
 
 static int g_verbose = 1;
 uint32_t g_rqDispatchPerFrame = 0; // reset per frame in QueuePresent
+// g_presentCount defined near top (used by crash handler)
 static int g_trackVerbose = 0;
 static uint32_t g_maxBoundDescSets = 8; // updated from device props in CreateDevice
+
+// Timed queue flush: submit empty + fence + wait with timeout
+// Returns true if GPU flushed within timeout, false if timed out
+static bool timedQueueFlush(DeviceDispatch& disp, VkQueue queue, uint64_t timeoutNs = 500000000ULL /*500ms*/) {
+    static VkFence s_probeFence = VK_NULL_HANDLE;
+    if (s_probeFence == VK_NULL_HANDLE) {
+        VkFenceCreateInfo fci = {};
+        fci.sType = VK_STRUCTURE_TYPE_FENCE_CREATE_INFO;
+        if (disp.CreateFence(disp.device, &fci, nullptr, &s_probeFence) != VK_SUCCESS)
+            return false;
+    }
+    disp.ResetFences(disp.device, 1, &s_probeFence);
+    // Submit empty batch with fence to mark current queue position
+    VkSubmitInfo empty = {};
+    empty.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+    VkResult sr = disp.QueueSubmit(queue, 1, &empty, s_probeFence);
+    if (sr != VK_SUCCESS) return false;
+    VkResult wr = disp.WaitForFences(disp.device, 1, &s_probeFence, VK_TRUE, timeoutNs);
+    return (wr == VK_SUCCESS);
+}
 
 // Dummy buffer for safe AS→SSBO descriptor fallback (always valid)
 static VkBuffer g_dummyBuf = VK_NULL_HANDLE;
@@ -1270,6 +1240,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
     // We only intercept CmdBuildAS (to build our BVH) and CmdTraceRays (to replace trace).
     // Set CUDA_RT_STRIP_EXTENSIONS=1 to strip (requires full reimplementation).
     bool stripRT = (getenv("CUDA_RT_STRIP_EXTENSIONS") && atoi(getenv("CUDA_RT_STRIP_EXTENSIONS")));
+    g_noBvh = (getenv("CUDA_RT_NO_BVH") && atoi(getenv("CUDA_RT_NO_BVH")));
+    if (g_noBvh) LOG("BVH operations disabled (CUDA_RT_NO_BVH=1)");
     static const char* rtExts[] = {
         "VK_KHR_acceleration_structure",
         "VK_KHR_ray_tracing_pipeline",
@@ -1844,6 +1816,30 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_AllocateMemory(
     }
 
     VkResult res = disp.AllocateMemory(device, pAllocateInfo, pAllocator, pMemory);
+    // If OOM and driver degraded, try freeing BVH buffers and retry
+    if (res == VK_ERROR_OUT_OF_HOST_MEMORY && g_rtDisabled.load(std::memory_order_relaxed)) {
+        static int oomAllocCount = 0;
+        if (++oomAllocCount <= 5)
+            fprintf(stderr, "[CudaRT] ⚠ AllocateMemory OOM #%d (size=%zu) — freeing BVH + retry\n",
+                    oomAllocCount, (size_t)pAllocateInfo->allocationSize);
+        // Emergency free BVH buffers
+        static bool emergencyFreed = false;
+        if (!emergencyFreed) {
+            emergencyFreed = true;
+            auto freeBufferMem = [&](VkBuffer& buf, VkDeviceMemory& mem) {
+                if (buf) { disp.DestroyBuffer(device, buf, nullptr); buf = VK_NULL_HANDLE; }
+                if (mem) { disp.FreeMemory(device, mem, nullptr); mem = VK_NULL_HANDLE; }
+            };
+            freeBufferMem(g_bvh2.nodesBuf, g_bvh2.nodesMem);
+            freeBufferMem(g_bvh2.trisBuf, g_bvh2.trisMem);
+            freeBufferMem(g_bvh2.tlasNodesBuf, g_bvh2.tlasNodesMem);
+            freeBufferMem(g_bvh2.instancesBuf, g_bvh2.instancesMem);
+            g_bvh2.nodesCapacity = g_bvh2.trisCapacity = g_bvh2.tlasNodesCapacity = g_bvh2.instancesCapacity = 0;
+            g_bvh2.ready = false;
+            fprintf(stderr, "[CudaRT] ♻ Emergency BVH free done — retrying allocation\n");
+            res = disp.AllocateMemory(device, pAllocateInfo, pAllocator, pMemory);
+        }
+    }
     if (res == VK_SUCCESS) {
         std::lock_guard<std::mutex> lock(g_lock);
         auto& mi = g_memories[(uint64_t)*pMemory];
@@ -2493,8 +2489,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateShaderModule(
         fprintf(stderr, "[CudaRT] STRIP_ONLY: stripped %d ray_query instructions from %zu-word shader\n",
                 stripped, numWords);
     } else {
+        // Tunable BVH traversal iteration limits (lower = faster but less accurate)
+        static int s_maxBlasIter = -1, s_maxTlasIter = -1;
+        if (s_maxBlasIter < 0) {
+            const char* e1 = getenv("CUDA_RT_MAX_BLAS_ITER");
+            const char* e2 = getenv("CUDA_RT_MAX_TLAS_ITER");
+            s_maxBlasIter = e1 ? atoi(e1) : 4096;
+            s_maxTlasIter = e2 ? atoi(e2) : 512;
+            if (s_maxBlasIter != 4096 || s_maxTlasIter != 512)
+                LOG("[PERF] BVH iteration limits: BLAS=%d TLAS=%d", s_maxBlasIter, s_maxTlasIter);
+        }
         rw = spirvTryRewriteRayQuery(spirvCode, numWords, (int)g_maxBoundDescSets,
-                                     g_bdaRequested, 128 /*bdaPushConstOffset*/);
+                                     g_bdaRequested, 128 /*bdaPushConstOffset*/,
+                                     s_maxBlasIter, s_maxTlasIter);
     }
 
     if (rw.rewritten) {
@@ -2790,6 +2797,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBuildAccelerationStructuresKHR(
 
 // Process all pending BLAS builds — called from QueueSubmit after GPU has executed
 static void processPendingBLAS() {
+    if (g_noBvh || g_rtDisabled.load(std::memory_order_relaxed)) return;
     std::vector<PendingBLAS> pending;
     {
         std::lock_guard<std::mutex> lock(g_lock);
@@ -3168,6 +3176,7 @@ static void transformAABB(const float m[12], float bminX, float bminY, float bmi
 // Throttle is handled by QueueSubmit; this function always does the actual rebuild.
 static uint64_t g_tlasGeneration = 0;  // incremented each TLAS rebuild for per-frame updates
 static void processPendingTLAS() {
+    if (g_noBvh || g_rtDisabled.load(std::memory_order_relaxed)) return;
     if (!g_pendingTLAS.pending || !g_lastBLAS) return;
     g_pendingTLAS.pending = false;
 
@@ -4055,6 +4064,7 @@ static bool setupBVH2Descriptors(DeviceDispatch& disp) {
 }
 
 static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
+    if (g_noBvh || g_rtDisabled.load(std::memory_order_relaxed)) return false;
     if (!bvh) return false;
     if (!setupBVH2Descriptors(disp)) return false;
 
@@ -4758,6 +4768,7 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
 // ready BEFORE subsequent CmdDispatch calls record RQ dispatches.
 // Vertex data from prior submits should already be readable via staging copies.
 static void tryEagerBLASBuild(VkCommandBuffer cmdBuf) {
+    if (g_noBvh || g_rtDisabled.load(std::memory_order_relaxed)) return;
     bool hasTLAS = false;
     bool hasPendingBLAS = false;
     bool hasLateBLAS = false;
@@ -7250,7 +7261,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
         if (savedFence != VK_NULL_HANDLE) {
             disp.QueueSubmit(queue, 0, nullptr, (VkFence)savedFence);
         }
-        disp.QueueWaitIdle(queue);
+        timedQueueFlush(disp, queue, 2000000000ULL); // 2s timeout in crash recovery
         return VK_SUCCESS;
     }
     g_globalRecoverySet = 1;
@@ -7315,16 +7326,23 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
             }
         }
 
-        // Periodic WaitIdle to flush driver state and prevent UAF accumulation
+        // Periodic flush to prevent UAF accumulation — uses timed fence instead of
+        // QueueWaitIdle to avoid blocking forever on heavy GPU compute work
         static int syncInterval = -1;
         if (syncInterval < 0) {
             const char* e = getenv("CUDA_RT_FRAME_SYNC");
             syncInterval = e ? atoi(e) : 0;
             if (syncInterval > 0)
-                LOG("[SYNC] Submit sync: QueueWaitIdle every %d submits", syncInterval);
+                LOG("[SYNC] Submit sync: timed flush every %d submits (500ms timeout)", syncInterval);
         }
         if (syncInterval > 0 && (submitIdx % syncInterval) == 0) {
-            disp.QueueWaitIdle(queue);
+            if (!timedQueueFlush(disp, queue, 500000000ULL)) {
+                static int flushTimeoutLog = 0;
+                if (flushTimeoutLog < 20) {
+                    flushTimeoutLog++;
+                    LOG("[SYNC] Flush timeout at submit #%u — GPU busy, continuing", submitIdx);
+                }
+            }
         }
 
         // Clear poisoned command buffers periodically
@@ -7381,7 +7399,17 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
     } else {
         res = disp.QueueSubmit(queue, submitCount, pSubmits, fence);
     }
-    if (res != VK_SUCCESS) { g_globalRecoverySet = 0; return res; }
+    if (res != VK_SUCCESS) {
+        // Suppress OOM after driver crash — driver returns bogus error from corrupted state
+        if (res == VK_ERROR_OUT_OF_HOST_MEMORY && g_rtDisabled.load(std::memory_order_relaxed)) {
+            static int qsSuppCount = 0;
+            if (++qsSuppCount <= 10)
+                fprintf(stderr, "[CudaRT] ⚠ QS OOM suppressed #%d (driver degraded)\n", qsSuppCount);
+            res = VK_SUCCESS;
+        } else {
+            g_globalRecoverySet = 0; return res;
+        }
+    }
 
     static int qsCount = 0;
     qsCount++;
@@ -7406,7 +7434,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
         }
     }
 
-    // Periodic WaitIdle to flush driver state (CUDA_RT_FRAME_SYNC)
+    // Periodic flush (CUDA_RT_FRAME_SYNC) — timed to avoid blocking forever
     {
         static int syncInterval = -1;
         if (syncInterval < 0) {
@@ -7414,7 +7442,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
             syncInterval = e ? atoi(e) : 0;
         }
         if (syncInterval > 0 && (qsCount % syncInterval) == 0) {
-            disp.QueueWaitIdle(queue);
+            timedQueueFlush(disp, queue, 500000000ULL);
         }
     }
 
@@ -7451,7 +7479,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
 
     if (hasPending && !submitCrashed) {
         // Wait for this submission to complete so GPU buffers are filled
-        disp.QueueWaitIdle(queue);
+        // Use timed flush with generous timeout (10s) since BLAS build needs vertex data
+        if (!timedQueueFlush(disp, queue, 10000000000ULL)) {
+            LOG("[QS] BLAS build flush timeout (10s) — attempting BLAS anyway");
+        }
         processPendingBLAS();
 
         // Upload BVH2 data to Vulkan SSBOs immediately after build
@@ -7530,6 +7561,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit2KHR(
 
     // Call real submit2 first
     VkResult res = disp.QueueSubmit2KHR(queue, submitCount, pSubmits, fence);
+    // After driver crash, suppress OOM errors — driver returns bogus error codes
+    if (res == VK_ERROR_OUT_OF_HOST_MEMORY && g_rtDisabled.load(std::memory_order_relaxed)) {
+        static int suppCount = 0;
+        if (++suppCount <= 10)
+            fprintf(stderr, "[CudaRT] ⚠ QS2 OOM suppressed #%d (driver degraded)\n", suppCount);
+        res = VK_SUCCESS;
+    }
     if (res != VK_SUCCESS) return res;
 
     static int qs2Count = 0;
@@ -7564,7 +7602,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit2KHR(
         }
         bool shouldRebuild = (g_bvh2.ready && g_tlasBVH && g_bvh2.tlasGen != g_tlasGeneration);
         if (shouldRebuild) {
-            disp.QueueWaitIdle(queue);
+            timedQueueFlush(disp, queue, 2000000000ULL); // 2s timeout for TLAS rebuild
             bool hasNewBLAS = processLateBLAS();
             if (hasNewBLAS) uploadBVH2Data(disp, g_lastBLAS);
             processPendingTLAS();
@@ -7574,6 +7612,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit2KHR(
         }
     }
 
+    if (res != VK_SUCCESS && g_rtDisabled.load(std::memory_order_relaxed)) {
+        static int qs2Sup = 0;
+        if (++qs2Sup <= 5)
+            LOG("⚠ QueueSubmit2 error %d (driver degraded)", (int)res);
+    }
     return res;
 }
 
@@ -7651,11 +7694,31 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
     }
     if (!pDisp || !pDisp->QueuePresentKHR) return VK_ERROR_DEVICE_LOST;
 
-    static uint32_t presentCount = 0;
-    presentCount++;
+    g_presentCount++;
 
-    // Verify our crash recovery handler is still installed
-    verifyCrashHandler();
+    // When RT is disabled after driver crash, free BVH buffers to reclaim VRAM
+    // This prevents VK_ERROR_OUT_OF_HOST_MEMORY from exhausting the allocation pool
+    {
+        static bool bvhFreed = false;
+        if (g_rtDisabled.load(std::memory_order_relaxed) && !bvhFreed && pDisp) {
+            bvhFreed = true;
+            fprintf(stderr, "[CudaRT] ♻ Freeing BVH buffers (RT disabled) to reclaim VRAM\n");
+            auto& disp = *pDisp;
+            // Free Vulkan buffers and memory
+            auto freeBufferMem = [&](VkBuffer& buf, VkDeviceMemory& mem) {
+                if (buf) { disp.DestroyBuffer(disp.device, buf, nullptr); buf = VK_NULL_HANDLE; }
+                if (mem) { disp.FreeMemory(disp.device, mem, nullptr); mem = VK_NULL_HANDLE; }
+            };
+            freeBufferMem(g_bvh2.nodesBuf, g_bvh2.nodesMem);
+            freeBufferMem(g_bvh2.trisBuf, g_bvh2.trisMem);
+            freeBufferMem(g_bvh2.tlasNodesBuf, g_bvh2.tlasNodesMem);
+            freeBufferMem(g_bvh2.instancesBuf, g_bvh2.instancesMem);
+            g_bvh2.nodesCapacity = g_bvh2.trisCapacity = 0;
+            g_bvh2.tlasNodesCapacity = g_bvh2.instancesCapacity = 0;
+            g_bvh2.ready = false;
+            fprintf(stderr, "[CudaRT] ♻ BVH buffers freed\n");
+        }
+    }
     // Clear poisoned command buffers at frame boundary (they'll be re-recorded)
     clearPoisonedCmdBufs();
 
@@ -7668,12 +7731,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
         if (frameSyncInterval > 0)
             LOG("[SYNC] Frame sync enabled: DeviceWaitIdle every %d frames", frameSyncInterval);
     }
-    if (frameSyncInterval > 0 && (presentCount % frameSyncInterval) == 0) {
-        auto waitFn = (PFN_vkDeviceWaitIdle)pDisp->GetDeviceProcAddr(pDisp->device, "vkDeviceWaitIdle");
-        if (waitFn) waitFn(pDisp->device);
+    if (frameSyncInterval > 0 && (g_presentCount % frameSyncInterval) == 0) {
+        // Use timed flush instead of DeviceWaitIdle to avoid blocking
+        VkQueue q = g_lastSubmitQueue.load(std::memory_order_relaxed);
+        if (q && pDisp) timedQueueFlush(*pDisp, q, 500000000ULL);
     }
     // Initialize NRC on first frame (lazy init — needs CUDA context to be ready)
-    if (!g_nrc && presentCount == 1) {
+    if (!g_nrc && g_presentCount == 1) {
         const char* nrcEnv = getenv("CUDA_RT_NRC");
         g_nrcEnabled = nrcEnv && atoi(nrcEnv) > 0;
         if (g_nrcEnabled) {
@@ -7699,16 +7763,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
             double fps = fpsFrames / elapsed;
             uint64_t recoveries = g_crashRecoveryCount.load(std::memory_order_relaxed);
             fprintf(stderr, "\r[CudaRT] %.1f FPS | frame %u | dispatches/f=%u | recoveries=%lu   ",
-                    fps, presentCount, rqDispatchThisFrame, (unsigned long)recoveries);
+                    fps, g_presentCount, rqDispatchThisFrame, (unsigned long)recoveries);
             fflush(stderr);
             fpsStart = now;
             fpsFrames = 0;
         }
     }
 
-    if (presentCount <= 5 || presentCount % 100 == 0) {
+    if (g_presentCount <= 5 || g_presentCount % 100 == 0) {
         LOG("[PRESENT] QueuePresent #%u (TLAS gen=%u addr=0x%llx dispatches=%u)",
-            presentCount, g_tlasGeneration,
+            g_presentCount, g_tlasGeneration,
             (unsigned long long)g_pendingTLAS.instanceAddr, rqDispatchThisFrame);
     }
 
@@ -7722,11 +7786,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
     }
 
     bool tlasEligible = g_bvh2.ready && g_pendingTLAS.instanceAddr != 0;
-    bool tlasThrottleOk = (presentCount % tlasEveryN) == 0;
+    bool tlasThrottleOk = (g_presentCount % tlasEveryN) == 0;
 
     if (tlasEligible && tlasThrottleOk) {
         uint64_t prevGen = g_tlasGeneration;
-        if (pDisp->QueueWaitIdle) pDisp->QueueWaitIdle(queue);
+        if (pDisp) timedQueueFlush(*pDisp, queue, 2000000000ULL);
 
         // Build any late BLASes (dynamic geometry) before TLAS
         bool hasNewBLAS = processLateBLAS();
@@ -7746,7 +7810,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
         if (g_tlasGeneration > prevGen) {
             reuploadTLASData(*pDisp);
             if (g_tlasGeneration <= 5 || g_tlasGeneration % 300 == 0)
-                LOG("[PRESENT] TLAS rebuilt (gen=%lu) at present #%u", g_tlasGeneration, presentCount);
+                LOG("[PRESENT] TLAS rebuilt (gen=%lu) at present #%u", g_tlasGeneration, g_presentCount);
         }
     }
 
@@ -8006,7 +8070,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
                     uint32_t w = g_denoiseTarget.width, h = g_denoiseTarget.height;
 
                     // Wait for any GPU work to complete
-                    pDisp->QueueWaitIdle(queue);
+                    timedQueueFlush(*pDisp, queue, 1000000000ULL);
 
                     // Step 1: Copy storage image → staging buffer
                     pDisp->ResetCommandBuffer(g_denoiseTarget.cmdBuf, 0);
@@ -8129,7 +8193,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
         }
     }
 
-    return pDisp->QueuePresentKHR(queue, pPresentInfo);
+    VkResult presRes = pDisp->QueuePresentKHR(queue, pPresentInfo);
+    // After driver crash, suppress OOM errors from present too
+    if (presRes == VK_ERROR_OUT_OF_HOST_MEMORY && g_rtDisabled.load(std::memory_order_relaxed)) {
+        static int presSuppCount = 0;
+        if (++presSuppCount <= 10)
+            fprintf(stderr, "[CudaRT] ⚠ Present OOM suppressed #%d (driver degraded)\n", presSuppCount);
+        presRes = VK_SUCCESS;
+    }
+    return presRes;
 }
 
 // Push BVH descriptor buffers directly into command buffer (bypasses descriptor pool entirely).
@@ -8301,6 +8373,21 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
             return;
         }
         if (halfRes >= 3) return; // NOP: skip RT dispatch entirely
+        // Driver instability guard: if any driver crash was detected, permanently NOP RT
+        if (g_rtDisabled.load(std::memory_order_relaxed)) return;
+        // RQ frame skip: only execute RQ dispatches every Nth present (reduces GPU load)
+        // CUDA_RT_RQ_FRAME_SKIP=N means run RQ on 1 out of every N frames (0=disabled)
+        {
+            static int rqFrameSkip = -1;
+            if (rqFrameSkip < 0) {
+                const char* e = getenv("CUDA_RT_RQ_FRAME_SKIP");
+                rqFrameSkip = e ? atoi(e) : 0;
+                if (rqFrameSkip > 0) LOG("[PERF] RQ frame skip: run RQ every %d frames", rqFrameSkip);
+            }
+            if (rqFrameSkip > 1) {
+                if ((g_presentCount % rqFrameSkip) != 0) return;
+            }
+        }
         // Dynamic driver health check: skip RT dispatches when too many driver threads
         // are suspended. 2+ suspended threads = locks held forever = deadlock on next submit.
         // This lets the benchmark continue with rasterization-only rendering.
@@ -8391,6 +8478,7 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatchIndirect(
                 static int halfRes2 = -1;
                 if (halfRes2 < 0) { const char* e = getenv("CUDA_RT_HALF_RES"); halfRes2 = e ? atoi(e) : 0; }
                 if (halfRes2 >= 3) return;
+                if (g_rtDisabled.load(std::memory_order_relaxed)) return;
                 if (g_suspendedThreadCount.load(std::memory_order_relaxed) >= 2) return;
             }
         }

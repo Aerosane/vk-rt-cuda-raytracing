@@ -67,11 +67,12 @@ void abort(void) {
         if (c <= 20)
             fprintf(stderr, "[noabort] abort() #%d intercepted — thread %ld\n", c, (long)syscall(186));
     }
-    // Non-main threads: exit cleanly to release locks
+    // Non-main threads: exit to release driver locks.
+    // This leaks some resources but prevents deadlock from held locks.
     if (syscall(186) != getpid()) {
         pthread_exit(NULL);
     }
-    // Main thread: yield instead of hard spin (single-CPU safe)
+    // Main thread: yield
     for (;;) sched_yield();
     __builtin_unreachable();
 }
@@ -117,4 +118,13 @@ void __stack_chk_fail(void) {
     if (n > 50 && syscall(186) != getpid()) {
         pthread_exit(NULL);
     }
+}
+
+// Intercept C++ terminate to prevent "terminate called recursively" cascade
+void __cxa_pure_virtual(void) {
+    static int c = 0;
+    int n = __sync_add_and_fetch(&c, 1);
+    if (n <= 5)
+        fprintf(stderr, "[noabort] __cxa_pure_virtual intercepted\n");
+    for (;;) usleep(1000000);
 }
