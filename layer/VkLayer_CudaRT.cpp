@@ -867,6 +867,12 @@ struct BVH2Interop {
     int numTlasNodes;
     int numInstances;
     uint64_t tlasGen;            // which TLAS generation is currently uploaded
+    // Buffer Device Address (BDA) — addresses for push constant injection
+    bool useBDA;                  // true if BDA mode enabled
+    VkDeviceAddress nodesAddr;    // vkGetBufferDeviceAddress for nodesBuf
+    VkDeviceAddress trisAddr;
+    VkDeviceAddress tlasNodesAddr;
+    VkDeviceAddress instancesAddr;
     // CUDA mirror pointers for IR executor
     void* cudaNodes;
     void* cudaTris;
@@ -1302,6 +1308,15 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
             LOG("  → Injecting VK_KHR_push_descriptor for BVH binding (bypass descriptor pool)");
         }
     }
+    // Inject VK_KHR_buffer_device_address for BDA mode (zero-descriptor BVH binding)
+    {
+        bool hasBDA = false;
+        for (auto& e : filteredExts) if (!strcmp(e, "VK_KHR_buffer_device_address")) hasBDA = true;
+        if (!hasBDA) {
+            filteredExts.push_back("VK_KHR_buffer_device_address");
+            LOG("  → Injecting VK_KHR_buffer_device_address for BDA BVH binding");
+        }
+    }
 
     // Strip RT feature structs from pNext chain before forwarding to driver.
     // We need a mutable copy of the chain. Walk and relink, skipping RT sTypes.
@@ -1387,6 +1402,30 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
     }
 
     auto createFunc = (PFN_vkCreateDevice)nextGIPA(VK_NULL_HANDLE, "vkCreateDevice");
+
+    // Inject bufferDeviceAddress feature for BDA mode (zero-descriptor BVH binding)
+    VkPhysicalDeviceBufferDeviceAddressFeatures bdaFeatures = {
+        VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES};
+    bdaFeatures.bufferDeviceAddress = VK_TRUE;
+    // Check if the app already has BDA features in the chain
+    {
+        bool foundBDA = false;
+        VkBaseOutStructure* cur = (VkBaseOutStructure*)modifiedCI.pNext;
+        while (cur) {
+            if (cur->sType == VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_BUFFER_DEVICE_ADDRESS_FEATURES) {
+                auto* f = (VkPhysicalDeviceBufferDeviceAddressFeatures*)cur;
+                f->bufferDeviceAddress = VK_TRUE;
+                foundBDA = true;
+                break;
+            }
+            cur = cur->pNext;
+        }
+        if (!foundBDA) {
+            bdaFeatures.pNext = (void*)modifiedCI.pNext;
+            modifiedCI.pNext = &bdaFeatures;
+            LOG("  → Injecting bufferDeviceAddress=1 feature for BDA BVH binding");
+        }
+    }
 
     LOG("  → Forwarding CreateDevice with %u extensions%s", (uint32_t)filteredExts.size(),
         stripRT ? " (RT stripped)" : " (RT passthrough)");
@@ -2446,12 +2485,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateShaderModule(
         fprintf(stderr, "[CudaRT] STRIP_ONLY: stripped %d ray_query instructions from %zu-word shader\n",
                 stripped, numWords);
     } else {
-        rw = spirvTryRewriteRayQuery(spirvCode, numWords, (int)g_maxBoundDescSets);
+        rw = spirvTryRewriteRayQuery(spirvCode, numWords, (int)g_maxBoundDescSets,
+                                     g_bvh2.useBDA, 128 /*bdaPushConstOffset*/);
     }
 
     if (rw.rewritten) {
-        LOG("CreateShaderModule: REWRITTEN ray query shader (%zu→%zu words, BVH set=%d)",
-            numWords, rw.code.size(), rw.bvhDescSet);
+        LOG("CreateShaderModule: REWRITTEN ray query shader (%zu→%zu words, BVH set=%d, bda=%d)",
+            numWords, rw.code.size(), rw.bvhDescSet, (int)rw.bdaActive);
 
         // Dump rewritten SPIR-V for offline validation
         static int rqShaderIdx = 0;
@@ -3733,6 +3773,8 @@ static bool ensureBufferCapacity(DeviceDispatch& disp, VkDeviceSize requiredSize
     bufCI.size = allocSize;
     // Use HOST_VISIBLE+HOST_COHERENT to avoid staging buffer + vkQueueWaitIdle deadlock
     bufCI.usage = VK_BUFFER_USAGE_STORAGE_BUFFER_BIT;
+    if (g_bvh2.useBDA)
+        bufCI.usage |= VK_BUFFER_USAGE_SHADER_DEVICE_ADDRESS_BIT;
     bufCI.sharingMode = VK_SHARING_MODE_EXCLUSIVE;
     if (disp.CreateBuffer(disp.device, &bufCI, nullptr, &buf) != VK_SUCCESS) return false;
     
@@ -3752,6 +3794,12 @@ static bool ensureBufferCapacity(DeviceDispatch& disp, VkDeviceSize requiredSize
     VkMemoryAllocateInfo allocInfo = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
     allocInfo.allocationSize = memReqs.size;
     allocInfo.memoryTypeIndex = hostMemType;
+    // BDA requires VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT
+    VkMemoryAllocateFlagsInfo allocFlags = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_FLAGS_INFO};
+    if (g_bvh2.useBDA) {
+        allocFlags.flags = VK_MEMORY_ALLOCATE_DEVICE_ADDRESS_BIT;
+        allocInfo.pNext = &allocFlags;
+    }
     if (disp.AllocateMemory(disp.device, &allocInfo, nullptr, &mem) != VK_SUCCESS) {
         disp.DestroyBuffer(disp.device, buf, nullptr); buf = VK_NULL_HANDLE; return false;
     }
@@ -3889,6 +3937,17 @@ static bool setupBVH2Descriptors(DeviceDispatch& disp) {
         }
     }
 
+    // BDA mode: pass BVH buffer addresses as push constants (zero descriptor binding)
+    // Enable with CUDA_RT_BDA=1. Completely eliminates descriptor set crash surface.
+    g_bvh2.useBDA = false;
+    {
+        const char* bda = getenv("CUDA_RT_BDA");
+        if (bda && atoi(bda) && disp.GetBufferDeviceAddress) {
+            g_bvh2.useBDA = true;
+            LOG("[BVH2] BDA mode ENABLED — BVH addresses via push constants (no descriptor binding)");
+        }
+    }
+
     // Pre-allocate LARGE BVH buffers (4MB each) so they can be bound during command
     // recording BEFORE real BVH data is available. Fill with null-safe data (huge AABB +
     // skip=-1) so shaders that run before upload will exit traversal immediately.
@@ -3933,6 +3992,21 @@ static bool setupBVH2Descriptors(DeviceDispatch& disp) {
         uploadToExistingBuffer(disp, g_bvh2.trisBuf, nullTri, sizeof(nullTri));
         uploadToExistingBuffer(disp, g_bvh2.tlasNodesBuf, nullNodes, sizeof(nullNodes));
         uploadToExistingBuffer(disp, g_bvh2.instancesBuf, nullInst, sizeof(nullInst));
+        
+        // Get buffer device addresses for BDA mode
+        if (g_bvh2.useBDA && disp.GetBufferDeviceAddress) {
+            VkBufferDeviceAddressInfo addrInfo = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            addrInfo.buffer = g_bvh2.nodesBuf;
+            g_bvh2.nodesAddr = disp.GetBufferDeviceAddress(disp.device, &addrInfo);
+            addrInfo.buffer = g_bvh2.trisBuf;
+            g_bvh2.trisAddr = disp.GetBufferDeviceAddress(disp.device, &addrInfo);
+            addrInfo.buffer = g_bvh2.tlasNodesBuf;
+            g_bvh2.tlasNodesAddr = disp.GetBufferDeviceAddress(disp.device, &addrInfo);
+            addrInfo.buffer = g_bvh2.instancesBuf;
+            g_bvh2.instancesAddr = disp.GetBufferDeviceAddress(disp.device, &addrInfo);
+            LOG("[BVH2] BDA addresses: nodes=0x%lx tris=0x%lx tlas=0x%lx inst=0x%lx",
+                g_bvh2.nodesAddr, g_bvh2.trisAddr, g_bvh2.tlasNodesAddr, g_bvh2.instancesAddr);
+        }
         
         // Write descriptors with VK_WHOLE_SIZE — covers entire pre-allocated buffer.
         // GPU reads actual contents at execution time, so updating buffer data later
@@ -4296,6 +4370,20 @@ static bool uploadBVH2Data(DeviceDispatch& disp, CudaBVH_t bvh) {
             disp.UpdateDescriptorSets(disp.device, 4, simWrites, 0, nullptr);
         }
         LOG("[BVH2] Descriptor sets updated with new buffer handles");
+        // Update BDA addresses after reallocation
+        if (g_bvh2.useBDA && disp.GetBufferDeviceAddress) {
+            VkBufferDeviceAddressInfo addrInfo = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            addrInfo.buffer = g_bvh2.nodesBuf;
+            g_bvh2.nodesAddr = disp.GetBufferDeviceAddress(disp.device, &addrInfo);
+            addrInfo.buffer = g_bvh2.trisBuf;
+            g_bvh2.trisAddr = disp.GetBufferDeviceAddress(disp.device, &addrInfo);
+            addrInfo.buffer = g_bvh2.tlasNodesBuf;
+            g_bvh2.tlasNodesAddr = disp.GetBufferDeviceAddress(disp.device, &addrInfo);
+            addrInfo.buffer = g_bvh2.instancesBuf;
+            g_bvh2.instancesAddr = disp.GetBufferDeviceAddress(disp.device, &addrInfo);
+            LOG("[BVH2] BDA addresses updated: nodes=0x%lx tris=0x%lx tlas=0x%lx inst=0x%lx",
+                g_bvh2.nodesAddr, g_bvh2.trisAddr, g_bvh2.tlasNodesAddr, g_bvh2.instancesAddr);
+        }
     }
 
     g_bvh2.numNodes = totalNodes;
@@ -4480,6 +4568,16 @@ static bool reuploadTLASData(DeviceDispatch& disp) {
                 simWrites[i].pBufferInfo = &bufs[i];
             }
             disp.UpdateDescriptorSets(disp.device, 4, simWrites, 0, nullptr);
+        }
+        // Update BDA addresses after TLAS reallocation
+        if (g_bvh2.useBDA && disp.GetBufferDeviceAddress) {
+            VkBufferDeviceAddressInfo addrInfo = {VK_STRUCTURE_TYPE_BUFFER_DEVICE_ADDRESS_INFO};
+            addrInfo.buffer = g_bvh2.tlasNodesBuf;
+            g_bvh2.tlasNodesAddr = disp.GetBufferDeviceAddress(disp.device, &addrInfo);
+            addrInfo.buffer = g_bvh2.instancesBuf;
+            g_bvh2.instancesAddr = disp.GetBufferDeviceAddress(disp.device, &addrInfo);
+            LOG("[BVH2] BDA TLAS addresses updated: tlas=0x%lx inst=0x%lx",
+                g_bvh2.tlasNodesAddr, g_bvh2.instancesAddr);
         }
     }
 
@@ -5698,11 +5796,19 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateComputePipelines(
         VkPipelineLayoutCreateInfo plCI = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         plCI.setLayoutCount = totalSets;
         plCI.pSetLayouts = sets.data();
+        // Add BDA push constant range for 4 uint64 buffer addresses
+        if (g_bvh2.useBDA) {
+            VkPushConstantRange bdaRange = {};
+            bdaRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+            bdaRange.offset = 128;
+            bdaRange.size = 32;
+            appPushConstants.push_back(bdaRange);
+        }
         plCI.pushConstantRangeCount = (uint32_t)appPushConstants.size();
         plCI.pPushConstantRanges = appPushConstants.empty() ? nullptr : appPushConstants.data();
 
         if (disp.CreatePipelineLayout(device, &plCI, nullptr, &extLayouts[i]) != VK_SUCCESS) {
-            LOG("[BVH2] Failed to create extended pipeline layout for RQ pipeline");
+            LOG("[BVH2] Failed to create extended compute pipeline layout for RQ pipeline");
             extLayouts[i] = VK_NULL_HANDLE;
         } else {
             LOG("[BVH2] Created %s layout: %u sets, %zu push consts, BVH2 at set=%u",
@@ -5858,6 +5964,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateGraphicsPipelines(
         VkPipelineLayoutCreateInfo plCI = {VK_STRUCTURE_TYPE_PIPELINE_LAYOUT_CREATE_INFO};
         plCI.setLayoutCount = totalSets;
         plCI.pSetLayouts = sets.data();
+        // Add BDA push constant range for 4 uint64 buffer addresses
+        if (g_bvh2.useBDA) {
+            VkPushConstantRange bdaRange = {};
+            bdaRange.stageFlags = VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT;
+            bdaRange.offset = 128;
+            bdaRange.size = 32;
+            appPushConstants.push_back(bdaRange);
+        }
         plCI.pushConstantRangeCount = (uint32_t)appPushConstants.size();
         plCI.pPushConstantRanges = appPushConstants.empty() ? nullptr : appPushConstants.data();
 
@@ -6845,6 +6959,19 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdEndRenderPass(
 static bool pushBVH2Descriptors(DeviceDispatch& disp, VkCommandBuffer cmdBuf,
                                  VkPipelineBindPoint bindPoint, VkPipelineLayout layout,
                                  uint32_t bvhSetIdx);
+// Push BDA addresses via push constants (completely avoids descriptor binding)
+static bool pushBVH2Addresses(DeviceDispatch& disp, VkCommandBuffer cmdBuf,
+                               VkPipelineLayout layout) {
+    if (!g_bvh2.useBDA || !g_bvh2.nodesAddr) return false;
+    VkDeviceAddress addrs[4] = {
+        g_bvh2.nodesAddr, g_bvh2.trisAddr,
+        g_bvh2.tlasNodesAddr, g_bvh2.instancesAddr
+    };
+    disp.CmdPushConstants(cmdBuf, layout,
+                          VK_SHADER_STAGE_COMPUTE_BIT | VK_SHADER_STAGE_FRAGMENT_BIT,
+                          128, 32, addrs);
+    return true;
+}
 static VKAPI_ATTR void VKAPI_CALL layer_CmdBindPipeline(
     VkCommandBuffer cmdBuf,
     VkPipelineBindPoint bindPoint,
@@ -6890,7 +7017,11 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdBindPipeline(
             if (layout && bvhSetIdx < 32) {
                 void* k2 = getKey(cmdBuf);
                 auto& d2 = g_deviceMap[k2];
-                if (!pushBVH2Descriptors(d2, cmdBuf, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, bvhSetIdx)) {
+                bool bound = false;
+                if (g_bvh2.useBDA) {
+                    bound = pushBVH2Addresses(d2, cmdBuf, layout);
+                }
+                if (!bound && !pushBVH2Descriptors(d2, cmdBuf, VK_PIPELINE_BIND_POINT_GRAPHICS, layout, bvhSetIdx)) {
                     VkDescriptorSet bindSet = (g_bvh2.descSetSimple && g_bvh2.descSetSimple != g_bvh2.descSet)
                                               ? g_bvh2.descSetSimple : g_bvh2.descSet;
                     d2.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_GRAPHICS,
@@ -8115,8 +8246,12 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatch(
                             LOG("[BVH-BIND] MERGED-SET: skipping bind for set=%u (shader uses high bindings 100-103)", bvhSetIdx);
                         }
                     } else {
-                        // Non-merged: prefer push descriptors (bypass descriptor pool)
-                        if (!pushBVH2Descriptors(disp, cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, layout, bvhSetIdx)) {
+                        // Non-merged: prefer BDA (push constants) > push descriptors > regular bind
+                        bool bound = false;
+                        if (g_bvh2.useBDA) {
+                            bound = pushBVH2Addresses(disp, cmdBuf, layout);
+                        }
+                        if (!bound && !pushBVH2Descriptors(disp, cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, layout, bvhSetIdx)) {
                             VkDescriptorSet bindSet = (g_bvh2.descSetSimple && g_bvh2.descSetSimple != g_bvh2.descSet)
                                                       ? g_bvh2.descSetSimple : g_bvh2.descSet;
                             disp.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,
@@ -8231,7 +8366,11 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdDispatchIndirect(
                 uint32_t bvhSetIdx = (uint32_t)it->second.bvhDescSet;
                 if (layout && g_bvh2.descSet) {
                     bool merged = it->second.isMergedSet;
-                    if (!merged && !pushBVH2Descriptors(disp, cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, layout, bvhSetIdx)) {
+                    bool bound = false;
+                    if (!merged && g_bvh2.useBDA) {
+                        bound = pushBVH2Addresses(disp, cmdBuf, layout);
+                    }
+                    if (!merged && !bound && !pushBVH2Descriptors(disp, cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE, layout, bvhSetIdx)) {
                         VkDescriptorSet bindSet = (g_bvh2.descSetSimple && g_bvh2.descSetSimple != g_bvh2.descSet)
                                                   ? g_bvh2.descSetSimple : g_bvh2.descSet;
                         disp.CmdBindDescriptorSets(cmdBuf, VK_PIPELINE_BIND_POINT_COMPUTE,

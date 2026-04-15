@@ -171,14 +171,24 @@ enum {
     CapRayQueryKHR = 4472,
     CapRayTraversalPrimitiveCulling = 4478,
     CapRayTracingKHR = 4479,
+    CapInt64 = 11,
+    CapPhysicalStorageBufferAddresses = 5347,
     DecDescriptorSet = 34,
     DecBinding = 33,
     DecNonWritable = 24,
     DecOffset = 35,
     DecArrayStride = 6,
     DecBlock = 2,
+    DecRestrict = 19,
+    DecAliased = 18,
     SCStorageBuffer = 12,
     SCFunction = 7,
+    SCPushConstant = 9,
+    SCPhysicalStorageBuffer = 5349,
+    AddrPhysicalStorageBuffer64 = 5348,
+    SpvMemoryAccessAlignedMask = 0x2,
+    SpvOpConvertUToPtr = 4422,
+    SpvOpConvertPtrToU = 4423,
     // GLSL.std.450 extended instructions
     GLSLstd450FAbs = 4,
     GLSLstd450FSign = 6,
@@ -236,7 +246,8 @@ static void spvEmit(std::vector<uint32_t>& out, uint16_t opcode,
 static std::vector<uint32_t> spirvRewriteRayQuery(
     const uint32_t* code, size_t numWords,
     int bvhDescSet, int bvhNodesBinding, int bvhTrisBinding,
-    int bvhTlasBinding = 2, int bvhInstBinding = 3)
+    int bvhTlasBinding = 2, int bvhInstBinding = 3,
+    bool useBDA = false, int bdaPushConstOffset = 128)
 {
     if (numWords < 5 || code[0] != 0x07230203u) return {};
 
@@ -286,6 +297,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
     // --- Pass 1: collect type/variable info ---
     std::unordered_set<uint32_t> rqTypeIds, rqPtrTypeIds, rqVarIds;
     std::unordered_set<uint32_t> asTypeIds, asPtrTypeIds, asVarIds;
+    bool hasPushConstants = false;
     uint32_t tVoid=0, tBool=0, tFloat=0, tUint=0, tInt=0;
     uint32_t tVec2=0, tVec3=0, tVec4=0, tUvec4=0;
     uint32_t cTrue=0, cFalse=0;
@@ -338,6 +350,8 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             if (wc>=4) {
                 if (rqPtrTypeIds.count(code[pos+1])) rqVarIds.insert(code[pos+2]);
                 if (asPtrTypeIds.count(code[pos+1])) asVarIds.insert(code[pos+2]);
+                // Detect existing push constant variables (storage class 9)
+                if (wc >= 4 && code[pos+3] == SCPushConstant) hasPushConstants = true;
             }
             break;
         }
@@ -346,8 +360,15 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
 
     if (rqTypeIds.empty()) return {};
 
-    fprintf(stderr, "[SPIRV-RQ] ray query types=%zu vars=%zu, AS types=%zu vars=%zu\n",
-            rqTypeIds.size(), rqVarIds.size(), asTypeIds.size(), asVarIds.size());
+    // BDA mode requires no existing push constants (SPIR-V allows only one PC block per entry)
+    bool bdaActive = useBDA;
+    if (useBDA && hasPushConstants) {
+        fprintf(stderr, "[SPIRV-RQ] WARN: Shader has existing push constants, falling back to SSBO descriptors\n");
+        bdaActive = false;
+    }
+
+    fprintf(stderr, "[SPIRV-RQ] ray query types=%zu vars=%zu, AS types=%zu vars=%zu bda=%d\n",
+            rqTypeIds.size(), rqVarIds.size(), asTypeIds.size(), asVarIds.size(), bdaActive);
 
     // Allocate missing base types
     bool needFloat = !tFloat, needUint = !tUint, needInt = !tInt, needBool = !tBool;
@@ -383,6 +404,36 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
     uint32_t tTlasRA = newId(), tTlasS = newId(), tTlasP = newId(), vTlas = newId();
     uint32_t tInstRA = newId(), tInstS = newId(), tInstP = newId(), vInst = newId();
     uint32_t pUvec4SB = newId(), pVec4SB = newId();
+    // BDA (buffer device address) mode IDs — only used when useBDA=true
+    uint32_t tUint64 = 0, tBdaStruct = 0, pBdaPC = 0, vBdaPC = 0, pU64PC = 0;
+    uint32_t pNodesPSB = 0, pTrisPSB = 0, pTlasPSB = 0, pInstPSB = 0;
+    uint32_t pUvec4PSB = 0, pVec4PSB = 0;
+    // SSA values for loaded PSB base pointers (set at function entry)
+    uint32_t bdaNodesPtr = 0, bdaTrisPtr = 0, bdaTlasPtr = 0, bdaInstPtr = 0;
+    if (useBDA) {
+        tUint64 = newId(); tBdaStruct = newId(); pBdaPC = newId();
+        vBdaPC = newId(); pU64PC = newId();
+        pNodesPSB = newId(); pTrisPSB = newId();
+        pTlasPSB = newId(); pInstPSB = newId();
+        pUvec4PSB = newId(); pVec4PSB = newId();
+        bdaNodesPtr = newId(); bdaTrisPtr = newId();
+        bdaTlasPtr = newId(); bdaInstPtr = newId();
+    }
+    // BDA/SSBO aliases: resolve at compile time based on bdaActive
+    // These are used in all AccessChain operations to BVH buffers
+    auto bPtrU4 = [&]() -> uint32_t { return bdaActive ? pUvec4PSB : pUvec4SB; };
+    auto bPtrV4 = [&]() -> uint32_t { return bdaActive ? pVec4PSB  : pVec4SB; };
+    auto bNodes = [&]() -> uint32_t { return bdaActive ? bdaNodesPtr : vNodes; };
+    auto bTris  = [&]() -> uint32_t { return bdaActive ? bdaTrisPtr  : vTris; };
+    auto bTlas  = [&]() -> uint32_t { return bdaActive ? bdaTlasPtr  : vTlas; };
+    auto bInst  = [&]() -> uint32_t { return bdaActive ? bdaInstPtr  : vInst; };
+    // Helper: emit Load with Aligned 16 for BDA, normal for SSBO
+    auto emitBvhLoad = [&](std::vector<uint32_t>& dst, uint32_t type, uint32_t result, uint32_t ptr) {
+        if (bdaActive)
+            spvEmit(dst, SpvOpLoad, {type, result, ptr, (uint32_t)SpvMemoryAccessAlignedMask, 16});
+        else
+            spvEmit(dst, SpvOpLoad, {type, result, ptr});
+    };
     // Constants: integers 0..10 and -1
     uint32_t c0 = newId(), c1 = newId(), cn1 = newId();
     uint32_t c2 = newId(), c3 = newId(), c4 = newId(), c5 = newId();
@@ -812,6 +863,8 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
     // Phase B: Types + variables (must go before functions)
     bool injectedDecorations = false;
     bool injectedTypes = false;
+    bool injectedBdaCaps = false;
+    bool injectedBdaLoads = false;  // loads at function entry
     pos = 5;
     while (pos < numWords) {
         uint16_t wc = (uint16_t)(code[pos] >> 16);
@@ -827,6 +880,31 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             if (cap == CapRayQueryKHR || cap == CapRayTraversalPrimitiveCulling ||
                 cap == CapRayTracingKHR)
                 skip = true;
+        }
+
+        // Inject BDA capabilities + extension after last OpCapability
+        if (bdaActive && op != SpvOpCapability && !injectedBdaCaps) {
+            injectedBdaCaps = true;
+            spvEmit(out, SpvOpCapability, {(uint32_t)CapInt64});
+            spvEmit(out, SpvOpCapability, {(uint32_t)CapPhysicalStorageBufferAddresses});
+            // Emit SPV_KHR_physical_storage_buffer as OpExtension (opcode 10)
+            // String "SPV_KHR_physical_storage_buffer" + null + padding
+            {
+                const char* ext = "SPV_KHR_physical_storage_buffer";
+                size_t len = strlen(ext) + 1;
+                size_t wordCount = (len + 3) / 4;
+                std::vector<uint32_t> words(wordCount, 0);
+                memcpy(words.data(), ext, len);
+                std::vector<uint32_t> ops;
+                for (auto w : words) ops.push_back(w);
+                spvEmit(out, 10 /*OpExtension*/, ops);
+            }
+        }
+
+        // Modify OpMemoryModel: change addressing model to PhysicalStorageBuffer64
+        if (bdaActive && op == SpvOpMemoryModel && wc >= 3) {
+            spvEmit(out, SpvOpMemoryModel, {(uint32_t)AddrPhysicalStorageBuffer64, code[pos+2]});
+            skip = true;
         }
 
         // Remove OpExtension "SPV_KHR_ray_query" (opcode 10)
@@ -890,12 +968,16 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
 #endif
                     newEP.push_back(id);
             }
-            // Add our BVH SSBO variables to the interface
+            // Add our BVH variables to the interface
 #if !SPIRV_RQ_NO_SSBO
-            newEP.push_back(vNodes);
-            newEP.push_back(vTris);
-            newEP.push_back(vTlas);
-            newEP.push_back(vInst);
+            if (bdaActive) {
+                newEP.push_back(vBdaPC);  // push constant block for BDA addresses
+            } else {
+                newEP.push_back(vNodes);
+                newEP.push_back(vTris);
+                newEP.push_back(vTlas);
+                newEP.push_back(vInst);
+            }
 #endif
             spvEmit(out, SpvOpEntryPoint, newEP);
             skip = true;
@@ -968,31 +1050,53 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
 
             // BVH SSBO decorations
 #if !SPIRV_RQ_NO_SSBO
-            E(SpvOpDecorate, {tNodesRA, (uint32_t)DecArrayStride, 16});
-            E(SpvOpDecorate, {tTrisRA,  (uint32_t)DecArrayStride, 16});
-            E(SpvOpDecorate, {tNodesS,  (uint32_t)DecBlock});
-            E(SpvOpDecorate, {tTrisS,   (uint32_t)DecBlock});
-            E(SpvOpMemberDecorate, {tNodesS, 0, (uint32_t)DecOffset, 0});
-            E(SpvOpMemberDecorate, {tTrisS,  0, (uint32_t)DecOffset, 0});
-            E(SpvOpMemberDecorate, {tNodesS, 0, (uint32_t)DecNonWritable});
-            E(SpvOpMemberDecorate, {tTrisS,  0, (uint32_t)DecNonWritable});
-            E(SpvOpDecorate, {vNodes, (uint32_t)DecDescriptorSet, (uint32_t)bvhDescSet});
-            E(SpvOpDecorate, {vNodes, (uint32_t)DecBinding, (uint32_t)bvhNodesBinding});
-            E(SpvOpDecorate, {vTris,  (uint32_t)DecDescriptorSet, (uint32_t)bvhDescSet});
-            E(SpvOpDecorate, {vTris,  (uint32_t)DecBinding, (uint32_t)bvhTrisBinding});
-            // TLAS SSBO decorations (binding 2 = TLAS nodes, binding 3 = instances)
-            E(SpvOpDecorate, {tTlasRA, (uint32_t)DecArrayStride, 16});
-            E(SpvOpDecorate, {tInstRA, (uint32_t)DecArrayStride, 16});
-            E(SpvOpDecorate, {tTlasS,  (uint32_t)DecBlock});
-            E(SpvOpDecorate, {tInstS,  (uint32_t)DecBlock});
-            E(SpvOpMemberDecorate, {tTlasS, 0, (uint32_t)DecOffset, 0});
-            E(SpvOpMemberDecorate, {tInstS, 0, (uint32_t)DecOffset, 0});
-            E(SpvOpMemberDecorate, {tTlasS, 0, (uint32_t)DecNonWritable});
-            E(SpvOpMemberDecorate, {tInstS, 0, (uint32_t)DecNonWritable});
-            E(SpvOpDecorate, {vTlas, (uint32_t)DecDescriptorSet, (uint32_t)bvhDescSet});
-            E(SpvOpDecorate, {vTlas, (uint32_t)DecBinding, (uint32_t)bvhTlasBinding});
-            E(SpvOpDecorate, {vInst, (uint32_t)DecDescriptorSet, (uint32_t)bvhDescSet});
-            E(SpvOpDecorate, {vInst, (uint32_t)DecBinding, (uint32_t)bvhInstBinding});
+            if (bdaActive) {
+                // BDA mode: push constant block decorations for address struct
+                E(SpvOpDecorate, {tBdaStruct, (uint32_t)DecBlock});
+                E(SpvOpMemberDecorate, {tBdaStruct, 0, (uint32_t)DecOffset, (uint32_t)bdaPushConstOffset});
+                E(SpvOpMemberDecorate, {tBdaStruct, 1, (uint32_t)DecOffset, (uint32_t)(bdaPushConstOffset + 8)});
+                E(SpvOpMemberDecorate, {tBdaStruct, 2, (uint32_t)DecOffset, (uint32_t)(bdaPushConstOffset + 16)});
+                E(SpvOpMemberDecorate, {tBdaStruct, 3, (uint32_t)DecOffset, (uint32_t)(bdaPushConstOffset + 24)});
+                // Buffer struct decorations (Block required for PhysicalStorageBuffer)
+                E(SpvOpDecorate, {tNodesRA, (uint32_t)DecArrayStride, 16});
+                E(SpvOpDecorate, {tTrisRA,  (uint32_t)DecArrayStride, 16});
+                E(SpvOpDecorate, {tTlasRA,  (uint32_t)DecArrayStride, 16});
+                E(SpvOpDecorate, {tInstRA,  (uint32_t)DecArrayStride, 16});
+                E(SpvOpDecorate, {tNodesS,  (uint32_t)DecBlock});
+                E(SpvOpDecorate, {tTrisS,   (uint32_t)DecBlock});
+                E(SpvOpDecorate, {tTlasS,   (uint32_t)DecBlock});
+                E(SpvOpDecorate, {tInstS,   (uint32_t)DecBlock});
+                E(SpvOpMemberDecorate, {tNodesS, 0, (uint32_t)DecOffset, 0});
+                E(SpvOpMemberDecorate, {tTrisS,  0, (uint32_t)DecOffset, 0});
+                E(SpvOpMemberDecorate, {tTlasS,  0, (uint32_t)DecOffset, 0});
+                E(SpvOpMemberDecorate, {tInstS,  0, (uint32_t)DecOffset, 0});
+            } else {
+                E(SpvOpDecorate, {tNodesRA, (uint32_t)DecArrayStride, 16});
+                E(SpvOpDecorate, {tTrisRA,  (uint32_t)DecArrayStride, 16});
+                E(SpvOpDecorate, {tNodesS,  (uint32_t)DecBlock});
+                E(SpvOpDecorate, {tTrisS,   (uint32_t)DecBlock});
+                E(SpvOpMemberDecorate, {tNodesS, 0, (uint32_t)DecOffset, 0});
+                E(SpvOpMemberDecorate, {tTrisS,  0, (uint32_t)DecOffset, 0});
+                E(SpvOpMemberDecorate, {tNodesS, 0, (uint32_t)DecNonWritable});
+                E(SpvOpMemberDecorate, {tTrisS,  0, (uint32_t)DecNonWritable});
+                E(SpvOpDecorate, {vNodes, (uint32_t)DecDescriptorSet, (uint32_t)bvhDescSet});
+                E(SpvOpDecorate, {vNodes, (uint32_t)DecBinding, (uint32_t)bvhNodesBinding});
+                E(SpvOpDecorate, {vTris,  (uint32_t)DecDescriptorSet, (uint32_t)bvhDescSet});
+                E(SpvOpDecorate, {vTris,  (uint32_t)DecBinding, (uint32_t)bvhTrisBinding});
+                // TLAS SSBO decorations (binding 2 = TLAS nodes, binding 3 = instances)
+                E(SpvOpDecorate, {tTlasRA, (uint32_t)DecArrayStride, 16});
+                E(SpvOpDecorate, {tInstRA, (uint32_t)DecArrayStride, 16});
+                E(SpvOpDecorate, {tTlasS,  (uint32_t)DecBlock});
+                E(SpvOpDecorate, {tInstS,  (uint32_t)DecBlock});
+                E(SpvOpMemberDecorate, {tTlasS, 0, (uint32_t)DecOffset, 0});
+                E(SpvOpMemberDecorate, {tInstS, 0, (uint32_t)DecOffset, 0});
+                E(SpvOpMemberDecorate, {tTlasS, 0, (uint32_t)DecNonWritable});
+                E(SpvOpMemberDecorate, {tInstS, 0, (uint32_t)DecNonWritable});
+                E(SpvOpDecorate, {vTlas, (uint32_t)DecDescriptorSet, (uint32_t)bvhDescSet});
+                E(SpvOpDecorate, {vTlas, (uint32_t)DecBinding, (uint32_t)bvhTlasBinding});
+                E(SpvOpDecorate, {vInst, (uint32_t)DecDescriptorSet, (uint32_t)bvhDescSet});
+                E(SpvOpDecorate, {vInst, (uint32_t)DecBinding, (uint32_t)bvhInstBinding});
+            }
 #endif // !SPIRV_RQ_NO_SSBO
         }
 #endif // !SPIRV_RQ_MINIMAL (Phase A)
@@ -1066,30 +1170,59 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
 
             // BVH nodes SSBO: buffer { uvec4 data[]; }
 #if !SPIRV_RQ_NO_SSBO
-            E(SpvOpTypeRuntimeArray, {tNodesRA, tUvec4});
-            E(SpvOpTypeStruct,       {tNodesS, tNodesRA});
-            E(SpvOpTypePointer,      {tNodesP, (uint32_t)SCStorageBuffer, tNodesS});
-            E(SpvOpVariable,         {tNodesP, vNodes, (uint32_t)SCStorageBuffer});
-            // Triangles SSBO: buffer { vec4 data[]; }
-            E(SpvOpTypeRuntimeArray, {tTrisRA, tVec4});
-            E(SpvOpTypeStruct,       {tTrisS, tTrisRA});
-            E(SpvOpTypePointer,      {tTrisP, (uint32_t)SCStorageBuffer, tTrisS});
-            E(SpvOpVariable,         {tTrisP, vTris, (uint32_t)SCStorageBuffer});
-            // SSBO element pointer types
-            E(SpvOpTypePointer, {pUvec4SB, (uint32_t)SCStorageBuffer, tUvec4});
-            E(SpvOpTypePointer, {pVec4SB,  (uint32_t)SCStorageBuffer, tVec4});
-            // TLAS nodes SSBO: buffer { uvec4 data[]; } (same format as BLAS nodes)
-            E(SpvOpTypeRuntimeArray, {tTlasRA, tUvec4});
-            E(SpvOpTypeStruct,       {tTlasS, tTlasRA});
-            E(SpvOpTypePointer,      {tTlasP, (uint32_t)SCStorageBuffer, tTlasS});
-            E(SpvOpVariable,         {tTlasP, vTlas, (uint32_t)SCStorageBuffer});
-            // Instances SSBO: buffer { vec4 data[]; }
-            E(SpvOpTypeRuntimeArray, {tInstRA, tVec4});
-            E(SpvOpTypeStruct,       {tInstS, tInstRA});
-            E(SpvOpTypePointer,      {tInstP, (uint32_t)SCStorageBuffer, tInstS});
-            E(SpvOpVariable,         {tInstP, vInst, (uint32_t)SCStorageBuffer});
-
-            fprintf(stderr, "[SPIRV-RQ] Injected BVH SSBOs set=%d bind=0,1,2,3\n", bvhDescSet);
+            if (bdaActive) {
+                // BDA mode: buffer struct types (same data layout, PhysicalStorageBuffer pointers)
+                E(SpvOpTypeRuntimeArray, {tNodesRA, tUvec4});
+                E(SpvOpTypeStruct,       {tNodesS, tNodesRA});
+                E(SpvOpTypeRuntimeArray, {tTrisRA, tVec4});
+                E(SpvOpTypeStruct,       {tTrisS, tTrisRA});
+                E(SpvOpTypeRuntimeArray, {tTlasRA, tUvec4});
+                E(SpvOpTypeStruct,       {tTlasS, tTlasRA});
+                E(SpvOpTypeRuntimeArray, {tInstRA, tVec4});
+                E(SpvOpTypeStruct,       {tInstS, tInstRA});
+                // PhysicalStorageBuffer pointer types (for buffer access)
+                E(SpvOpTypePointer, {pNodesPSB, (uint32_t)SCPhysicalStorageBuffer, tNodesS});
+                E(SpvOpTypePointer, {pTrisPSB,  (uint32_t)SCPhysicalStorageBuffer, tTrisS});
+                E(SpvOpTypePointer, {pTlasPSB,  (uint32_t)SCPhysicalStorageBuffer, tTlasS});
+                E(SpvOpTypePointer, {pInstPSB,  (uint32_t)SCPhysicalStorageBuffer, tInstS});
+                E(SpvOpTypePointer, {pUvec4PSB, (uint32_t)SCPhysicalStorageBuffer, tUvec4});
+                E(SpvOpTypePointer, {pVec4PSB,  (uint32_t)SCPhysicalStorageBuffer, tVec4});
+                // Push constant block: struct { uint64 nodesAddr, trisAddr, tlasAddr, instAddr; }
+                E(SpvOpTypeInt,     {tUint64, 64, 0});
+                E(SpvOpTypeStruct,  {tBdaStruct, tUint64, tUint64, tUint64, tUint64});
+                E(SpvOpTypePointer, {pBdaPC, (uint32_t)SCPushConstant, tBdaStruct});
+                E(SpvOpTypePointer, {pU64PC, (uint32_t)SCPushConstant, tUint64});
+                E(SpvOpVariable,    {pBdaPC, vBdaPC, (uint32_t)SCPushConstant});
+                // SB pointer types still needed for non-PSB AccessChain fallbacks
+                E(SpvOpTypePointer, {pUvec4SB, (uint32_t)SCStorageBuffer, tUvec4});
+                E(SpvOpTypePointer, {pVec4SB,  (uint32_t)SCStorageBuffer, tVec4});
+                fprintf(stderr, "[SPIRV-RQ] Injected BVH BDA (PhysicalStorageBuffer) push const offset=%d\n",
+                        bdaPushConstOffset);
+            } else {
+                E(SpvOpTypeRuntimeArray, {tNodesRA, tUvec4});
+                E(SpvOpTypeStruct,       {tNodesS, tNodesRA});
+                E(SpvOpTypePointer,      {tNodesP, (uint32_t)SCStorageBuffer, tNodesS});
+                E(SpvOpVariable,         {tNodesP, vNodes, (uint32_t)SCStorageBuffer});
+                // Triangles SSBO: buffer { vec4 data[]; }
+                E(SpvOpTypeRuntimeArray, {tTrisRA, tVec4});
+                E(SpvOpTypeStruct,       {tTrisS, tTrisRA});
+                E(SpvOpTypePointer,      {tTrisP, (uint32_t)SCStorageBuffer, tTrisS});
+                E(SpvOpVariable,         {tTrisP, vTris, (uint32_t)SCStorageBuffer});
+                // SSBO element pointer types
+                E(SpvOpTypePointer, {pUvec4SB, (uint32_t)SCStorageBuffer, tUvec4});
+                E(SpvOpTypePointer, {pVec4SB,  (uint32_t)SCStorageBuffer, tVec4});
+                // TLAS nodes SSBO: buffer { uvec4 data[]; } (same format as BLAS nodes)
+                E(SpvOpTypeRuntimeArray, {tTlasRA, tUvec4});
+                E(SpvOpTypeStruct,       {tTlasS, tTlasRA});
+                E(SpvOpTypePointer,      {tTlasP, (uint32_t)SCStorageBuffer, tTlasS});
+                E(SpvOpVariable,         {tTlasP, vTlas, (uint32_t)SCStorageBuffer});
+                // Instances SSBO: buffer { vec4 data[]; }
+                E(SpvOpTypeRuntimeArray, {tInstRA, tVec4});
+                E(SpvOpTypeStruct,       {tInstS, tInstRA});
+                E(SpvOpTypePointer,      {tInstP, (uint32_t)SCStorageBuffer, tInstS});
+                E(SpvOpVariable,         {tInstP, vInst, (uint32_t)SCStorageBuffer});
+                fprintf(stderr, "[SPIRV-RQ] Injected BVH SSBOs set=%d bind=0,1,2,3\n", bvhDescSet);
+            }
 #else
             fprintf(stderr, "[SPIRV-RQ] SSBO injection SUPPRESSED (SPIRV_RQ_NO_SSBO=1)\n");
 #endif
@@ -1166,6 +1299,28 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 spvEmit(out, SpvOpVariable, {pUint,  tvRayCullMask, (uint32_t)SCFunction});
                 spvEmit(out, SpvOpVariable, {pUint,  tvInstFlags,   (uint32_t)SCFunction});
                 spvEmit(out, SpvOpVariable, {pUint,  tvHitFrontFace,(uint32_t)SCFunction}); // bool stored as uint
+                // BDA: load buffer addresses from push constants and convert to PSB pointers
+                if (bdaActive && !injectedBdaLoads) {
+                    injectedBdaLoads = true;
+                    // Load each uint64 address from push constant block
+                    uint32_t pAddr0 = newId(), pAddr1 = newId(), pAddr2 = newId(), pAddr3 = newId();
+                    uint32_t addr0 = newId(), addr1 = newId(), addr2 = newId(), addr3 = newId();
+                    // AccessChain into push constant struct members
+                    spvEmit(out, SpvOpAccessChain, {pU64PC, pAddr0, vBdaPC, c0});
+                    spvEmit(out, SpvOpAccessChain, {pU64PC, pAddr1, vBdaPC, c1});
+                    spvEmit(out, SpvOpAccessChain, {pU64PC, pAddr2, vBdaPC, c2});
+                    spvEmit(out, SpvOpAccessChain, {pU64PC, pAddr3, vBdaPC, c3});
+                    // Load the addresses
+                    spvEmit(out, SpvOpLoad, {tUint64, addr0, pAddr0});
+                    spvEmit(out, SpvOpLoad, {tUint64, addr1, pAddr1});
+                    spvEmit(out, SpvOpLoad, {tUint64, addr2, pAddr2});
+                    spvEmit(out, SpvOpLoad, {tUint64, addr3, pAddr3});
+                    // Convert to PhysicalStorageBuffer pointers
+                    spvEmit(out, (uint16_t)SpvOpConvertUToPtr, {pNodesPSB, bdaNodesPtr, addr0});
+                    spvEmit(out, (uint16_t)SpvOpConvertUToPtr, {pTrisPSB,  bdaTrisPtr,  addr1});
+                    spvEmit(out, (uint16_t)SpvOpConvertUToPtr, {pTlasPSB,  bdaTlasPtr,  addr2});
+                    spvEmit(out, (uint16_t)SpvOpConvertUToPtr, {pInstPSB,  bdaInstPtr,  addr3});
+                }
             }
             skip = true; // already copied OpLabel
         }
@@ -1278,8 +1433,8 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             // SSBO READ TEST: Load uint word 0 from TLAS SSBO, check if non-zero (integer)
             {
                 uint32_t ssboPtr = newId(), ssboVal = newId();
-                E(SpvOpAccessChain, {pUvec4SB, ssboPtr, vTlas, c0, c0});  // tlas[0]
-                E(SpvOpLoad, {tUvec4, ssboVal, ssboPtr});
+                E(SpvOpAccessChain, {bPtrU4(), ssboPtr, bTlas(), c0, c0});  // tlas[0]
+                emitBvhLoad(out, tUvec4, ssboVal, ssboPtr);
                 uint32_t ssboW0 = newId();
                 E(SpvOpCompositeExtract, {tUint, ssboW0, ssboVal, 0});
                 // Integer comparison: if raw uint bits != 0 → data present
@@ -1368,10 +1523,10 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             E(SpvOpIMul, {tInt, tlNi2, tlNiVal, c2});
             E(SpvOpIAdd, {tInt, tlNi2p1, tlNi2, c1});
             uint32_t ptw0 = newId(), ptw1 = newId(), tw0 = newId(), tw1 = newId();
-            E(SpvOpAccessChain, {pUvec4SB, ptw0, vTlas, c0, tlNi2});
-            E(SpvOpLoad, {tUvec4, tw0, ptw0});
-            E(SpvOpAccessChain, {pUvec4SB, ptw1, vTlas, c0, tlNi2p1});
-            E(SpvOpLoad, {tUvec4, tw1, ptw1});
+            E(SpvOpAccessChain, {bPtrU4(), ptw0, bTlas(), c0, tlNi2});
+            emitBvhLoad(out, tUvec4, tw0, ptw0);
+            E(SpvOpAccessChain, {bPtrU4(), ptw1, bTlas(), c0, tlNi2p1});
+            emitBvhLoad(out, tUvec4, tw1, ptw1);
 
             // Extract leaf_enc = int(tw1.z), skip = int(tw1.w)
             uint32_t tw1z = newId(), tw1w = newId(), tlLeafEnc = newId(), tlSkipVal = newId();
@@ -1415,8 +1570,8 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 // vec4[8] = (customIdx, sbtOffset, origInstIdx, packed(instanceMask | instanceFlags<<8))
                 uint32_t ib8Idx = newId(), pIb8 = newId(), ib8 = newId();
                 E(SpvOpIAdd, {tInt, ib8Idx, instBase, c8});
-                E(SpvOpAccessChain, {pVec4SB, pIb8, vInst, c0, ib8Idx});
-                E(SpvOpLoad, {tVec4, ib8, pIb8});
+                E(SpvOpAccessChain, {bPtrV4(), pIb8, bInst(), c0, ib8Idx});
+                emitBvhLoad(out, tVec4, ib8, pIb8);
                 uint32_t packedF = newId(), packedU = newId();
                 E(SpvOpCompositeExtract, {tFloat, packedF, ib8, 3});
                 E(SpvOpConvertFToU, {tUint, packedU, packedF});
@@ -1446,30 +1601,30 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 // ir0 = instances[instBase + 3]
                 uint32_t ir0Idx = newId(), pIr0 = newId(), ir0 = newId();
                 E(SpvOpIAdd, {tInt, ir0Idx, instBase, c3});
-                E(SpvOpAccessChain, {pVec4SB, pIr0, vInst, c0, ir0Idx});
-                E(SpvOpLoad, {tVec4, ir0, pIr0});
+                E(SpvOpAccessChain, {bPtrV4(), pIr0, bInst(), c0, ir0Idx});
+                emitBvhLoad(out, tVec4, ir0, pIr0);
                 // ir1 = instances[instBase + 4]
                 uint32_t ir1Idx = newId(), pIr1 = newId(), ir1 = newId();
                 E(SpvOpIAdd, {tInt, ir1Idx, instBase, c4});
-                E(SpvOpAccessChain, {pVec4SB, pIr1, vInst, c0, ir1Idx});
-                E(SpvOpLoad, {tVec4, ir1, pIr1});
+                E(SpvOpAccessChain, {bPtrV4(), pIr1, bInst(), c0, ir1Idx});
+                emitBvhLoad(out, tVec4, ir1, pIr1);
                 // ir2 = instances[instBase + 5]
                 uint32_t ir2Idx = newId(), pIr2 = newId(), ir2 = newId();
                 E(SpvOpIAdd, {tInt, ir2Idx, instBase, c5});
-                E(SpvOpAccessChain, {pVec4SB, pIr2, vInst, c0, ir2Idx});
-                E(SpvOpLoad, {tVec4, ir2, pIr2});
+                E(SpvOpAccessChain, {bPtrV4(), pIr2, bInst(), c0, ir2Idx});
+                emitBvhLoad(out, tVec4, ir2, pIr2);
 
                 // Load per-instance BLAS offsets from packed buffer:
                 // vec4[6] = (blasMin.xyz, float(blasNodeOff))
                 // vec4[7] = (blasMax.xyz, float(blasTriOff))
                 uint32_t ib6Idx = newId(), pIb6 = newId(), ib6 = newId();
                 E(SpvOpIAdd, {tInt, ib6Idx, instBase, c6});
-                E(SpvOpAccessChain, {pVec4SB, pIb6, vInst, c0, ib6Idx});
-                E(SpvOpLoad, {tVec4, ib6, pIb6});
+                E(SpvOpAccessChain, {bPtrV4(), pIb6, bInst(), c0, ib6Idx});
+                emitBvhLoad(out, tVec4, ib6, pIb6);
                 uint32_t ib7Idx = newId(), pIb7 = newId(), ib7 = newId();
                 E(SpvOpIAdd, {tInt, ib7Idx, instBase, c7});
-                E(SpvOpAccessChain, {pVec4SB, pIb7, vInst, c0, ib7Idx});
-                E(SpvOpLoad, {tVec4, ib7, pIb7});
+                E(SpvOpAccessChain, {bPtrV4(), pIb7, bInst(), c0, ib7Idx});
+                emitBvhLoad(out, tVec4, ib7, pIb7);
                 // blasNodeOff = int(ib6.w), blasTriOff = int(ib7.w)
                 // Stored as float(uint) in C++, read back via ConvertFToS (exact for offsets < 2^24)
                 uint32_t ib6wF = newId(), ib7wF = newId();
@@ -1576,10 +1731,10 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                 E(SpvOpIMul, {tInt, ni2, niOff, c2});
                 E(SpvOpIAdd, {tInt, ni2p1, ni2, c1});
                 uint32_t pw0 = newId(), pw1 = newId(), w0 = newId(), w1 = newId();
-                E(SpvOpAccessChain, {pUvec4SB, pw0, vNodes, c0, ni2});
-                E(SpvOpLoad, {tUvec4, w0, pw0});
-                E(SpvOpAccessChain, {pUvec4SB, pw1, vNodes, c0, ni2p1});
-                E(SpvOpLoad, {tUvec4, w1, pw1});
+                E(SpvOpAccessChain, {bPtrU4(), pw0, bNodes(), c0, ni2});
+                emitBvhLoad(out, tUvec4, w0, pw0);
+                E(SpvOpAccessChain, {bPtrU4(), pw1, bNodes(), c0, ni2p1});
+                emitBvhLoad(out, tUvec4, w1, pw1);
 
                 // Extract leaf_enc = int(w1.z), skip = int(w1.w)
                 uint32_t w1z = newId(), w1w = newId(), leafEnc = newId(), skipVal = newId();
@@ -1643,13 +1798,13 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
                     E(SpvOpIAdd, {tInt, bp1, b, c1});
                     E(SpvOpIAdd, {tInt, bp2, b, c2});
                     uint32_t pp0 = newId(), pp1 = newId(), pp2 = newId();
-                    E(SpvOpAccessChain, {pVec4SB, pp0, vTris, c0, b});
-                    E(SpvOpAccessChain, {pVec4SB, pp1, vTris, c0, bp1});
-                    E(SpvOpAccessChain, {pVec4SB, pp2, vTris, c0, bp2});
+                    E(SpvOpAccessChain, {bPtrV4(), pp0, bTris(), c0, b});
+                    E(SpvOpAccessChain, {bPtrV4(), pp1, bTris(), c0, bp1});
+                    E(SpvOpAccessChain, {bPtrV4(), pp2, bTris(), c0, bp2});
                     uint32_t p0 = newId(), p1 = newId(), p2 = newId();
-                    E(SpvOpLoad, {tVec4, p0, pp0});
-                    E(SpvOpLoad, {tVec4, p1, pp1});
-                    E(SpvOpLoad, {tVec4, p2, pp2});
+                    emitBvhLoad(out, tVec4, p0, pp0);
+                    emitBvhLoad(out, tVec4, p1, pp1);
+                    emitBvhLoad(out, tVec4, p2, pp2);
 
                     // v0 = p0.xyz
                     uint32_t v0x = newId(), v0y = newId(), v0z = newId(), v0 = newId();
@@ -2144,8 +2299,8 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             spvEmit(out, SpvOpIAdd, {tInt, metaIdx, ibase, c8});
             // Load vec4 from instance SSBO
             uint32_t pM = newId(), metaV = newId();
-            spvEmit(out, SpvOpAccessChain, {pVec4SB, pM, vInst, c0, metaIdx});
-            spvEmit(out, SpvOpLoad, {tVec4, metaV, pM});
+            spvEmit(out, SpvOpAccessChain, {bPtrV4(), pM, bInst(), c0, metaIdx});
+            emitBvhLoad(out, tVec4, metaV, pM);
             // Extract .z = originalInstIdx, convert float→int/uint
             uint32_t valF = newId();
             spvEmit(out, SpvOpCompositeExtract, {tFloat, valF, metaV, (uint32_t)2});
@@ -2219,8 +2374,8 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             spvEmit(out, SpvOpIAdd, {tInt, metaIdx, ibase, c8});
             // Load vec4 from instance SSBO
             uint32_t pM = newId(), metaV = newId();
-            spvEmit(out, SpvOpAccessChain, {pVec4SB, pM, vInst, c0, metaIdx});
-            spvEmit(out, SpvOpLoad, {tVec4, metaV, pM});
+            spvEmit(out, SpvOpAccessChain, {bPtrV4(), pM, bInst(), c0, metaIdx});
+            emitBvhLoad(out, tVec4, metaV, pM);
             // Extract component: .x=customIdx, .y=sbtOffset
             int comp = (op == SpvOpRQGetSBTOffset) ? 1 : 0;
             uint32_t valF = newId();
@@ -2308,18 +2463,18 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             // Load 3 vec4 rows from instance SSBO
             uint32_t r0i = newId(), pr0 = newId(), r0 = newId();
             spvEmit(out, SpvOpIAdd, {tInt, r0i, instBase, rOff0});
-            spvEmit(out, SpvOpAccessChain, {pVec4SB, pr0, vInst, c0, r0i});
-            spvEmit(out, SpvOpLoad, {tVec4, r0, pr0});
+            spvEmit(out, SpvOpAccessChain, {bPtrV4(), pr0, bInst(), c0, r0i});
+            emitBvhLoad(out, tVec4, r0, pr0);
 
             uint32_t r1i = newId(), pr1 = newId(), r1 = newId();
             spvEmit(out, SpvOpIAdd, {tInt, r1i, instBase, rOff1});
-            spvEmit(out, SpvOpAccessChain, {pVec4SB, pr1, vInst, c0, r1i});
-            spvEmit(out, SpvOpLoad, {tVec4, r1, pr1});
+            spvEmit(out, SpvOpAccessChain, {bPtrV4(), pr1, bInst(), c0, r1i});
+            emitBvhLoad(out, tVec4, r1, pr1);
 
             uint32_t r2i = newId(), pr2 = newId(), r2 = newId();
             spvEmit(out, SpvOpIAdd, {tInt, r2i, instBase, rOff2});
-            spvEmit(out, SpvOpAccessChain, {pVec4SB, pr2, vInst, c0, r2i});
-            spvEmit(out, SpvOpLoad, {tVec4, r2, pr2});
+            spvEmit(out, SpvOpAccessChain, {bPtrV4(), pr2, bInst(), c0, r2i});
+            emitBvhLoad(out, tVec4, r2, pr2);
 
             // Extract all 12 components
             uint32_t r0x=newId(), r0y=newId(), r0z=newId(), r0w=newId();
@@ -2434,6 +2589,7 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
 // ============================================================================
 struct SpirvRewriteResult {
     bool rewritten;
+    bool bdaActive;      // true if BDA mode was used for this shader
     std::vector<uint32_t> code;
     int bvhDescSet;
     int bvhNodesBinding;
@@ -2444,10 +2600,12 @@ struct SpirvRewriteResult {
 
 static SpirvRewriteResult spirvTryRewriteRayQuery(
     const uint32_t* code, size_t numWords,
-    int maxBoundSets = 8)  // V100 default; caller should pass actual limit
+    int maxBoundSets = 8,  // V100 default; caller should pass actual limit
+    bool useBDA = false, int bdaPushConstOffset = 128)
 {
     SpirvRewriteResult r = {};
     r.rewritten = false;
+    r.bdaActive = false;
     if (!spirvHasRayQuery(code, numWords)) return r;
 
     int maxSet = spirvMaxDescriptorSet(code, numWords);
@@ -2468,11 +2626,32 @@ static SpirvRewriteResult spirvTryRewriteRayQuery(
         r.bvhInstBinding = 103;
     }
 
-    fprintf(stderr, "[SPIRV-RQ] Shader has ray queries! Rewriting (BVH set=%d bind=%d,%d,%d,%d maxSet=%d limit=%d)\n",
+    fprintf(stderr, "[SPIRV-RQ] Shader has ray queries! Rewriting (BVH set=%d bind=%d,%d,%d,%d maxSet=%d limit=%d bda=%d)\n",
             r.bvhDescSet, r.bvhNodesBinding, r.bvhTrisBinding, r.bvhTlasBinding, r.bvhInstBinding,
-            maxSet, maxBoundSets);
+            maxSet, maxBoundSets, useBDA);
     r.code = spirvRewriteRayQuery(code, numWords, r.bvhDescSet, r.bvhNodesBinding, r.bvhTrisBinding,
-                                  r.bvhTlasBinding, r.bvhInstBinding);
+                                  r.bvhTlasBinding, r.bvhInstBinding, useBDA, bdaPushConstOffset);
     r.rewritten = !r.code.empty();
+    // Check if BDA was actually used (might be disabled if shader has existing push constants)
+    if (r.rewritten && useBDA) {
+        // The rewriter sets bdaActive internally; we can detect by checking the addressing model
+        // in the output SPIR-V (word 3 of instruction at offset 5+)
+        // Simple heuristic: if useBDA was requested and rewrite succeeded, check if the
+        // output has PhysicalStorageBuffer64 addressing model
+        if (r.code.size() > 10) {
+            // Scan for OpMemoryModel (opcode 14)
+            for (size_t i = 5; i < r.code.size(); ) {
+                uint16_t wc = (uint16_t)(r.code[i] >> 16);
+                uint16_t op = (uint16_t)(r.code[i] & 0xFFFF);
+                if (wc == 0) break;
+                if (op == 14 && wc >= 3 && r.code[i+1] == 5348) { // AddrPhysicalStorageBuffer64
+                    r.bdaActive = true;
+                    break;
+                }
+                if (op == 14) break; // found MemoryModel but not BDA
+                i += wc;
+            }
+        }
+    }
     return r;
 }
