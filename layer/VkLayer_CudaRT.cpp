@@ -881,6 +881,14 @@ struct BVH2Interop {
 };
 static BVH2Interop g_bvh2 = {};
 
+// BDA mode: read early so shader rewriting can see it before BVH pre-alloc
+// NOTE: V100 NVVM compiler (580.x) cannot compile PhysicalStorageBuffer SPIR-V.
+// BDA works on Turing+ (RTX 20xx, driver 525+). Keep disabled on V100.
+static bool g_bdaRequested = []() {
+    const char* e = getenv("CUDA_RT_BDA");
+    return e && atoi(e);
+}();
+
 static int g_verbose = 1;
 uint32_t g_rqDispatchPerFrame = 0; // reset per frame in QueuePresent
 static int g_trackVerbose = 0;
@@ -2486,7 +2494,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateShaderModule(
                 stripped, numWords);
     } else {
         rw = spirvTryRewriteRayQuery(spirvCode, numWords, (int)g_maxBoundDescSets,
-                                     g_bvh2.useBDA, 128 /*bdaPushConstOffset*/);
+                                     g_bdaRequested, 128 /*bdaPushConstOffset*/);
     }
 
     if (rw.rewritten) {
@@ -3940,12 +3948,9 @@ static bool setupBVH2Descriptors(DeviceDispatch& disp) {
     // BDA mode: pass BVH buffer addresses as push constants (zero descriptor binding)
     // Enable with CUDA_RT_BDA=1. Completely eliminates descriptor set crash surface.
     g_bvh2.useBDA = false;
-    {
-        const char* bda = getenv("CUDA_RT_BDA");
-        if (bda && atoi(bda) && disp.GetBufferDeviceAddress) {
-            g_bvh2.useBDA = true;
-            LOG("[BVH2] BDA mode ENABLED — BVH addresses via push constants (no descriptor binding)");
-        }
+    if (g_bdaRequested && disp.GetBufferDeviceAddress) {
+        g_bvh2.useBDA = true;
+        LOG("[BVH2] BDA mode ENABLED — BVH addresses via push constants (no descriptor binding)");
     }
 
     // Pre-allocate LARGE BVH buffers (4MB each) so they can be bound during command

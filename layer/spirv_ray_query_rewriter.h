@@ -901,11 +901,14 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             }
         }
 
-        // Modify OpMemoryModel: change addressing model to PhysicalStorageBuffer64
-        if (bdaActive && op == SpvOpMemoryModel && wc >= 3) {
-            spvEmit(out, SpvOpMemoryModel, {(uint32_t)AddrPhysicalStorageBuffer64, code[pos+2]});
-            skip = true;
-        }
+        // Note: We do NOT change the addressing model to PhysicalStorageBuffer64.
+        // The V100 NVVM compiler (580.142) rejects PhysicalStorageBuffer64 even though
+        // the driver advertises bufferDeviceAddress support. NVIDIA drivers are permissive
+        // about using PhysicalStorageBuffer pointers with Logical addressing model.
+        // if (bdaActive && op == SpvOpMemoryModel && wc >= 3) {
+        //     spvEmit(out, SpvOpMemoryModel, {(uint32_t)AddrPhysicalStorageBuffer64, code[pos+2]});
+        //     skip = true;
+        // }
 
         // Remove OpExtension "SPV_KHR_ray_query" (opcode 10)
         if (op == 10 /*OpExtension*/ && wc >= 2) {
@@ -2634,21 +2637,18 @@ static SpirvRewriteResult spirvTryRewriteRayQuery(
     r.rewritten = !r.code.empty();
     // Check if BDA was actually used (might be disabled if shader has existing push constants)
     if (r.rewritten && useBDA) {
-        // The rewriter sets bdaActive internally; we can detect by checking the addressing model
-        // in the output SPIR-V (word 3 of instruction at offset 5+)
-        // Simple heuristic: if useBDA was requested and rewrite succeeded, check if the
-        // output has PhysicalStorageBuffer64 addressing model
+        // Detect BDA by checking for PhysicalStorageBufferAddresses capability (5347)
+        // We no longer change the addressing model, so scan for the capability instead
         if (r.code.size() > 10) {
-            // Scan for OpMemoryModel (opcode 14)
             for (size_t i = 5; i < r.code.size(); ) {
                 uint16_t wc = (uint16_t)(r.code[i] >> 16);
                 uint16_t op = (uint16_t)(r.code[i] & 0xFFFF);
                 if (wc == 0) break;
-                if (op == 14 && wc >= 3 && r.code[i+1] == 5348) { // AddrPhysicalStorageBuffer64
+                if (op == 17 /*OpCapability*/ && wc >= 2 && r.code[i+1] == 5347) {
                     r.bdaActive = true;
                     break;
                 }
-                if (op == 14) break; // found MemoryModel but not BDA
+                if (op == 14) break; // past capabilities section
                 i += wc;
             }
         }
