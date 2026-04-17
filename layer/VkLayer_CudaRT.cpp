@@ -7357,6 +7357,46 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
         }
     }
 
+    // Surgical skip range: fake-submit only within [SKIP_FROM, SKIP_TO] without
+    // setting g_gpuDead, so the driver continues to render real frames outside
+    // the window. Use this to "piss on" a specific bad submit (e.g. V100 580.142
+    // UAF at 7834) while keeping the rest of the benchmark live.
+    {
+        static int skipFrom = -1, skipTo = -1;
+        if (skipFrom < 0) {
+            const char* f = getenv("CUDA_RT_SKIP_FROM");
+            const char* t = getenv("CUDA_RT_SKIP_TO");
+            skipFrom = (f && atoi(f) > 0) ? atoi(f) : 0;
+            skipTo   = (t && atoi(t) > 0) ? atoi(t) : 0;
+            if (skipFrom > 0 && skipTo < skipFrom) skipTo = skipFrom;
+        }
+        if (skipFrom > 0 && (int)g_submitCount >= skipFrom && (int)g_submitCount <= skipTo
+            && !g_gpuDead.load(std::memory_order_relaxed)) {
+            std::vector<VkSubmitInfo> fakes(submitCount);
+            for (uint32_t si = 0; si < submitCount; si++) {
+                fakes[si] = {};
+                fakes[si].sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+                fakes[si].pNext = pSubmits[si].pNext;
+                fakes[si].waitSemaphoreCount   = pSubmits[si].waitSemaphoreCount;
+                fakes[si].pWaitSemaphores      = pSubmits[si].pWaitSemaphores;
+                fakes[si].pWaitDstStageMask    = pSubmits[si].pWaitDstStageMask;
+                fakes[si].signalSemaphoreCount = pSubmits[si].signalSemaphoreCount;
+                fakes[si].pSignalSemaphores    = pSubmits[si].pSignalSemaphores;
+            }
+            installCrashRecovery();
+            g_crashGuardActive = 1;
+            if (sigsetjmp(g_crashJmpBuf, 1) == 0) {
+                disp.QueueSubmit(queue, submitCount, fakes.data(), fence);
+            }
+            g_crashGuardActive = 0;
+            static uint32_t skipCount = 0;
+            if ((++skipCount % 10) == 1)
+                fprintf(stderr, "[CudaRT] SKIP SUBMIT #%u at %u (window %d-%d)\n",
+                        skipCount, g_submitCount, skipFrom, skipTo);
+            return VK_SUCCESS;
+        }
+    }
+
     // GPU dead mode: driver has crashed during rendering. Don't touch any
     // command buffers (they may reference freed state). Issue a signal-only
     // submit so the app's semaphores + fence are signaled and it progresses.
@@ -7412,11 +7452,41 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
 
     // Fast path: after BLAS builds are done, pass through with crash guard
     if (g_blasBuildsDone) {
+        // Filter out poisoned command buffers — any buffer whose recording
+        // triggered a CRASH RECOVERY is known to contain a bad command and
+        // will crash the driver on execution. Submit only the clean ones;
+        // if everything is poisoned, do a signal-only submit.
+        std::vector<VkSubmitInfo> cleaned;
+        std::vector<std::vector<VkCommandBuffer>> cleanBufs(submitCount);
+        bool anyFiltered = false;
+        cleaned.reserve(submitCount);
+        for (uint32_t si = 0; si < submitCount; si++) {
+            VkSubmitInfo sub = pSubmits[si];
+            auto& cb = cleanBufs[si];
+            cb.reserve(sub.commandBufferCount);
+            for (uint32_t j = 0; j < sub.commandBufferCount; j++) {
+                if (!isCmdBufPoisoned(sub.pCommandBuffers[j]))
+                    cb.push_back(sub.pCommandBuffers[j]);
+                else
+                    anyFiltered = true;
+            }
+            sub.commandBufferCount = (uint32_t)cb.size();
+            sub.pCommandBuffers    = cb.empty() ? nullptr : cb.data();
+            cleaned.push_back(sub);
+        }
+        if (anyFiltered) {
+            static uint64_t poisonFilterCount = 0;
+            if ((++poisonFilterCount % 25) == 1)
+                fprintf(stderr, "[CudaRT] ⚠ POISON FILTER #%lu: dropped poisoned cmdBufs at submit %u\n",
+                        poisonFilterCount, g_submitCount);
+        }
+        const VkSubmitInfo* realSubmits = cleaned.data();
+
         VkResult r = VK_ERROR_DEVICE_LOST;
         installCrashRecovery();
         g_crashGuardActive = 1;
         if (sigsetjmp(g_crashJmpBuf, 1) == 0) {
-            r = disp.QueueSubmit(queue, submitCount, pSubmits, fence);
+            r = disp.QueueSubmit(queue, submitCount, realSubmits, fence);
             g_crashGuardActive = 0;
         } else {
             uint64_t cnt = g_crashRecoveryCount.load(std::memory_order_relaxed);
@@ -7702,7 +7772,45 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit2KHR(
 {
     void* key = getKey(queue);
     auto& disp = g_deviceMap[key];
+    g_lastSubmitQueue.store(queue, std::memory_order_relaxed);
     g_submitCount++;
+
+    // Surgical skip window (see QueueSubmit version for rationale).
+    {
+        static int skipFrom = -1, skipTo = -1;
+        if (skipFrom < 0) {
+            const char* f = getenv("CUDA_RT_SKIP_FROM");
+            const char* t = getenv("CUDA_RT_SKIP_TO");
+            skipFrom = (f && atoi(f) > 0) ? atoi(f) : 0;
+            skipTo   = (t && atoi(t) > 0) ? atoi(t) : 0;
+            if (skipFrom > 0 && skipTo < skipFrom) skipTo = skipFrom;
+        }
+        if (skipFrom > 0 && (int)g_submitCount >= skipFrom && (int)g_submitCount <= skipTo
+            && !g_gpuDead.load(std::memory_order_relaxed)) {
+            std::vector<VkSubmitInfo2KHR> fakes(submitCount);
+            for (uint32_t si = 0; si < submitCount; si++) {
+                fakes[si] = {};
+                fakes[si].sType = VK_STRUCTURE_TYPE_SUBMIT_INFO_2_KHR;
+                fakes[si].pNext = pSubmits[si].pNext;
+                fakes[si].flags = pSubmits[si].flags;
+                fakes[si].waitSemaphoreInfoCount   = pSubmits[si].waitSemaphoreInfoCount;
+                fakes[si].pWaitSemaphoreInfos      = pSubmits[si].pWaitSemaphoreInfos;
+                fakes[si].signalSemaphoreInfoCount = pSubmits[si].signalSemaphoreInfoCount;
+                fakes[si].pSignalSemaphoreInfos    = pSubmits[si].pSignalSemaphoreInfos;
+            }
+            installCrashRecovery();
+            g_crashGuardActive = 1;
+            if (sigsetjmp(g_crashJmpBuf, 1) == 0) {
+                disp.QueueSubmit2KHR(queue, submitCount, fakes.data(), fence);
+            }
+            g_crashGuardActive = 0;
+            static uint32_t skip2Count = 0;
+            if ((++skip2Count % 10) == 1)
+                fprintf(stderr, "[CudaRT] SKIP SUBMIT2 #%u at %u (window %d-%d)\n",
+                        skip2Count, g_submitCount, skipFrom, skipTo);
+            return VK_SUCCESS;
+        }
+    }
 
     // GPU dead mode: fake a submit that drops command buffers but keeps
     // semaphore waits/signals (preserving per-submit pNext for timeline info).
@@ -7732,7 +7840,44 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit2KHR(
         return VK_SUCCESS;
     }
 
-    VkResult res = disp.QueueSubmit2KHR(queue, submitCount, pSubmits, fence);
+    // Filter poisoned command buffers from QueueSubmit2 as well.
+    std::vector<VkSubmitInfo2KHR> cleaned2(submitCount);
+    std::vector<std::vector<VkCommandBufferSubmitInfoKHR>> cleanBuf2(submitCount);
+    bool anyFiltered2 = false;
+    for (uint32_t si = 0; si < submitCount; si++) {
+        cleaned2[si] = pSubmits[si];
+        auto& cb = cleanBuf2[si];
+        cb.reserve(pSubmits[si].commandBufferInfoCount);
+        for (uint32_t j = 0; j < pSubmits[si].commandBufferInfoCount; j++) {
+            const auto& info = pSubmits[si].pCommandBufferInfos[j];
+            if (!isCmdBufPoisoned(info.commandBuffer))
+                cb.push_back(info);
+            else
+                anyFiltered2 = true;
+        }
+        cleaned2[si].commandBufferInfoCount = (uint32_t)cb.size();
+        cleaned2[si].pCommandBufferInfos    = cb.empty() ? nullptr : cb.data();
+    }
+    if (anyFiltered2) {
+        static uint64_t poison2Count = 0;
+        if ((++poison2Count % 25) == 1)
+            fprintf(stderr, "[CudaRT] ⚠ POISON FILTER2 #%lu at submit %u\n",
+                    poison2Count, g_submitCount);
+    }
+
+    VkResult res = VK_ERROR_DEVICE_LOST;
+    installCrashRecovery();
+    g_crashGuardActive = 1;
+    if (sigsetjmp(g_crashJmpBuf, 1) == 0) {
+        res = disp.QueueSubmit2KHR(queue, submitCount, cleaned2.data(), fence);
+    } else {
+        fprintf(stderr, "[CudaRT] ⚠ QS2 CRASH RECOVERED — poisoning all cmdBufs in this submit\n");
+        for (uint32_t si = 0; si < submitCount; si++)
+            for (uint32_t j = 0; j < pSubmits[si].commandBufferInfoCount; j++)
+                poisonCmdBuf(pSubmits[si].pCommandBufferInfos[j].commandBuffer);
+        res = VK_SUCCESS;
+    }
+    g_crashGuardActive = 0;
     // After driver crash, suppress OOM errors — driver returns bogus error codes
     if (isBogusOOM(res)) {
         static int suppCount = 0;
