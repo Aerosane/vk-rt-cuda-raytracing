@@ -56,6 +56,8 @@ static volatile uint32_t g_submitCount = 0;            // monotonic QueueSubmit 
 // stop calling the driver entirely and fake all submissions with signal-only empty submits.
 // This lets the app complete its frame loop and report a score rather than crashing.
 static std::atomic<bool> g_gpuDead{false};
+// Last queue used for QueueSubmit (for fence rescue in WaitForFences + idle-before-rebuild)
+static std::atomic<VkQueue> g_lastSubmitQueue{VK_NULL_HANDLE};
 static void installCrashRecovery(); // forward declaration
 // Helper: check if a VkResult is a bogus OOM from corrupted driver
 static inline bool isBogusOOM(VkResult r) {
@@ -4880,6 +4882,20 @@ static void tryEagerBLASBuild(VkCommandBuffer cmdBuf) {
 
         if (g_bvh2.ready)
             LOG("[EAGER] ✅ BVH pipeline ready BEFORE RQ dispatches are recorded!");
+
+        // Stabilize driver after initial BVH/descriptor setup — see Case 2 comment.
+        {
+            static bool idledInitOnce = false;
+            if (!idledInitOnce) {
+                idledInitOnce = true;
+                VkQueue q = g_lastSubmitQueue.load(std::memory_order_relaxed);
+                if (q != VK_NULL_HANDLE && disp.QueueWaitIdle) {
+                    fprintf(stderr, "[CudaRT] [EAGER] post-init QueueWaitIdle (stabilize driver)\n");
+                    disp.QueueWaitIdle(q);
+                    usleep(100000);
+                }
+            }
+        }
     }
     // Case 2: Rebuild — new TLAS + late BLASes (scene change after initial build)
     else if (hasTLAS && hasLateBLAS && g_blasBuildsDone && g_bvh2.ready) {
@@ -4902,6 +4918,24 @@ static void tryEagerBLASBuild(VkCommandBuffer cmdBuf) {
         }
 
         LOG("[EAGER] ✅ BVH pipeline rebuilt for scene change!");
+
+        // After scene-change rebuild, force a full queue idle. The V100 driver
+        // has a UAF race where our descriptor/buffer uploads during rebuild get
+        // freed before deferred driver work references them. QueueWaitIdle
+        // ensures all prior driver work completes before the app submits new
+        // CmdBindDescriptorSets that reference the rebuilt BVH descriptors.
+        {
+            static bool idledOnce = false;
+            if (!idledOnce) {
+                idledOnce = true;
+                VkQueue q = g_lastSubmitQueue.load(std::memory_order_relaxed);
+                if (q != VK_NULL_HANDLE && disp.QueueWaitIdle) {
+                    LOG("[EAGER] post-rebuild QueueWaitIdle (stabilize driver)");
+                    disp.QueueWaitIdle(q);
+                    usleep(100000); // 100ms settle
+                }
+            }
+        }
     }
 }
 
@@ -7291,10 +7325,6 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdPipelineBarrier2KHR(
 // ═══════════════════════════════════════════
 // Intercepted: CmdDispatch — bind BVH2 descriptor set for RQ pipelines
 // ═══════════════════════════════════════════
-// ═══════════════════════════════════════════
-// Last queue used for QueueSubmit (for fence rescue in WaitForFences)
-static std::atomic<VkQueue> g_lastSubmitQueue{VK_NULL_HANDLE};
-
 // Intercepted: QueueSubmit — process deferred BLAS builds after GPU execution
 // ═══════════════════════════════════════════
 static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
@@ -7307,6 +7337,25 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
     auto& disp = g_deviceMap[key];
     g_lastSubmitQueue.store(queue, std::memory_order_relaxed);
     g_submitCount++;
+
+    // Preemptive GPU DEAD: if CUDA_RT_PREEMPT_DEAD is set, enter GPU DEAD mode
+    // just before the known-bad submit range (V100 driver crashes at ~7834).
+    {
+        static int preemptAt = -1;
+        if (preemptAt < 0) {
+            const char* e = getenv("CUDA_RT_PREEMPT_DEAD");
+            preemptAt = (e && atoi(e) > 0) ? atoi(e) : 0;
+        }
+        if (preemptAt > 0 && g_submitCount >= (uint32_t)preemptAt
+            && !g_gpuDead.load(std::memory_order_relaxed)) {
+            g_gpuDead.store(true, std::memory_order_relaxed);
+            g_rtDisabled.store(true, std::memory_order_relaxed);
+            FILE* f = fopen("/tmp/.vkrt_degraded", "w");
+            if (f) { fputs("1", f); fclose(f); }
+            fprintf(stderr, "[CudaRT] ⚠ PREEMPTIVE GPU DEAD at submit %u (threshold %d)\n",
+                    g_submitCount, preemptAt);
+        }
+    }
 
     // GPU dead mode: driver has crashed during rendering. Don't touch any
     // command buffers (they may reference freed state). Issue a signal-only
@@ -7335,7 +7384,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
             g_crashGuardActive = 0;
         }
         static uint32_t fakeCount = 0;
-        if ((++fakeCount % 500) == 1)
+        if ((++fakeCount % 100) == 1)
             fprintf(stderr, "[CudaRT] GPU DEAD: fake submit #%u (submit %u)\n", fakeCount, g_submitCount);
         return VK_SUCCESS;
     }
@@ -7678,7 +7727,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit2KHR(
             g_crashGuardActive = 0;
         }
         static uint32_t fake2Count = 0;
-        if ((++fake2Count % 500) == 1)
+        if ((++fake2Count % 100) == 1)
             fprintf(stderr, "[CudaRT] GPU DEAD: fake submit2 #%u (submit %u)\n", fake2Count, g_submitCount);
         return VK_SUCCESS;
     }
@@ -7760,6 +7809,16 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_WaitForFences(
     }
     if (!pDisp) return VK_ERROR_DEVICE_LOST;
 
+    // GPU DEAD: fake submits don't produce real fence signals — return success
+    // immediately so the app's frame loop isn't throttled by real fence waits.
+    if (g_gpuDead.load(std::memory_order_relaxed)) {
+        static std::atomic<uint64_t> gdFenceCount{0};
+        uint64_t n = gdFenceCount.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 5 || (n % 500) == 0)
+            fprintf(stderr, "[CudaRT] GPU DEAD: fake fence success #%lu (%u fences)\n", n, fenceCount);
+        return VK_SUCCESS;
+    }
+
     // Short timeouts: pass through directly
     if (timeout <= 200000000ULL) { // ≤200ms
         return pDisp->WaitForFences(device, fenceCount, pFences, waitAll, timeout);
@@ -7822,10 +7881,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_WaitSemaphores(
         return fn(device, pWaitInfo, timeout);
     }
 
-    // GPU dead: try short wait. If timed out, force-signal pending values.
-    VkResult r = fn(device, pWaitInfo, 100000000ULL); // 100ms
-    if (r == VK_SUCCESS || r == VK_ERROR_DEVICE_LOST) return VK_SUCCESS;
-
+    // GPU dead: skip real wait entirely — force-signal all pending values.
     auto signalFn = (PFN_vkSignalSemaphore)disp.GetDeviceProcAddr(device, "vkSignalSemaphore");
     if (!signalFn) signalFn = (PFN_vkSignalSemaphore)disp.GetDeviceProcAddr(device, "vkSignalSemaphoreKHR");
     if (signalFn && pWaitInfo) {
@@ -7836,10 +7892,11 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_WaitSemaphores(
             si.value = pWaitInfo->pValues[i];
             signalFn(device, &si);
         }
-        static int s = 0;
-        if (++s <= 10)
-            fprintf(stderr, "[CudaRT] GPU DEAD: force-signaled %u timeline semaphores\n",
-                    pWaitInfo->semaphoreCount);
+        static std::atomic<int> s{0};
+        int v = s.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (v <= 5 || (v % 500) == 0)
+            fprintf(stderr, "[CudaRT] GPU DEAD: force-signaled %u timeline semaphores (#%d)\n",
+                    pWaitInfo->semaphoreCount, v);
     }
     return VK_SUCCESS;
 }
