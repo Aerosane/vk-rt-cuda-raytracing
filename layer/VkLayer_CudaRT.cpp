@@ -16,6 +16,7 @@
 #include <vulkan/vk_layer.h>
 
 #include "cuda_bvh_backend.h"
+#include "cuda_vk_interop.h"
 #include <cuda_runtime.h>
 #include "spirv_ray_query_rewriter.h"
 #include "rt_ir_lower.h"
@@ -1752,6 +1753,111 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
     // Install crash recovery handler for driver UAF bugs
     installCrashRecovery();
     LOG("  → Crash recovery handler installed (SIGSEGV/SIGBUS)");
+
+    // CUDA-Vulkan interop self-test: confirms CUDA context is reachable
+    // from inside the layer so future interop paths (external memory,
+    // external semaphores) have a known-good baseline.
+    {
+        static bool interopTested = false;
+        if (!interopTested) {
+            interopTested = true;
+            uint32_t firstWord = 0;
+            int rc = cuda_interop_selftest(&firstWord);
+            if (rc == 0) {
+                LOG("  → CUDA interop self-test PASSED (pattern=0x%08x)", firstWord);
+            } else {
+                LOG("  → WARNING: CUDA interop self-test FAILED rc=%d word=0x%08x", rc, firstWord);
+            }
+        }
+    }
+
+    // Try a full Vulkan→CUDA external-memory roundtrip as a second proof
+    // of the interop path: allocate exportable memory, export fd, import
+    // into CUDA, fill with a pattern via kernel, read back from the
+    // mapped Vulkan buffer, compare. Gated by CUDA_RT_INTEROP_PROBE=1 so
+    // it doesn't run for every app.
+    if (getenv("CUDA_RT_INTEROP_PROBE")) {
+        static bool probed = false;
+        if (!probed) {
+            probed = true;
+            const size_t PROBE_SZ = 4096;
+            // Exportable memory alloc
+            VkExportMemoryAllocateInfo exp = {};
+            exp.sType = VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO;
+            exp.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+
+            VkMemoryAllocateInfo mai = {VK_STRUCTURE_TYPE_MEMORY_ALLOCATE_INFO};
+            mai.pNext = &exp;
+            mai.allocationSize = PROBE_SZ;
+            // HOST_VISIBLE|HOST_COHERENT so we can read back on CPU after
+            // CUDA writes.
+            auto& mp = disp.memProps;
+            mai.memoryTypeIndex = UINT32_MAX;
+            for (uint32_t j = 0; j < mp.memoryTypeCount; j++) {
+                uint32_t flags = mp.memoryTypes[j].propertyFlags;
+                if ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+                    (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT) &&
+                    (flags & VK_MEMORY_PROPERTY_DEVICE_LOCAL_BIT)) {
+                    mai.memoryTypeIndex = j; break;
+                }
+            }
+            if (mai.memoryTypeIndex == UINT32_MAX) {
+                for (uint32_t j = 0; j < mp.memoryTypeCount; j++) {
+                    uint32_t flags = mp.memoryTypes[j].propertyFlags;
+                    if ((flags & VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT) &&
+                        (flags & VK_MEMORY_PROPERTY_HOST_COHERENT_BIT)) {
+                        mai.memoryTypeIndex = j; break;
+                    }
+                }
+            }
+            VkDeviceMemory mem = VK_NULL_HANDLE;
+            VkResult ar = disp.AllocateMemory(*pDevice, &mai, nullptr, &mem);
+            if (ar != VK_SUCCESS) {
+                LOG("  → INTEROP PROBE: AllocateMemory failed (%d)", ar);
+            } else {
+                auto getMemFd = (PFN_vkGetMemoryFdKHR)disp.GetDeviceProcAddr(*pDevice, "vkGetMemoryFdKHR");
+                if (!getMemFd) {
+                    LOG("  → INTEROP PROBE: vkGetMemoryFdKHR not available");
+                    disp.FreeMemory(*pDevice, mem, nullptr);
+                } else {
+                    VkMemoryGetFdInfoKHR gfi = {VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
+                    gfi.memory = mem;
+                    gfi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+                    int fd = -1;
+                    VkResult fr = getMemFd(*pDevice, &gfi, &fd);
+                    if (fr != VK_SUCCESS || fd < 0) {
+                        LOG("  → INTEROP PROBE: vkGetMemoryFdKHR failed (%d)", fr);
+                        disp.FreeMemory(*pDevice, mem, nullptr);
+                    } else {
+                        CudaInteropMem cim = {};
+                        int ic = cuda_interop_import_fd(fd, PROBE_SZ, &cim);
+                        if (ic != 0) {
+                            LOG("  → INTEROP PROBE: CUDA import failed (%d)", ic);
+                            disp.FreeMemory(*pDevice, mem, nullptr);
+                        } else {
+                            cuda_interop_fill_pattern(cim.devPtr, PROBE_SZ, 0xDEADBEEF);
+                            cudaDeviceSynchronize();
+                            void* host = nullptr;
+                            if (disp.MapMemory(*pDevice, mem, 0, PROBE_SZ, 0, &host) == VK_SUCCESS && host) {
+                                uint32_t w0 = ((uint32_t*)host)[0];
+                                uint32_t w7 = ((uint32_t*)host)[7];
+                                uint32_t ew0 = 0xDEADBEEF ^ 0u;
+                                uint32_t ew7 = 0xDEADBEEF ^ 7u;
+                                bool ok = (w0 == ew0 && w7 == ew7);
+                                LOG("  → INTEROP PROBE: roundtrip %s (w0=0x%08x exp=0x%08x, w7=0x%08x exp=0x%08x)",
+                                    ok ? "PASSED" : "FAILED", w0, ew0, w7, ew7);
+                                disp.UnmapMemory(*pDevice, mem);
+                            } else {
+                                LOG("  → INTEROP PROBE: MapMemory failed");
+                            }
+                            cuda_interop_destroy_mem(&cim);
+                            disp.FreeMemory(*pDevice, mem, nullptr);
+                        }
+                    }
+                }
+            }
+        }
+    }
 
     return VK_SUCCESS;
 }
