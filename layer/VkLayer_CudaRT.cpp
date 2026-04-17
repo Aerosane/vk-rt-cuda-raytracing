@@ -51,7 +51,13 @@ static std::atomic<bool> g_rtDisabled{false};        // permanently disable RT a
 static bool g_noBvh = false;                          // CUDA_RT_NO_BVH=1: skip all BVH operations
 static thread_local int g_threadCrashCount = 0;       // per-thread FUNC SKIP counter
 static volatile uint32_t g_presentCount = 0;           // monotonic frame counter (volatile for cross-thread visibility)
+static volatile uint32_t g_submitCount = 0;            // monotonic QueueSubmit counter (for init detection)
 static void installCrashRecovery(); // forward declaration
+// Helper: check if a VkResult is a bogus OOM from corrupted driver
+static inline bool isBogusOOM(VkResult r) {
+    return (r == VK_ERROR_OUT_OF_HOST_MEMORY || r == VK_ERROR_OUT_OF_DEVICE_MEMORY) 
+           && g_rtDisabled.load(std::memory_order_relaxed);
+}
 
 // Global recovery point: when crashes happen outside a guard region,
 // jump back here instead of trying to skip individual instructions.
@@ -147,16 +153,17 @@ static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
         pid_t mainTid = getpid(); // main thread TID == PID
 
         // If this is the app's main thread crashing in app code, DO NOT skip.
-        // Let the default signal action kill the process gracefully.
-        // Use /proc/self/maps-based detection (set by detectAppTextRange at init).
+        // Use _exit to kill process cleanly (signal(SIG_DFL)+return re-delivers forever).
         if (uc && sig != SIGABRT) {
             uint64_t rip = uc->uc_mcontext.gregs[REG_RIP];
             bool ripInApp = (g_appTextStart && rip >= g_appTextStart && rip < g_appTextEnd);
             if (ripInApp) {
                 if (c <= 5)
-                    fprintf(stderr, "[CudaRT] ⚠ APP CRASH sig=%d RIP=%p tid=%d (app text %p–%p) — not intercepting\n",
-                            sig, (void*)rip, tid, (void*)g_appTextStart, (void*)g_appTextEnd);
+                    fprintf(stderr, "[CudaRT] ⚠ APP CRASH sig=%d RIP=%p tid=%d — exiting\n",
+                            sig, (void*)rip, tid);
                 signal(sig, SIG_DFL);
+                // Direct syscall to avoid any libc cleanup that may re-enter handler
+                syscall(SYS_exit_group, 139);
                 return;
             }
         }
@@ -186,30 +193,25 @@ static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
                 g_rtDisabled.store(true, std::memory_order_relaxed);
                 fprintf(stderr, "[CudaRT] ⚠ DRIVER CRASH sig=%d tid=%d — RT dispatches permanently disabled\n",
                         sig, (int)syscall(SYS_gettid));
+                // Signal noabort.so to suppress exit() calls from bogus OOM
+                FILE* f = fopen("/tmp/.vkrt_degraded", "w");
+                if (f) { fputs("1", f); fclose(f); }
             }
 
             g_threadCrashCount++;
             int tid2 = (int)syscall(SYS_gettid);
 
-            // After 20 FUNC SKIPs on this thread, it's in a loop.
-            // During init (Frame 0): PARK thread (test18 got Frame 19 with this).
-            // After init: trampoline pthread_exit (releases locks cleanly).
-            if (g_threadCrashCount > 20 && uc) {
-                int exp = g_suspendedThreadCount.load(std::memory_order_relaxed);
-                if (exp < 4) g_suspendedThreadCount.compare_exchange_strong(exp, exp + 1);
-
-                if (g_presentCount > 0) {
-                    fprintf(stderr, "[CudaRT] THREAD EXIT: tid=%d after %d crashes (frame %u) — trampoline\n",
-                            tid2, g_threadCrashCount, g_presentCount);
-                    uc->uc_mcontext.gregs[REG_RIP] = (uint64_t)(void*)&crashThreadTrampoline;
-                    uc->uc_mcontext.gregs[REG_RSP] = (uc->uc_mcontext.gregs[REG_RSP] & ~0xFULL) - 128;
-                    return;
-                } else {
-                    if (g_threadCrashCount == 21)
-                        fprintf(stderr, "[CudaRT] THREAD PARK: tid=%d after %d crashes (still in init) — suspending\n",
-                                tid2, g_threadCrashCount);
-                    for (;;) usleep(1000000);
+            // After 30 FUNC SKIPs on this thread, SUSPEND it (park indefinitely).
+            // A thread in a tight SEGV loop cannot make progress — parking it is
+            // the least bad option. PARK kept us alive to Frame 19 before.
+            if (g_threadCrashCount > 30) {
+                if (g_threadCrashCount == 31) {
+                    int exp = g_suspendedThreadCount.load(std::memory_order_relaxed);
+                    if (exp < 4) g_suspendedThreadCount.compare_exchange_strong(exp, exp + 1);
+                    fprintf(stderr, "[CudaRT] THREAD PARK: tid=%d at %d crashes (submit %u) — suspending\n",
+                            tid2, g_threadCrashCount, g_submitCount);
                 }
+                for (;;) usleep(1000000);
             }
 
             // FUNC SKIP: scan stack for return addresses and jump to caller.
@@ -217,7 +219,16 @@ static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
                 uint64_t rip = uc->uc_mcontext.gregs[REG_RIP];
                 uint64_t rsp = uc->uc_mcontext.gregs[REG_RSP];
 
-                for (int i = 0; i < 32; i++) {
+                // Loop detection: track last (rip->val) pair per thread.
+                // If same pair seen 3+ times, we're in an infinite loop — suspend.
+                static thread_local uint64_t lastRip = 0, lastVal = 0;
+                static thread_local int samePairCount = 0;
+
+                // Find a valid return address (skip index picks later slot if we're looping)
+                int startIdx = (samePairCount >= 2) ? (samePairCount * 4) : 0;
+                if (startIdx > 28) startIdx = 28;
+
+                for (int i = startIdx; i < 32; i++) {
                     uint64_t val = 0;
                     void* page = (void*)((rsp + i * 8) & ~0xFFFUL);
                     unsigned char vec;
@@ -225,6 +236,24 @@ static void crashRecoveryHandler(int sig, siginfo_t* info, void* ctx) {
                     val = *(uint64_t*)(rsp + i * 8);
                     uint8_t top = val >> 40;
                     if (top >= 0x70 && top <= 0x7e && val != rip) {
+                        // Check for loop: same source+target repeating
+                        if (rip == lastRip && val == lastVal) {
+                            samePairCount++;
+                            if (samePairCount >= 3) {
+                                // Stuck in a loop — suspend this thread forever
+                                static thread_local int announced = 0;
+                                if (!announced) {
+                                    announced = 1;
+                                    fprintf(stderr, "[CudaRT] THREAD LOOP STUCK: tid=%d rip=%p val=%p — suspending\n",
+                                            tid2, (void*)rip, (void*)val);
+                                }
+                                for (;;) usleep(1000000);
+                            }
+                            // Try a different target: keep scanning
+                            continue;
+                        }
+                        lastRip = rip; lastVal = val; samePairCount = 0;
+
                         uc->uc_mcontext.gregs[REG_RSP] = rsp + (i + 1) * 8;
                         uc->uc_mcontext.gregs[REG_RIP] = val;
                         uc->uc_mcontext.gregs[REG_RAX] = 0;
@@ -1750,6 +1779,13 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateBuffer(
     }
 
     VkResult res = disp.CreateBuffer(device, &modCI, pAllocator, pBuffer);
+    // Suppress bogus OOM from corrupted driver state
+    if (isBogusOOM(res)) {
+        static int suppCB = 0;
+        if (++suppCB <= 5) fprintf(stderr, "[CudaRT] ⚠ CreateBuffer OOM suppressed #%d\n", suppCB);
+        res = disp.CreateBuffer(device, &modCI, pAllocator, pBuffer); // retry once
+        if (res != VK_SUCCESS) return VK_SUCCESS; // fake success — app will crash on use but won't abort
+    }
     if (res == VK_SUCCESS) {
         std::lock_guard<std::mutex> lock(g_lock);
         BufferInfo bi = {};
@@ -1817,7 +1853,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_AllocateMemory(
 
     VkResult res = disp.AllocateMemory(device, pAllocateInfo, pAllocator, pMemory);
     // If OOM and driver degraded, try freeing BVH buffers and retry
-    if (res == VK_ERROR_OUT_OF_HOST_MEMORY && g_rtDisabled.load(std::memory_order_relaxed)) {
+    if (isBogusOOM(res)) {
         static int oomAllocCount = 0;
         if (++oomAllocCount <= 5)
             fprintf(stderr, "[CudaRT] ⚠ AllocateMemory OOM #%d (size=%zu) — freeing BVH + retry\n",
@@ -2012,6 +2048,12 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateImage(
     }
 
     VkResult res = disp.CreateImage(device, pCreateInfo, pAllocator, pImage);
+    if (isBogusOOM(res)) {
+        static int suppCI = 0;
+        if (++suppCI <= 5) fprintf(stderr, "[CudaRT] ⚠ CreateImage OOM suppressed #%d\n", suppCI);
+        res = disp.CreateImage(device, pCreateInfo, pAllocator, pImage);
+        if (res != VK_SUCCESS) return VK_SUCCESS;
+    }
     if (res == VK_SUCCESS && (pCreateInfo->usage & VK_IMAGE_USAGE_STORAGE_BIT)) {
         std::lock_guard<std::mutex> lock(g_lock);
         g_storageImages[(uint64_t)*pImage] = {
@@ -7244,6 +7286,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
     void* key = getKey(queue);
     auto& disp = g_deviceMap[key];
     g_lastSubmitQueue.store(queue, std::memory_order_relaxed);
+    g_submitCount++;
 
     // Set global recovery point — ANY crash (even in driver internal threads
     // on our single CPU) will longjmp back here instead of cascading
@@ -7401,7 +7444,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
     }
     if (res != VK_SUCCESS) {
         // Suppress OOM after driver crash — driver returns bogus error from corrupted state
-        if (res == VK_ERROR_OUT_OF_HOST_MEMORY && g_rtDisabled.load(std::memory_order_relaxed)) {
+        if (isBogusOOM(res)) {
             static int qsSuppCount = 0;
             if (++qsSuppCount <= 10)
                 fprintf(stderr, "[CudaRT] ⚠ QS OOM suppressed #%d (driver degraded)\n", qsSuppCount);
@@ -7558,11 +7601,10 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit2KHR(
 {
     void* key = getKey(queue);
     auto& disp = g_deviceMap[key];
-
-    // Call real submit2 first
+    g_submitCount++;
     VkResult res = disp.QueueSubmit2KHR(queue, submitCount, pSubmits, fence);
     // After driver crash, suppress OOM errors — driver returns bogus error codes
-    if (res == VK_ERROR_OUT_OF_HOST_MEMORY && g_rtDisabled.load(std::memory_order_relaxed)) {
+    if (isBogusOOM(res)) {
         static int suppCount = 0;
         if (++suppCount <= 10)
             fprintf(stderr, "[CudaRT] ⚠ QS2 OOM suppressed #%d (driver degraded)\n", suppCount);
@@ -7678,6 +7720,111 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_WaitForFences(
         fprintf(stderr, "[CudaRT] ⚠ FENCE RESCUE #%lu: force VK_SUCCESS for %u fences\n",
                 rc, fenceCount);
     return VK_SUCCESS;
+}
+
+// ─── OOM-suppressing wrappers for common rendering functions ───
+// After driver crash, driver returns bogus VK_ERROR_OUT_OF_HOST_MEMORY.
+// Suppress these to prevent app from aborting.
+
+static VKAPI_ATTR VkResult VKAPI_CALL layer_AcquireNextImageKHR(
+    VkDevice device, VkSwapchainKHR swapchain, uint64_t timeout,
+    VkSemaphore semaphore, VkFence fence, uint32_t* pImageIndex)
+{
+    void* key = getKey(device);
+    auto& disp = g_deviceMap[key];
+    auto fn = (PFN_vkAcquireNextImageKHR)disp.GetDeviceProcAddr(device, "vkAcquireNextImageKHR");
+    if (!fn) return VK_ERROR_DEVICE_LOST;
+    VkResult res = fn(device, swapchain, timeout, semaphore, fence, pImageIndex);
+    if (isBogusOOM(res)) {
+        static int s = 0;
+        if (++s <= 5) fprintf(stderr, "[CudaRT] ⚠ AcquireNextImage OOM suppressed #%d\n", s);
+        if (pImageIndex) *pImageIndex = 0;
+        return VK_SUCCESS;
+    }
+    return res;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL layer_AllocateCommandBuffers(
+    VkDevice device, const VkCommandBufferAllocateInfo* pAI, VkCommandBuffer* pCBs)
+{
+    void* key = getKey(device);
+    auto& disp = g_deviceMap[key];
+    VkResult res = disp.AllocateCommandBuffers(device, pAI, pCBs);
+    if (isBogusOOM(res)) {
+        static int s = 0;
+        if (++s <= 5) fprintf(stderr, "[CudaRT] ⚠ AllocateCmdBuf OOM suppressed #%d\n", s);
+        res = disp.AllocateCommandBuffers(device, pAI, pCBs); // retry
+        if (res != VK_SUCCESS) return VK_SUCCESS;
+    }
+    return res;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL layer_BeginCommandBuffer(
+    VkCommandBuffer cb, const VkCommandBufferBeginInfo* pBI)
+{
+    // Need to find the device dispatch from command buffer — use the stored queue dispatch
+    auto fn = (PFN_vkBeginCommandBuffer)nullptr;
+    {
+        std::lock_guard<std::mutex> lock(g_lock);
+        for (auto& kv : g_deviceMap) {
+            if (kv.second.BeginCommandBuffer) { fn = kv.second.BeginCommandBuffer; break; }
+        }
+    }
+    if (!fn) return VK_SUCCESS;
+    VkResult res = fn(cb, pBI);
+    if (isBogusOOM(res)) {
+        static int s = 0;
+        if (++s <= 5) fprintf(stderr, "[CudaRT] ⚠ BeginCmdBuf OOM suppressed #%d\n", s);
+        return VK_SUCCESS;
+    }
+    return res;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL layer_AllocateDescriptorSets2(
+    VkDevice device, const VkDescriptorSetAllocateInfo* pAI, VkDescriptorSet* pSets)
+{
+    void* key = getKey(device);
+    auto& disp = g_deviceMap[key];
+    VkResult res = disp.AllocateDescriptorSets(device, pAI, pSets);
+    if (((res == VK_ERROR_OUT_OF_HOST_MEMORY || res == VK_ERROR_OUT_OF_DEVICE_MEMORY || res == VK_ERROR_OUT_OF_POOL_MEMORY)) 
+        && g_rtDisabled.load(std::memory_order_relaxed)) {
+        static int s = 0;
+        if (++s <= 5) fprintf(stderr, "[CudaRT] ⚠ AllocDescSets OOM suppressed #%d\n", s);
+        return VK_SUCCESS;
+    }
+    return res;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateFence(
+    VkDevice device, const VkFenceCreateInfo* pCI, const VkAllocationCallbacks* pA, VkFence* pF)
+{
+    void* key = getKey(device);
+    auto& disp = g_deviceMap[key];
+    auto fn = (PFN_vkCreateFence)disp.GetDeviceProcAddr(device, "vkCreateFence");
+    if (!fn) return VK_ERROR_DEVICE_LOST;
+    VkResult res = fn(device, pCI, pA, pF);
+    if (isBogusOOM(res)) {
+        static int s = 0;
+        if (++s <= 5) fprintf(stderr, "[CudaRT] ⚠ CreateFence OOM suppressed #%d\n", s);
+        return VK_SUCCESS;
+    }
+    return res;
+}
+
+static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateSemaphore(
+    VkDevice device, const VkSemaphoreCreateInfo* pCI, const VkAllocationCallbacks* pA, VkSemaphore* pS)
+{
+    void* key = getKey(device);
+    auto& disp = g_deviceMap[key];
+    auto fn = (PFN_vkCreateSemaphore)disp.GetDeviceProcAddr(device, "vkCreateSemaphore");
+    if (!fn) return VK_ERROR_DEVICE_LOST;
+    VkResult res = fn(device, pCI, pA, pS);
+    if (isBogusOOM(res)) {
+        static int s = 0;
+        if (++s <= 5) fprintf(stderr, "[CudaRT] ⚠ CreateSemaphore OOM suppressed #%d\n", s);
+        return VK_SUCCESS;
+    }
+    return res;
 }
 
 // ─── QueuePresentKHR: per-frame hook for deferred TLAS retry ───
@@ -8195,7 +8342,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
 
     VkResult presRes = pDisp->QueuePresentKHR(queue, pPresentInfo);
     // After driver crash, suppress OOM errors from present too
-    if (presRes == VK_ERROR_OUT_OF_HOST_MEMORY && g_rtDisabled.load(std::memory_order_relaxed)) {
+    if (isBogusOOM(presRes)) {
         static int presSuppCount = 0;
         if (++presSuppCount <= 10)
             fprintf(stderr, "[CudaRT] ⚠ Present OOM suppressed #%d (driver degraded)\n", presSuppCount);
@@ -8728,6 +8875,18 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetDeviceProcAddr(VkDevice
     }
     if (strcmp(pName, "vkQueuePresentKHR") == 0)
         return (PFN_vkVoidFunction)layer_QueuePresentKHR;
+
+    // OOM-suppressing wrappers for common rendering functions
+    if (strcmp(pName, "vkAcquireNextImageKHR") == 0)
+        return (PFN_vkVoidFunction)layer_AcquireNextImageKHR;
+    INTERCEPT(AllocateCommandBuffers);
+    INTERCEPT(BeginCommandBuffer);
+    if (strcmp(pName, "vkAllocateDescriptorSets") == 0)
+        return (PFN_vkVoidFunction)layer_AllocateDescriptorSets2;
+    if (strcmp(pName, "vkCreateFence") == 0)
+        return (PFN_vkVoidFunction)layer_CreateFence;
+    if (strcmp(pName, "vkCreateSemaphore") == 0)
+        return (PFN_vkVoidFunction)layer_CreateSemaphore;
 
     // Barrier remapping: MUST intercept even in lean mode to remap RT stage/access bits
     INTERCEPT(CmdPipelineBarrier);

@@ -247,7 +247,8 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
     const uint32_t* code, size_t numWords,
     int bvhDescSet, int bvhNodesBinding, int bvhTrisBinding,
     int bvhTlasBinding = 2, int bvhInstBinding = 3,
-    bool useBDA = false, int bdaPushConstOffset = 128)
+    bool useBDA = false, int bdaPushConstOffset = 128,
+    int maxBlasIter = 4096, int maxTlasIter = 512)
 {
     if (numWords < 5 || code[0] != 0x07230203u) return {};
 
@@ -1136,8 +1137,8 @@ static std::vector<uint32_t> spirvRewriteRayQuery(
             E(SpvOpConstant, {tInt, c8, 8});
             E(SpvOpConstant, {tInt, c9, 9});
             E(SpvOpConstant, {tInt, c10, 10});
-            E(SpvOpConstant, {tInt, cMaxIter, 4096}); // max BLAS traversal iterations (world BLAS has 17K+ nodes)
-            E(SpvOpConstant, {tInt, cMaxTlasIter, 512}); // max TLAS traversal iterations (137K+ nodes)
+            E(SpvOpConstant, {tInt, cMaxIter, (uint32_t)maxBlasIter}); // max BLAS traversal iterations (tunable)
+            E(SpvOpConstant, {tInt, cMaxTlasIter, (uint32_t)maxTlasIter}); // max TLAS traversal iterations (tunable)
             E(SpvOpConstant, {tFloat, cf0, zb});
             E(SpvOpConstant, {tFloat, cf_huge, hb});
             E(SpvOpConstant, {tFloat, cf1, f1b});
@@ -2605,7 +2606,8 @@ struct SpirvRewriteResult {
 static SpirvRewriteResult spirvTryRewriteRayQuery(
     const uint32_t* code, size_t numWords,
     int maxBoundSets = 8,  // V100 default; caller should pass actual limit
-    bool useBDA = false, int bdaPushConstOffset = 128)
+    bool useBDA = false, int bdaPushConstOffset = 128,
+    int maxBlasIter = 4096, int maxTlasIter = 512)
 {
     SpirvRewriteResult r = {};
     r.rewritten = false;
@@ -2634,7 +2636,8 @@ static SpirvRewriteResult spirvTryRewriteRayQuery(
             r.bvhDescSet, r.bvhNodesBinding, r.bvhTrisBinding, r.bvhTlasBinding, r.bvhInstBinding,
             maxSet, maxBoundSets, useBDA);
     r.code = spirvRewriteRayQuery(code, numWords, r.bvhDescSet, r.bvhNodesBinding, r.bvhTrisBinding,
-                                  r.bvhTlasBinding, r.bvhInstBinding, useBDA, bdaPushConstOffset);
+                                  r.bvhTlasBinding, r.bvhInstBinding, useBDA, bdaPushConstOffset,
+                                  maxBlasIter, maxTlasIter);
     r.rewritten = !r.code.empty();
     // Check if BDA was actually used (might be disabled if shader has existing push constants)
     if (r.rewritten && useBDA) {

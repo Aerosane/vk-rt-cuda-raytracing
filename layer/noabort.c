@@ -120,6 +120,60 @@ void __stack_chk_fail(void) {
     }
 }
 
+// Intercept exit()/_exit() — prevent app from dying on bogus OOM errors.
+// Check /tmp/.vkrt_degraded flag (set by VK_RT layer when driver is corrupted).
+void exit(int status) {
+    static int (*real_exit)(int) __attribute__((noreturn)) = NULL;
+    if (!real_exit) real_exit = dlsym(RTLD_NEXT, "exit");
+    
+    if (status != 0 && access("/tmp/.vkrt_degraded", F_OK) == 0) {
+        static int exitCount = 0;
+        int c = __sync_add_and_fetch(&exitCount, 1);
+        if (c <= 10)
+            fprintf(stderr, "[noabort] exit(%d) suppressed #%d — driver degraded\n", status, c);
+        if (c <= 3) {
+            usleep(100000);
+            return;
+        }
+    }
+    real_exit(status);
+    __builtin_unreachable();
+}
+
+void _exit(int status) {
+    static void (*real__exit)(int) __attribute__((noreturn)) = NULL;
+    if (!real__exit) real__exit = dlsym(RTLD_NEXT, "_exit");
+    
+    if (status != 0 && access("/tmp/.vkrt_degraded", F_OK) == 0) {
+        static int exitCount = 0;
+        int c = __sync_add_and_fetch(&exitCount, 1);
+        if (c <= 10)
+            fprintf(stderr, "[noabort] _exit(%d) suppressed #%d — driver degraded\n", status, c);
+        if (c <= 3) {
+            usleep(100000);
+            return;
+        }
+    }
+    real__exit(status);
+    __builtin_unreachable();
+}
+
+void _Exit(int status) {
+    _exit(status);
+    __builtin_unreachable();
+}
+
+// Intercept std::terminate to prevent "terminate called recursively" cascade.
+// When terminate is called in degraded mode, exit cleanly instead of looping.
+void _ZSt9terminatev(void) {
+    static int c = 0;
+    int n = __sync_add_and_fetch(&c, 1);
+    if (n <= 5)
+        fprintf(stderr, "[noabort] std::terminate() #%d — exiting\n", n);
+    syscall(231, 139); // SYS_exit_group
+    for (;;) usleep(1000000);
+}
+
 // Intercept C++ terminate to prevent "terminate called recursively" cascade
 void __cxa_pure_virtual(void) {
     static int c = 0;
