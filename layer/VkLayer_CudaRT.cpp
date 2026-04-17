@@ -456,6 +456,7 @@ struct DeviceDispatch {
     PFN_vkCmdDispatch CmdDispatch;
     PFN_vkCmdDispatchIndirect CmdDispatchIndirect;
     PFN_vkCmdFillBuffer CmdFillBuffer;
+    PFN_vkCmdUpdateBuffer CmdUpdateBuffer;
     PFN_vkGetImageMemoryRequirements GetImageMemoryRequirements;
 
     // Render pass profiling
@@ -543,6 +544,11 @@ struct MemInfo {
     VkDeviceSize mapOffset;
     VkDeviceSize allocSize;      // total allocation size
     VkDevice device;             // owning device (for fd export)
+    // CUDA interop (opt-in via CUDA_RT_INTEROP_MEM=1)
+    void* cuDevPtr;              // CUDA-mapped alias to same VRAM (null if not imported)
+    void* cuExt;                 // cudaExternalMemory_t (opaque)
+    bool  exported;              // was VkExportMemoryAllocateInfo injected
+    int   fd;                    // exported fd (-1 if none)
 };
 static std::unordered_map<uint64_t, BufferInfo> g_buffers;   // key: VkBuffer
 static std::unordered_map<uint64_t, MemInfo>    g_memories;  // key: VkDeviceMemory
@@ -1349,8 +1355,24 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
         }
     }
 
+    // Inject VK_KHR_external_semaphore_fd + external_semaphore for CUDA sem interop
+    {
+        bool hasSemFd = false, hasSem = false;
+        for (auto& e : filteredExts) {
+            if (!strcmp(e, "VK_KHR_external_semaphore_fd")) hasSemFd = true;
+            if (!strcmp(e, "VK_KHR_external_semaphore"))    hasSem   = true;
+        }
+        if (!hasSem) {
+            filteredExts.push_back("VK_KHR_external_semaphore");
+            LOG("  → Injecting VK_KHR_external_semaphore for CUDA sem interop");
+        }
+        if (!hasSemFd) {
+            filteredExts.push_back("VK_KHR_external_semaphore_fd");
+            LOG("  → Injecting VK_KHR_external_semaphore_fd for CUDA sem interop");
+        }
+    }
+
     // Strip RT feature structs from pNext chain before forwarding to driver.
-    // We need a mutable copy of the chain. Walk and relink, skipping RT sTypes.
     static const VkStructureType rtSTypes[] = {
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_ACCELERATION_STRUCTURE_FEATURES_KHR,
         VK_STRUCTURE_TYPE_PHYSICAL_DEVICE_RAY_TRACING_PIPELINE_FEATURES_KHR,
@@ -1524,6 +1546,7 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateDevice(
     LOAD_DEV(CmdDispatch);
     LOAD_DEV(CmdDispatchIndirect);
     LOAD_DEV(CmdFillBuffer);
+    LOAD_DEV(CmdUpdateBuffer);
     LOAD_DEV(GetImageMemoryRequirements);
     // Render pass profiling
     LOAD_DEV(CmdBeginRenderPass);
@@ -1978,7 +2001,29 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_AllocateMemory(
         return res;
     }
 
-    VkResult res = disp.AllocateMemory(device, pAllocateInfo, pAllocator, pMemory);
+    // CUDA interop mem export: gated by CUDA_RT_INTEROP_MEM=1
+    static int wantInteropMemCached = -1;
+    if (wantInteropMemCached < 0)
+        wantInteropMemCached = getenv("CUDA_RT_INTEROP_MEM") ? 1 : 0;
+    bool wantExport = wantInteropMemCached && !hasExport &&
+                      pAllocateInfo->allocationSize >= 4096;
+
+    VkExportMemoryAllocateInfo expMI = {VK_STRUCTURE_TYPE_EXPORT_MEMORY_ALLOCATE_INFO};
+    VkMemoryAllocateInfo modAlloc = *pAllocateInfo;
+    if (wantExport) {
+        expMI.handleTypes = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+        expMI.pNext = pAllocateInfo->pNext;
+        modAlloc.pNext = &expMI;
+    }
+
+    VkResult res = disp.AllocateMemory(device,
+                                       wantExport ? &modAlloc : pAllocateInfo,
+                                       pAllocator, pMemory);
+    if (wantExport && res != VK_SUCCESS) {
+        // Retry without export (some memory types may reject)
+        res = disp.AllocateMemory(device, pAllocateInfo, pAllocator, pMemory);
+        wantExport = false;
+    }
     // If OOM and driver degraded, try freeing BVH buffers and retry
     if (isBogusOOM(res)) {
         static int oomAllocCount = 0;
@@ -2010,6 +2055,31 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_AllocateMemory(
         mi.mapOffset = 0;
         mi.allocSize = pAllocateInfo->allocationSize;
         mi.device = device;
+        mi.cuDevPtr = nullptr;
+        mi.cuExt = nullptr;
+        mi.exported = wantExport;
+        mi.fd = -1;
+        if (wantExport) {
+            auto getFd = (PFN_vkGetMemoryFdKHR)disp.GetDeviceProcAddr(device, "vkGetMemoryFdKHR");
+            if (getFd) {
+                VkMemoryGetFdInfoKHR gfi = {VK_STRUCTURE_TYPE_MEMORY_GET_FD_INFO_KHR};
+                gfi.memory = *pMemory;
+                gfi.handleType = VK_EXTERNAL_MEMORY_HANDLE_TYPE_OPAQUE_FD_BIT;
+                int fd = -1;
+                if (getFd(device, &gfi, &fd) == VK_SUCCESS && fd >= 0) {
+                    CudaInteropMem cim = {};
+                    if (cuda_interop_import_fd(fd, pAllocateInfo->allocationSize, &cim) == 0) {
+                        mi.cuDevPtr = cim.devPtr;
+                        mi.cuExt    = cim.ext;
+                        mi.fd       = fd;
+                        static uint32_t memImp = 0;
+                        if (++memImp <= 5)
+                            fprintf(stderr, "[CudaRT] interop: imported mem 0x%lx (%zu B) → cu=%p\n",
+                                    (uint64_t)*pMemory, (size_t)pAllocateInfo->allocationSize, cim.devPtr);
+                    }
+                }
+            }
+        }
         if(g_trackVerbose) LOG("  [track] AllocateMemory: mem=0x%lx size=%zu",
             (uint64_t)*pMemory, (size_t)pAllocateInfo->allocationSize);
     }
@@ -7430,6 +7500,9 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdPipelineBarrier2KHR(
 
 // ═══════════════════════════════════════════
 // Intercepted: CmdDispatch — bind BVH2 descriptor set for RQ pipelines
+// Forward decl: defined near layer_CreateSemaphore
+static bool cudaSignalRegisteredSem(VkSemaphore s, uint64_t value);
+
 // ═══════════════════════════════════════════
 // Intercepted: QueueSubmit — process deferred BLAS builds after GPU execution
 // ═══════════════════════════════════════════
@@ -7509,6 +7582,29 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
     // Preserve each original submit's pNext (for VkTimelineSemaphoreSubmitInfo
     // which carries per-semaphore values — critical for timeline waits).
     if (g_gpuDead.load(std::memory_order_relaxed)) {
+        // Best-effort: signal every registered (CUDA-imported) semaphore via
+        // CUDA. The driver's signal path is dead, but CUDA can drive the same
+        // kernel sync primitive. Also fall back to a fake vkQueueSubmit for
+        // semaphores we don't own (it will no-op or error harmlessly).
+        uint32_t cudaSigCount = 0;
+        for (uint32_t si = 0; si < submitCount; si++) {
+            const auto& s = pSubmits[si];
+            // Timeline values live in pNext VkTimelineSemaphoreSubmitInfo
+            const VkTimelineSemaphoreSubmitInfo* tl = nullptr;
+            for (const VkBaseInStructure* bi = (const VkBaseInStructure*)s.pNext;
+                 bi; bi = bi->pNext) {
+                if (bi->sType == VK_STRUCTURE_TYPE_TIMELINE_SEMAPHORE_SUBMIT_INFO) {
+                    tl = (const VkTimelineSemaphoreSubmitInfo*)bi; break;
+                }
+            }
+            for (uint32_t j = 0; j < s.signalSemaphoreCount; j++) {
+                uint64_t v = 0;
+                if (tl && tl->pSignalSemaphoreValues && j < tl->signalSemaphoreValueCount)
+                    v = tl->pSignalSemaphoreValues[j];
+                if (cudaSignalRegisteredSem(s.pSignalSemaphores[j], v))
+                    cudaSigCount++;
+            }
+        }
         std::vector<VkSubmitInfo> fakes(submitCount);
         for (uint32_t si = 0; si < submitCount; si++) {
             fakes[si] = {};
@@ -7519,7 +7615,6 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
             fakes[si].pWaitDstStageMask     = pSubmits[si].pWaitDstStageMask;
             fakes[si].signalSemaphoreCount  = pSubmits[si].signalSemaphoreCount;
             fakes[si].pSignalSemaphores     = pSubmits[si].pSignalSemaphores;
-            // Omit command buffers — this is the whole point.
         }
         installCrashRecovery();
         g_crashGuardActive = 1;
@@ -7531,7 +7626,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit(
         }
         static uint32_t fakeCount = 0;
         if ((++fakeCount % 100) == 1)
-            fprintf(stderr, "[CudaRT] GPU DEAD: fake submit #%u (submit %u)\n", fakeCount, g_submitCount);
+            fprintf(stderr, "[CudaRT] GPU DEAD: fake submit #%u (submit %u, cudaSig=%u)\n",
+                    fakeCount, g_submitCount, cudaSigCount);
         return VK_SUCCESS;
     }
 
@@ -7921,6 +8017,14 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit2KHR(
     // GPU dead mode: fake a submit that drops command buffers but keeps
     // semaphore waits/signals (preserving per-submit pNext for timeline info).
     if (g_gpuDead.load(std::memory_order_relaxed)) {
+        uint32_t cudaSigCount = 0;
+        for (uint32_t si = 0; si < submitCount; si++) {
+            for (uint32_t j = 0; j < pSubmits[si].signalSemaphoreInfoCount; j++) {
+                const auto& info = pSubmits[si].pSignalSemaphoreInfos[j];
+                if (cudaSignalRegisteredSem(info.semaphore, info.value))
+                    cudaSigCount++;
+            }
+        }
         std::vector<VkSubmitInfo2KHR> fakes(submitCount);
         for (uint32_t si = 0; si < submitCount; si++) {
             fakes[si] = {};
@@ -7942,7 +8046,8 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit2KHR(
         }
         static uint32_t fake2Count = 0;
         if ((++fake2Count % 100) == 1)
-            fprintf(stderr, "[CudaRT] GPU DEAD: fake submit2 #%u (submit %u)\n", fake2Count, g_submitCount);
+            fprintf(stderr, "[CudaRT] GPU DEAD: fake submit2 #%u (submit %u, cudaSig=%u)\n",
+                    fake2Count, g_submitCount, cudaSigCount);
         return VK_SUCCESS;
     }
 
@@ -8295,6 +8400,28 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateFence(
     return res;
 }
 
+// Semaphore registry for CUDA interop.
+// When CUDA_RT_INTEROP_SEM=1 is set, every vkCreateSemaphore gets
+// VkExportSemaphoreCreateInfo appended so the fd can be exported and
+// handed to CUDA. In GPU DEAD mode, fake submits then signal via
+// cuSignalExternalSemaphoresAsync — a real signal the NVIDIA driver
+// observes, unlike vkSignalSemaphore which goes through the dead queue.
+struct SemInterop {
+    VkDevice device;
+    int      timeline;
+    int      fd;
+    CudaInteropSem cu;
+    bool     ready;
+};
+static std::mutex g_semMutex;
+static std::unordered_map<uint64_t, SemInterop> g_semInterop;
+
+static bool wantSemInterop() {
+    static int v = -1;
+    if (v < 0) v = getenv("CUDA_RT_INTEROP_SEM") ? 1 : 0;
+    return v != 0;
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateSemaphore(
     VkDevice device, const VkSemaphoreCreateInfo* pCI, const VkAllocationCallbacks* pA, VkSemaphore* pS)
 {
@@ -8302,13 +8429,93 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_CreateSemaphore(
     auto& disp = g_deviceMap[key];
     auto fn = (PFN_vkCreateSemaphore)disp.GetDeviceProcAddr(device, "vkCreateSemaphore");
     if (!fn) return VK_ERROR_DEVICE_LOST;
-    VkResult res = fn(device, pCI, pA, pS);
+
+    // Detect timeline semaphore by sType walk of pNext chain
+    int isTimeline = 0;
+    if (pCI && pCI->pNext) {
+        const VkBaseInStructure* s = (const VkBaseInStructure*)pCI->pNext;
+        while (s) {
+            if (s->sType == VK_STRUCTURE_TYPE_SEMAPHORE_TYPE_CREATE_INFO) {
+                auto* ti = (const VkSemaphoreTypeCreateInfo*)s;
+                isTimeline = (ti->semaphoreType == VK_SEMAPHORE_TYPE_TIMELINE) ? 1 : 0;
+                break;
+            }
+            s = s->pNext;
+        }
+    }
+
+    VkSemaphoreCreateInfo injected = {};
+    VkExportSemaphoreCreateInfo expSem = {};
+    const VkSemaphoreCreateInfo* useCI = pCI;
+    if (wantSemInterop() && pCI) {
+        injected = *pCI;
+        expSem.sType = VK_STRUCTURE_TYPE_EXPORT_SEMAPHORE_CREATE_INFO;
+        expSem.pNext = injected.pNext;
+        expSem.handleTypes = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+        injected.pNext = &expSem;
+        useCI = &injected;
+    }
+
+    VkResult res = fn(device, useCI, pA, pS);
+    {
+        static uint32_t createCount = 0;
+        if (++createCount <= 3)
+            fprintf(stderr, "[CudaRT] CreateSemaphore #%u res=%d timeline=%d wantInterop=%d\n",
+                    createCount, (int)res, isTimeline, wantSemInterop() ? 1 : 0);
+    }
     if (isBogusOOM(res)) {
         static int s = 0;
         if (++s <= 5) fprintf(stderr, "[CudaRT] ⚠ CreateSemaphore OOM suppressed #%d\n", s);
         return VK_SUCCESS;
     }
+    if (res != VK_SUCCESS) {
+        // Fallback: retry without export if driver rejected the export handle type
+        if (wantSemInterop() && pCI) {
+            res = fn(device, pCI, pA, pS);
+        }
+        if (res != VK_SUCCESS) return res;
+    } else if (wantSemInterop() && pS && *pS != VK_NULL_HANDLE) {
+        auto getSemFd = (PFN_vkGetSemaphoreFdKHR)disp.GetDeviceProcAddr(device, "vkGetSemaphoreFdKHR");
+        static uint32_t diag = 0;
+        bool logThis = (++diag <= 3);
+        if (!getSemFd) {
+            if (logThis) fprintf(stderr, "[CudaRT] interop: getSemFd=NULL\n");
+        } else {
+            VkSemaphoreGetFdInfoKHR gfi = {VK_STRUCTURE_TYPE_SEMAPHORE_GET_FD_INFO_KHR};
+            gfi.semaphore = *pS;
+            gfi.handleType = VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_OPAQUE_FD_BIT;
+            int fd = -1;
+            VkResult gr = getSemFd(device, &gfi, &fd);
+            if (logThis) fprintf(stderr, "[CudaRT] interop: getSemFd res=%d fd=%d\n", (int)gr, fd);
+            if (gr == VK_SUCCESS && fd >= 0) {
+                SemInterop si = {};
+                si.device = device;
+                si.timeline = isTimeline;
+                si.fd = fd;
+                int ir = cuda_interop_import_sem_fd(fd, isTimeline, &si.cu);
+                if (logThis) fprintf(stderr, "[CudaRT] interop: import_sem_fd rc=%d\n", ir);
+                if (ir == 0) {
+                    si.ready = true;
+                    std::lock_guard<std::mutex> lk(g_semMutex);
+                    g_semInterop[(uint64_t)*pS] = si;
+                    static uint32_t semLogs = 0;
+                    if (++semLogs <= 3)
+                        fprintf(stderr, "[CudaRT] interop: imported %s semaphore %p into CUDA\n",
+                                isTimeline ? "timeline" : "binary", (void*)*pS);
+                }
+            }
+        }
+    }
     return res;
+}
+
+// Best-effort: signal a registered semaphore via CUDA.
+// Returns true if the semaphore was known and signal was issued.
+static bool cudaSignalRegisteredSem(VkSemaphore s, uint64_t value) {
+    std::lock_guard<std::mutex> lk(g_semMutex);
+    auto it = g_semInterop.find((uint64_t)s);
+    if (it == g_semInterop.end() || !it->second.ready) return false;
+    return cuda_interop_signal_sem(&it->second.cu, value, it->second.timeline) == 0;
 }
 
 // ─── QueuePresentKHR: per-frame hook for deferred TLAS retry ───
@@ -9175,6 +9382,94 @@ static VKAPI_ATTR void VKAPI_CALL layer_CmdWriteAccelerationStructuresProperties
 // Layer dispatch: GetInstanceProcAddr / GetDeviceProcAddr
 // ═══════════════════════════════════════════
 
+// ─── CUDA-backed buffer ops (bypass V100 driver for fill/update/copy) ───
+// Resolves VkBuffer → CUDA device pointer via g_buffers → g_memories.
+// Returns nullptr if no interop mapping exists.
+static void* cudaResolveBuffer(VkBuffer buf, VkDeviceSize* outBaseOff) {
+    auto it = g_buffers.find((uint64_t)buf);
+    if (it == g_buffers.end()) return nullptr;
+    auto mit = g_memories.find((uint64_t)it->second.memory);
+    if (mit == g_memories.end() || !mit->second.cuDevPtr) return nullptr;
+    if (outBaseOff) *outBaseOff = it->second.memOffset;
+    return (char*)mit->second.cuDevPtr + it->second.memOffset;
+}
+
+static VKAPI_ATTR void VKAPI_CALL layer_CmdFillBuffer(
+    VkCommandBuffer cmdBuf, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size, uint32_t data)
+{
+    void* key = getKey(cmdBuf);
+    auto& disp = g_deviceMap[key];
+    if (getenv("CUDA_RT_INTEROP_OPS")) {
+        std::lock_guard<std::mutex> lock(g_lock);
+        VkDeviceSize base = 0;
+        void* cuPtr = cudaResolveBuffer(dst, &base);
+        if (cuPtr) {
+            VkDeviceSize actual = size;
+            if (actual == VK_WHOLE_SIZE) {
+                auto it = g_buffers.find((uint64_t)dst);
+                actual = (it != g_buffers.end()) ? it->second.size - offset : 0;
+            }
+            if (cuda_interop_memset_u32((char*)cuPtr + offset, data, actual) == 0) {
+                static uint32_t n = 0;
+                if (++n <= 5) fprintf(stderr, "[CudaRT] CUDA-fill buf=0x%lx off=%zu sz=%zu val=0x%x\n",
+                        (uint64_t)dst, (size_t)offset, (size_t)actual, data);
+                return; // skip driver
+            }
+        }
+    }
+    disp.CmdFillBuffer(cmdBuf, dst, offset, size, data);
+}
+
+static VKAPI_ATTR void VKAPI_CALL layer_CmdUpdateBuffer(
+    VkCommandBuffer cmdBuf, VkBuffer dst, VkDeviceSize offset, VkDeviceSize size, const void* pData)
+{
+    void* key = getKey(cmdBuf);
+    auto& disp = g_deviceMap[key];
+    if (getenv("CUDA_RT_INTEROP_OPS")) {
+        std::lock_guard<std::mutex> lock(g_lock);
+        void* cuPtr = cudaResolveBuffer(dst, nullptr);
+        if (cuPtr && pData) {
+            if (cuda_interop_memcpy_h2d((char*)cuPtr + offset, pData, size) == 0) {
+                static uint32_t n = 0;
+                if (++n <= 5) fprintf(stderr, "[CudaRT] CUDA-update buf=0x%lx off=%zu sz=%zu\n",
+                        (uint64_t)dst, (size_t)offset, (size_t)size);
+                return;
+            }
+        }
+    }
+    disp.CmdUpdateBuffer(cmdBuf, dst, offset, size, pData);
+}
+
+static VKAPI_ATTR void VKAPI_CALL layer_CmdCopyBuffer(
+    VkCommandBuffer cmdBuf, VkBuffer src, VkBuffer dst,
+    uint32_t regionCount, const VkBufferCopy* pRegions)
+{
+    void* key = getKey(cmdBuf);
+    auto& disp = g_deviceMap[key];
+    if (getenv("CUDA_RT_INTEROP_OPS")) {
+        std::lock_guard<std::mutex> lock(g_lock);
+        void* sPtr = cudaResolveBuffer(src, nullptr);
+        void* dPtr = cudaResolveBuffer(dst, nullptr);
+        if (sPtr && dPtr) {
+            bool ok = true;
+            for (uint32_t i = 0; i < regionCount; i++) {
+                const auto& r = pRegions[i];
+                if (cuda_interop_memcpy_d2d((char*)dPtr + r.dstOffset,
+                                            (char*)sPtr + r.srcOffset, r.size) != 0) {
+                    ok = false; break;
+                }
+            }
+            if (ok) {
+                static uint32_t n = 0;
+                if (++n <= 5) fprintf(stderr, "[CudaRT] CUDA-copy src=0x%lx→dst=0x%lx regs=%u\n",
+                        (uint64_t)src, (uint64_t)dst, regionCount);
+                return;
+            }
+        }
+    }
+    disp.CmdCopyBuffer(cmdBuf, src, dst, regionCount, pRegions);
+}
+
 #define INTERCEPT(name) if (!strcmp(pName, "vk" #name)) return (PFN_vkVoidFunction)layer_##name
 
 static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetInstanceProcAddr(VkInstance instance, const char* pName)
@@ -9410,6 +9705,9 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetDeviceProcAddr(VkDevice
     INTERCEPT(CmdBindDescriptorSets);
     INTERCEPT(CmdDispatch);
     INTERCEPT(CmdDispatchIndirect);
+    INTERCEPT(CmdFillBuffer);
+    INTERCEPT(CmdUpdateBuffer);
+    INTERCEPT(CmdCopyBuffer);
     INTERCEPT(CreateDescriptorPool);
     INTERCEPT(DestroyDescriptorPool);
     INTERCEPT(CreateDescriptorSetLayout);

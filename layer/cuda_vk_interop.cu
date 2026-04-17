@@ -160,4 +160,40 @@ int cuda_interop_selftest(uint32_t* outFirstWord) {
     return (host == 0xCAFEBABE) ? 0 : -4;
 }
 
+} // extern "C" (first block end)
+
+// Memset/memcpy on imported memory.
+__global__ void k_memset_u32(uint32_t* buf, uint32_t val, size_t nWords) {
+    size_t i = blockIdx.x * (size_t)blockDim.x + threadIdx.x;
+    size_t stride = (size_t)gridDim.x * blockDim.x;
+    for (; i < nWords; i += stride) buf[i] = val;
+}
+
+extern "C" int cuda_interop_memset_u32(void* devPtr, uint32_t value, size_t bytes) {
+    if (!devPtr || (bytes & 3)) return -1;
+    size_t nWords = bytes / 4;
+    if (nWords == 0) return 0;
+    int block = 256;
+    int grid = (int)((nWords + block - 1) / block);
+    if (grid > 65535) grid = 65535;
+    k_memset_u32<<<grid, block>>>((uint32_t*)devPtr, value, nWords);
+    cudaError_t er = cudaGetLastError();
+    return er == cudaSuccess ? 0 : -2;
+}
+
+extern "C" int cuda_interop_memcpy_d2d(void* dst, const void* src, size_t bytes) {
+    if (!dst || !src || !bytes) return -1;
+    cudaError_t er = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyDeviceToDevice, 0);
+    return er == cudaSuccess ? 0 : -2;
+}
+
+extern "C" int cuda_interop_memcpy_h2d(void* dst, const void* src, size_t bytes) {
+    if (!dst || !src || !bytes) return -1;
+    cudaError_t er = cudaMemcpyAsync(dst, src, bytes, cudaMemcpyHostToDevice, 0);
+    return er == cudaSuccess ? 0 : -2;
+}
+
+extern "C" {
+// (trailing brace closed at end)
+int cuda_interop_pad_marker(void) { return 0; }
 } // extern "C"

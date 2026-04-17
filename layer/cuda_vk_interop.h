@@ -28,6 +28,11 @@ int cuda_interop_destroy_sem(struct CudaInteropSem* s);
 int cuda_interop_fill_pattern(void* devPtr, size_t bytes, uint32_t seed);
 int cuda_interop_selftest(uint32_t* outFirstWord);
 
+// Direct operations on imported device memory (replaces Vulkan cmd equivalents).
+int cuda_interop_memset_u32(void* devPtr, uint32_t value, size_t bytes);
+int cuda_interop_memcpy_d2d(void* dst, const void* src, size_t bytes);
+int cuda_interop_memcpy_h2d(void* dst, const void* src, size_t bytes);
+
 #ifdef __cplusplus
 }
 #endif
