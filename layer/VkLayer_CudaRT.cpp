@@ -8054,6 +8054,31 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_AcquireNextImageKHR(
     auto& disp = g_deviceMap[key];
     auto fn = (PFN_vkAcquireNextImageKHR)disp.GetDeviceProcAddr(device, "vkAcquireNextImageKHR");
     if (!fn) return VK_ERROR_DEVICE_LOST;
+
+    // GPU DEAD: fabricate an image index + signal the semaphore/fence so the
+    // app's present-acquire handshake keeps ticking without the driver.
+    if (g_gpuDead.load(std::memory_order_relaxed)) {
+        static std::atomic<uint32_t> fakeIdx{0};
+        if (pImageIndex) *pImageIndex = fakeIdx.fetch_add(1, std::memory_order_relaxed) & 0x3;
+        // Best-effort signal the acquire sema/fence via an empty submit on the
+        // last known queue (driver rejects happily if state is bad, that's OK).
+        VkQueue q = g_lastSubmitQueue.load(std::memory_order_relaxed);
+        if (q != VK_NULL_HANDLE) {
+            VkSubmitInfo si = {};
+            si.sType = VK_STRUCTURE_TYPE_SUBMIT_INFO;
+            if (semaphore != VK_NULL_HANDLE) {
+                si.signalSemaphoreCount = 1;
+                si.pSignalSemaphores = &semaphore;
+            }
+            installCrashRecovery();
+            g_crashGuardActive = 1;
+            if (sigsetjmp(g_crashJmpBuf, 1) == 0)
+                disp.QueueSubmit(q, 1, &si, fence);
+            g_crashGuardActive = 0;
+        }
+        return VK_SUCCESS;
+    }
+
     VkResult res = fn(device, swapchain, timeout, semaphore, fence, pImageIndex);
     if (isBogusOOM(res)) {
         static int s = 0;
@@ -8162,6 +8187,22 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueuePresentKHR(
     if (!pDisp || !pDisp->QueuePresentKHR) return VK_ERROR_DEVICE_LOST;
 
     g_presentCount++;
+
+    // GPU DEAD: skip the real present (driver queue is poisoned). Return
+    // SUCCESS so the app treats the frame as delivered and keeps looping.
+    // Without this, QueuePresent itself can SIGSEGV on a dead driver.
+    if (g_gpuDead.load(std::memory_order_relaxed)) {
+        static std::atomic<uint64_t> gdPresent{0};
+        uint64_t n = gdPresent.fetch_add(1, std::memory_order_relaxed) + 1;
+        if (n <= 3 || (n % 500) == 0)
+            fprintf(stderr, "[CudaRT] GPU DEAD: fake present #%lu\n", n);
+        // Still need to return valid pResults per image if requested
+        if (pPresentInfo && pPresentInfo->pResults) {
+            for (uint32_t i = 0; i < pPresentInfo->swapchainCount; i++)
+                const_cast<VkResult*>(pPresentInfo->pResults)[i] = VK_SUCCESS;
+        }
+        return VK_SUCCESS;
+    }
 
     // When RT is disabled after driver crash, free BVH buffers to reclaim VRAM
     // This prevents VK_ERROR_OUT_OF_HOST_MEMORY from exhausting the allocation pool
