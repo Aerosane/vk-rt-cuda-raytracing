@@ -7941,6 +7941,39 @@ static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueSubmit2KHR(
 // When a driver worker thread crashes and gets suspended, it may hold internal locks
 // that prevent fence signaling. This intercept retries with short timeouts, and after
 // ~2 seconds auto-signals stuck fences via empty QueueSubmit.
+
+// GPU DEAD: report all fences as signaled so polling loops (vkGetFenceStatus) exit.
+static VKAPI_ATTR VkResult VKAPI_CALL layer_GetFenceStatus(
+    VkDevice device, VkFence fence)
+{
+    if (g_gpuDead.load(std::memory_order_relaxed)) return VK_SUCCESS;
+    void* key = getKey(device);
+    auto& disp = g_deviceMap[key];
+    if (!disp.GetFenceStatus) return VK_SUCCESS;
+    return disp.GetFenceStatus(device, fence);
+}
+
+// GPU DEAD: swallow DeviceWaitIdle so the app can flush without blocking.
+static VKAPI_ATTR VkResult VKAPI_CALL layer_DeviceWaitIdle(VkDevice device)
+{
+    if (g_gpuDead.load(std::memory_order_relaxed)) return VK_SUCCESS;
+    void* key = getKey(device);
+    auto& disp = g_deviceMap[key];
+    auto fn = (PFN_vkDeviceWaitIdle)disp.GetDeviceProcAddr(device, "vkDeviceWaitIdle");
+    if (!fn) return VK_SUCCESS;
+    return fn(device);
+}
+
+// GPU DEAD: swallow QueueWaitIdle — driver queue may be poisoned.
+static VKAPI_ATTR VkResult VKAPI_CALL layer_QueueWaitIdle(VkQueue queue)
+{
+    if (g_gpuDead.load(std::memory_order_relaxed)) return VK_SUCCESS;
+    void* key = getKey(queue);
+    auto& disp = g_deviceMap[key];
+    if (!disp.QueueWaitIdle) return VK_SUCCESS;
+    return disp.QueueWaitIdle(queue);
+}
+
 static VKAPI_ATTR VkResult VKAPI_CALL layer_WaitForFences(
     VkDevice device, uint32_t fenceCount, const VkFence* pFences,
     VkBool32 waitAll, uint64_t timeout)
@@ -9250,6 +9283,12 @@ static VKAPI_ATTR PFN_vkVoidFunction VKAPI_CALL layer_GetDeviceProcAddr(VkDevice
         return (PFN_vkVoidFunction)layer_CreateSemaphore;
     if (strcmp(pName, "vkWaitSemaphores") == 0 || strcmp(pName, "vkWaitSemaphoresKHR") == 0)
         return (PFN_vkVoidFunction)layer_WaitSemaphores;
+    if (strcmp(pName, "vkGetFenceStatus") == 0)
+        return (PFN_vkVoidFunction)layer_GetFenceStatus;
+    if (strcmp(pName, "vkDeviceWaitIdle") == 0)
+        return (PFN_vkVoidFunction)layer_DeviceWaitIdle;
+    if (strcmp(pName, "vkQueueWaitIdle") == 0)
+        return (PFN_vkVoidFunction)layer_QueueWaitIdle;
 
     // Barrier remapping: MUST intercept even in lean mode to remap RT stage/access bits
     INTERCEPT(CmdPipelineBarrier);
